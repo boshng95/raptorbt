@@ -282,6 +282,7 @@ impl EngineKernel {
         let tz_offset_ns = config.session_tz_offset_ns;
         let limit_slippage = config.limit_slippage;
         let fill_timing = config.resolved_fill_timing();
+        let same_bar_marketable_limit_on_close = config.same_bar_marketable_limit_on_close;
 
         Self {
             config,
@@ -306,7 +307,7 @@ impl EngineKernel {
             alloted_capital: inst_config.and_then(|ic| ic.alloted_capital),
             lot_size: inst_config.and_then(|ic| ic.lot_size),
             spec: None,
-            orders: OrderEngine::with_tz_offset(tz_offset_ns),
+            orders: OrderEngine::with_tz_offset(tz_offset_ns, same_bar_marketable_limit_on_close),
             pending_events: Vec::new(),
             book: OrderBook::new(),
             queue: QueueTracker::new(),
@@ -1354,7 +1355,7 @@ impl EngineKernel {
         };
 
         let size = match self.lot_size {
-            Some(lot) if lot > 0.0 => (raw_size / lot).floor() * lot,
+            Some(lot) if lot > 0.0 => floor_to_lot(raw_size, lot),
             _ => raw_size,
         };
         let size = match &self.spec {
@@ -1547,6 +1548,14 @@ impl EngineKernel {
 
         (stop_price, target_price)
     }
+}
+
+/// Floor to the lot grid without dropping an exact decimal-grid value because
+/// its binary quotient landed a few ULPs below the integer boundary.
+fn floor_to_lot(raw_size: f64, lot: f64) -> f64 {
+    let lots = raw_size / lot;
+    let boundary_tolerance = f64::EPSILON * lots.abs().max(1.0) * 4.0;
+    (lots + boundary_tolerance).floor() * lot
 }
 
 #[cfg(test)]

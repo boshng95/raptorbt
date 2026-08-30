@@ -142,6 +142,10 @@ pub struct PyBacktestConfig {
     /// conflicts; false keeps the legacy stop-first assumption.
     #[pyo3(get, set)]
     pub bar_path_adaptive: bool,
+    /// Opt-in Nautilus compatibility for composite decisions made before the
+    /// primary close at the same timestamp.
+    #[pyo3(get, set)]
+    pub same_bar_marketable_limit_on_close: bool,
     stop_config: StopConfig,
     target_config: TargetConfig,
     /// Execution-timing policy, parsed at construction; `None` derives it
@@ -177,6 +181,7 @@ impl PyBacktestConfig {
         liquidate_on_margin_call=false,
         squareoff_time=None,
         fill_timing=None,
+        same_bar_marketable_limit_on_close=false,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -202,6 +207,7 @@ impl PyBacktestConfig {
         liquidate_on_margin_call: bool,
         squareoff_time: Option<String>,
         fill_timing: Option<String>,
+        same_bar_marketable_limit_on_close: bool,
     ) -> PyResult<Self> {
         let squareoff_time_minutes = parse_squareoff_time(squareoff_time.as_deref())?;
         let fill_timing = parse_fill_timing(fill_timing.as_deref())?;
@@ -226,6 +232,7 @@ impl PyBacktestConfig {
             fill_prob_slippage,
             fill_seed,
             bar_path_adaptive,
+            same_bar_marketable_limit_on_close,
             stop_config: StopConfig::None,
             target_config: TargetConfig::None,
             squareoff_time_minutes,
@@ -358,6 +365,7 @@ impl From<&PyBacktestConfig> for BacktestConfig {
             fill_prob_slippage: py_config.fill_prob_slippage,
             fill_seed: py_config.fill_seed,
             bar_path_adaptive: py_config.bar_path_adaptive,
+            same_bar_marketable_limit_on_close: py_config.same_bar_marketable_limit_on_close,
         }
     }
 }

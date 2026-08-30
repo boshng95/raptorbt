@@ -475,6 +475,13 @@ pub struct BacktestConfig {
     /// close). `false` (default) keeps the legacy stop-first assumption.
     #[serde(default)]
     pub bar_path_adaptive: bool,
+
+    /// Compatibility mode for close-labelled composite decisions.  A plain
+    /// limit submitted before the primary close may fill on that same close
+    /// when it is marketable there.  Disabled by default because normal
+    /// callback orders only begin resting on the next bar.
+    #[serde(default)]
+    pub same_bar_marketable_limit_on_close: bool,
 }
 
 fn default_one() -> f64 {
@@ -508,6 +515,7 @@ impl Default for BacktestConfig {
             fill_prob_slippage: 0.0,
             fill_seed: 0,
             bar_path_adaptive: false,
+            same_bar_marketable_limit_on_close: false,
         }
     }
 }
