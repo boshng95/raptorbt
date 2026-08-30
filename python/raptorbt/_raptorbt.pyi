@@ -56,6 +56,7 @@ class BacktestConfig:
     liquidate_on_margin_call: bool
     fill_seed: int
     bar_path_adaptive: bool
+    same_bar_marketable_limit_on_close: bool
     legacy_annualization: bool
     squareoff_time_minutes: int | None
 
@@ -85,6 +86,7 @@ class BacktestConfig:
         liquidate_on_margin_call: bool = ...,
         squareoff_time: str | None = ...,
         fill_timing: str | None = ...,
+        same_bar_marketable_limit_on_close: bool = ...,
     ) -> None: ...
     def set_fixed_stop(self, percent: float) -> None: ...
     def set_atr_stop(self, multiplier: float, period: int) -> None: ...

@@ -63,6 +63,9 @@ pub struct OrderEngine {
     /// Entry latency on the tick path: an order is invisible to prints
     /// before `submitted_ts + latency`. `0` (default) = same print.
     order_latency_ns: i64,
+    /// Opt-in compatibility for decisions made by a composite callback just
+    /// before the primary close with the same timestamp.
+    same_bar_marketable_limit_on_close: bool,
 }
 
 impl OrderEngine {
@@ -80,8 +83,8 @@ impl OrderEngine {
     }
 
     /// An engine whose DAY orders expire on a trading date offset from UTC.
-    pub fn with_tz_offset(tz_offset_ns: i64) -> Self {
-        Self { tz_offset_ns, ..Self::default() }
+    pub fn with_tz_offset(tz_offset_ns: i64, same_bar_marketable_limit_on_close: bool) -> Self {
+        Self { tz_offset_ns, same_bar_marketable_limit_on_close, ..Self::default() }
     }
 
     /// Set the tick-path order-entry latency (see `order_latency_ns`).
@@ -292,7 +295,11 @@ impl OrderEngine {
             self.orders.iter().map(|o| (o.id, o.status)).collect();
 
         for order in &mut self.orders {
-            if order.status.is_terminal() || order.submitted_idx >= idx {
+            if order.status.is_terminal() || order.submitted_idx > idx {
+                continue;
+            }
+            let submitted_this_bar = order.submitted_idx == idx;
+            if submitted_this_bar && !self.same_bar_marketable_limit_on_close {
                 continue;
             }
             // Still in flight to the venue: this print cannot see it, so it
@@ -328,6 +335,33 @@ impl OrderEngine {
             let (direction, is_entry) = side_as_fill_args(order.side);
             let oid = order.id;
             let fill = move |p: Price| MatchOutcome::Fill { order_id: oid, price: p };
+
+            // A composite callback is delivered before the primary close in
+            // the Nautilus event ordering.  When compatibility is enabled,
+            // only a plain limit which crosses that close participates.  Do
+            // not inspect this bar's high/low: they occurred before the
+            // decision and would introduce look-ahead.
+            if submitted_this_bar {
+                let outcome = match order.kind {
+                    OrderKind::Limit { price } => {
+                        let marketable = match order.side {
+                            OrderSide::Buy => price >= bar.close,
+                            OrderSide::Sell => price <= bar.close,
+                        };
+                        marketable.then(|| fill(bar.close))
+                    }
+                    _ => None,
+                };
+                match outcome {
+                    Some(outcome) => actions.push(outcome),
+                    None if matches!(order.tif, TimeInForce::Ioc | TimeInForce::Fok) => {
+                        let _ = order.transition(OrderStatus::Canceled);
+                        actions.push(MatchOutcome::Cancel { order_id: order.id });
+                    }
+                    None => {}
+                }
+                continue;
+            }
 
             let outcome = match order.kind {
                 // Plain market orders are filled by the kernel on their
@@ -523,6 +557,24 @@ mod tests {
         let fm = FillModel::default();
         // idx == submitted_idx: the bar had closed when the order was placed.
         assert!(engine.match_bar(0, &bar(0, 100.0, 100.5, 98.0, 99.5), &fm).is_empty());
+    }
+
+    #[test]
+    fn compatibility_market_limit_fills_at_same_close_without_using_range() {
+        let (mut engine, id) = engine_with(
+            OrderKind::Limit { price: 101.0 },
+            OrderSide::Buy,
+            TimeInForce::Gtd { expire_ns: 12 },
+        );
+        engine.same_bar_marketable_limit_on_close = true;
+        let fm = FillModel::default();
+        let outcomes = engine.match_bar(0, &bar(0, 100.0, 102.0, 98.0, 100.5), &fm);
+        assert_eq!(outcomes, vec![MatchOutcome::Fill { order_id: id, price: 100.5 }]);
+
+        let (mut engine, _) =
+            engine_with(OrderKind::Limit { price: 99.0 }, OrderSide::Buy, TimeInForce::Gtc);
+        engine.same_bar_marketable_limit_on_close = true;
+        assert!(engine.match_bar(0, &bar(0, 100.0, 102.0, 98.0, 100.5), &fm).is_empty());
     }
 
     #[test]

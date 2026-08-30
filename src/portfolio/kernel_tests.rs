@@ -19,6 +19,15 @@ fn make_kernel() -> EngineKernel {
     )
 }
 
+#[test]
+fn exact_fractional_lot_is_not_dropped_at_binary_boundary() {
+    let rounded = floor_to_lot(0.10185, 0.00001);
+    assert!((rounded - 0.10185).abs() < 1e-15, "rounded={rounded:.17}");
+
+    let below = floor_to_lot(0.101849, 0.00001);
+    assert!((below - 0.10184).abs() < 1e-15, "below={below:.17}");
+}
+
 fn bar(idx: i64, price: Price) -> KernelBar {
     KernelBar {
         timestamp: idx,
