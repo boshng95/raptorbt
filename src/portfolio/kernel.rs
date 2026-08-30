@@ -248,6 +248,10 @@ pub struct EngineKernel {
     /// Per-instrument capital cap and lot rounding, if any.
     alloted_capital: Option<f64>,
     lot_size: Option<f64>,
+    /// Instrument-level upper bound for an opening quantity.
+    max_quantity: Option<f64>,
+    /// Settlement-currency precision. `None` preserves historical arithmetic.
+    currency_precision: Option<u32>,
     /// Market definition: quantization, contract multiplier, expiry.
     ///
     /// `None` reproduces pre-spec behavior exactly (multiplier 1.0, no
@@ -323,6 +327,8 @@ impl EngineKernel {
             effective_target,
             alloted_capital: inst_config.and_then(|ic| ic.alloted_capital),
             lot_size: inst_config.and_then(|ic| ic.lot_size),
+            max_quantity: inst_config.and_then(|ic| ic.max_quantity),
+            currency_precision: inst_config.and_then(|ic| ic.currency_precision),
             spec: None,
             orders: OrderEngine::with_tz_offset(
                 tz_offset_ns,
@@ -505,7 +511,19 @@ impl EngineKernel {
     /// several kernels and re-points each one at the pool before stepping it.
     #[inline]
     pub fn set_cash(&mut self, cash: f64) {
-        self.cash = cash;
+        self.cash = self.quantize_money(cash);
+    }
+
+    /// Quantize a settlement-currency amount when an instrument declares its
+    /// currency precision. Keeping `None` as a no-op preserves stock Raptor's
+    /// floating-point behavior for every existing caller.
+    #[inline]
+    fn quantize_money(&self, value: f64) -> f64 {
+        let Some(precision) = self.currency_precision else {
+            return value;
+        };
+        let factor = 10_f64.powi(precision.min(15) as i32);
+        (value * factor).round() / factor
     }
 
     /// Market value of open positions at the given price, or 0.0 when flat.
@@ -587,7 +605,7 @@ impl EngineKernel {
         // understate equity by the cost basis for the whole run. No fee term
         // in either arm: an adoption is not a trade and charges nothing.
         match margin_rate {
-            None => self.cash -= price * size * self.multiplier(),
+            None => self.cash = self.quantize_money(self.cash - price * size * self.multiplier()),
             Some(rate) => self.margin.lock(id, price * size * self.multiplier() * rate),
         }
         Ok(id)
@@ -681,10 +699,10 @@ impl EngineKernel {
     /// shorts correctly.
     #[inline]
     pub fn equity(&self, close: Price) -> f64 {
-        match self.account {
+        self.quantize_money(match self.account {
             AccountMode::Cash => self.cash + self.position_value(close),
             AccountMode::Margin { .. } => self.cash + self.ledger.unrealized_total(close),
-        }
+        })
     }
 
     /// Cash not locked as initial margin (margin mode); all cash otherwise.
@@ -1349,10 +1367,10 @@ impl EngineKernel {
         // per-contract schedules charge per contract, not per notional unit.
         let fee_price = exit_price * self.multiplier();
         let exit_breakdown = self.fee_model.breakdown(fee_price, size, direction, false);
-        let fees = match exit_breakdown {
+        let fees = self.quantize_money(match exit_breakdown {
             Some(b) => b.total(),
             None => self.fee_model.calculate(fee_price, size, direction),
-        };
+        });
 
         // Round-trip breakdown: entry components plus exit components, so the
         // itemized total equals the fees actually deducted from the equity curve.
@@ -1392,12 +1410,14 @@ impl EngineKernel {
     fn credit_close(&mut self, position_id: u64, trade: &Trade, exit_fees: f64, exit_price: Price) {
         match self.account {
             AccountMode::Cash => {
-                self.cash += exit_price * trade.size * self.multiplier() - exit_fees;
+                self.cash = self.quantize_money(
+                    self.cash + exit_price * trade.size * self.multiplier() - exit_fees,
+                );
             }
             AccountMode::Margin { .. } => {
                 self.margin.release(position_id);
                 let entry_fees = trade.fees - exit_fees;
-                self.cash += trade.pnl + entry_fees;
+                self.cash = self.quantize_money(self.cash + trade.pnl + entry_fees);
             }
         }
     }
@@ -1425,11 +1445,11 @@ impl EngineKernel {
             let Some(managed) = self.ledger.get(position_id) else { continue };
             let entry_ts = managed.entry_timestamp;
             let entry_breakdown = managed.entry_breakdown;
-            let settle_fee = if fee_rate > 0.0 {
+            let settle_fee = self.quantize_money(if fee_rate > 0.0 {
                 settle_price * managed.position.size * self.multiplier() * fee_rate
             } else {
                 0.0
-            };
+            });
             if let Some(trade) = self.ledger.close_position(
                 position_id,
                 ExitDetails {
@@ -1544,14 +1564,17 @@ impl EngineKernel {
             };
             return Some(EngineEvent::EntryRejected { idx, reason });
         }
+        if self.max_quantity.is_some_and(|maximum| size > maximum) {
+            return Some(EngineEvent::EntryRejected { idx, reason: RejectReason::MaxQuantity });
+        }
 
         // Same per-contract price convention as the exit path: notional
         // scaling rides on the price, contract count stays raw.
         let entry_breakdown = self.fee_model.breakdown(contract_value, size, direction, true);
-        let entry_fees = match entry_breakdown {
+        let entry_fees = self.quantize_money(match entry_breakdown {
             Some(b) => b.total(),
             None => self.fee_model.calculate(contract_value, size, direction),
-        };
+        });
 
         // Capital-fraction sizing fits by construction; explicit unit counts
         // (order API) can exceed the account and are refused instead of
@@ -1590,14 +1613,17 @@ impl EngineKernel {
             entry_breakdown,
         )?;
         match funding {
-            None => self.cash -= contract_value * size + entry_fees,
+            None => {
+                self.cash =
+                    self.quantize_money(self.cash - contract_value * size - entry_fees);
+            }
             Some(EntryFunding::Rate { rate, .. }) => {
                 self.margin.lock(position_id, contract_value * size * rate);
-                self.cash -= entry_fees;
+                self.cash = self.quantize_money(self.cash - entry_fees);
             }
             Some(EntryFunding::Deposit { per_contract }) => {
                 self.margin.lock(position_id, per_contract * size);
-                self.cash -= entry_fees;
+                self.cash = self.quantize_money(self.cash - entry_fees);
             }
         }
 

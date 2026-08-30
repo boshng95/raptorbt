@@ -1,8 +1,8 @@
 # Nautilus parity branch
 
-This branch is based on upstream `v0.10.1` and carries two narrowly scoped
+This branch is based on upstream `v0.10.1` and carries five narrowly scoped
 compatibility corrections used by algotrade-nautilus backtest experiments.
-Neither correction changes default matching behavior.
+The corrections are opt-in or default-neutral for existing callers.
 
 ## Changes
 
@@ -15,10 +15,22 @@ Neither correction changes default matching behavior.
    exact decimal-grid value is divided by its lot increment. For example,
    `0.10185 / 0.00001` no longer loses one lot by evaluating just below the
    integer boundary. Values genuinely below the boundary still floor.
+3. `BacktestConfig` accepts optional `fee_per_share`, `fee_minimum`, and
+   `fee_max_pct` fields. Together with the existing percentage `fees` field,
+   these express the project's IB US and ASX commission schedules. All three
+   default to zero, preserving stock Raptor behavior.
+4. `InstrumentConfig.currency_precision` optionally quantizes fees and
+   account arithmetic to the settlement-currency grid. `None` preserves the
+   upstream floating-point path; the parity adapter supplies the precision
+   already present in the Nautilus instrument metadata.
+5. `InstrumentConfig.max_quantity` optionally rejects an opening quantity
+   above the instrument's declared limit. `None` remains unlimited. This
+   reproduces the existing Nautilus constraint which, for example, rejects a
+   23,750-unit ADA order against a 9,000-unit maximum.
 
 ## Evidence
 
-- All 509 Rust library tests pass with `RAYON_NUM_THREADS=4`.
+- All 514 Rust library tests pass with `RAYON_NUM_THREADS=4`.
 - The algotrade-nautilus strict BTC callback case matched 230 of 230 canonical
   data, indicator, decision, order, fill, fee, position, equity, and metric
   events over 2026-01-01 through 2026-02-01, twice per engine.
