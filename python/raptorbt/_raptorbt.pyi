@@ -28,6 +28,9 @@ _Instrument = tuple[_I64, _F64, _F64, _F64, _F64, _F64, _Bool, _Bool, int, float
 class BacktestConfig:
     initial_capital: float
     fees: float
+    fee_per_share: float
+    fee_minimum: float
+    fee_max_pct: float
     slippage: float
     # Deprecated in favor of fill_timing: True maps to "same_bar_close",
     # False to "next_bar_open". An explicit fill_timing wins over this flag.
@@ -83,6 +86,9 @@ class BacktestConfig:
         squareoff_time: str | None = ...,
         fill_timing: str | None = ...,
         same_bar_marketable_limit_on_close: bool = ...,
+        fee_per_share: float = ...,
+        fee_minimum: float = ...,
+        fee_max_pct: float = ...,
     ) -> None: ...
     def set_fixed_stop(self, percent: float) -> None: ...
     def set_atr_stop(self, multiplier: float, period: int) -> None: ...
@@ -96,6 +102,8 @@ class InstrumentConfig:
     alloted_capital: float | None
     existing_qty: float | None
     avg_price: float | None
+    max_quantity: float | None
+    currency_precision: int | None
 
     def __init__(
         self,
@@ -103,6 +111,8 @@ class InstrumentConfig:
         alloted_capital: float | None = ...,
         existing_qty: float | None = ...,
         avg_price: float | None = ...,
+        max_quantity: float | None = ...,
+        currency_precision: int | None = ...,
     ) -> None: ...
     def set_fixed_stop(self, percent: float) -> None: ...
     def set_atr_stop(self, multiplier: float, period: int) -> None: ...
@@ -1015,4 +1025,3 @@ def resolve_atr_period(
     config: BacktestConfig | None = ...,
     instrument_config: InstrumentConfig | None = ...,
 ) -> int | None: ...
-

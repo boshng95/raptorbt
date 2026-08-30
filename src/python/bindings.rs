@@ -75,6 +75,15 @@ pub struct PyBacktestConfig {
     pub initial_capital: f64,
     #[pyo3(get, set)]
     pub fees: f64,
+    /// Optional per-share fee; when set, replaces the percentage base fee.
+    #[pyo3(get, set)]
+    pub fee_per_share: f64,
+    /// Optional minimum commission per fill/order.
+    #[pyo3(get, set)]
+    pub fee_minimum: f64,
+    /// Optional commission cap as a fraction of notional.
+    #[pyo3(get, set)]
+    pub fee_max_pct: f64,
     #[pyo3(get, set)]
     pub slippage: f64,
     /// Deprecated in favor of `fill_timing`: `True` maps to
@@ -182,6 +191,9 @@ impl PyBacktestConfig {
         squareoff_time=None,
         fill_timing=None,
         same_bar_marketable_limit_on_close=false,
+        fee_per_share=0.0,
+        fee_minimum=0.0,
+        fee_max_pct=0.0,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -208,12 +220,18 @@ impl PyBacktestConfig {
         squareoff_time: Option<String>,
         fill_timing: Option<String>,
         same_bar_marketable_limit_on_close: bool,
+        fee_per_share: f64,
+        fee_minimum: f64,
+        fee_max_pct: f64,
     ) -> PyResult<Self> {
         let squareoff_time_minutes = parse_squareoff_time(squareoff_time.as_deref())?;
         let fill_timing = parse_fill_timing(fill_timing.as_deref())?;
         Ok(Self {
             initial_capital,
             fees,
+            fee_per_share,
+            fee_minimum,
+            fee_max_pct,
             slippage,
             upon_bar_close,
             apply_slippage,
@@ -343,6 +361,9 @@ impl From<&PyBacktestConfig> for BacktestConfig {
         BacktestConfig {
             initial_capital: py_config.initial_capital,
             fees: py_config.fees,
+            fee_per_share: py_config.fee_per_share,
+            fee_minimum: py_config.fee_minimum,
+            fee_max_pct: py_config.fee_max_pct,
             slippage: py_config.slippage,
             stop: py_config.stop_config,
             target: py_config.target_config,
@@ -382,6 +403,12 @@ pub struct PyInstrumentConfig {
     pub existing_qty: Option<f64>,
     #[pyo3(get, set)]
     pub avg_price: Option<f64>,
+    /// Maximum permitted order/position quantity.
+    #[pyo3(get, set)]
+    pub max_quantity: Option<f64>,
+    /// Settlement-currency precision for fees, cash, equity, and P&L.
+    #[pyo3(get, set)]
+    pub currency_precision: Option<u32>,
     stop_config: Option<StopConfig>,
     target_config: Option<TargetConfig>,
 }
@@ -389,18 +416,29 @@ pub struct PyInstrumentConfig {
 #[pymethods]
 impl PyInstrumentConfig {
     #[new]
-    #[pyo3(signature = (lot_size=None, alloted_capital=None, existing_qty=None, avg_price=None))]
+    #[pyo3(signature = (
+        lot_size=None,
+        alloted_capital=None,
+        existing_qty=None,
+        avg_price=None,
+        max_quantity=None,
+        currency_precision=None,
+    ))]
     fn new(
         lot_size: Option<f64>,
         alloted_capital: Option<f64>,
         existing_qty: Option<f64>,
         avg_price: Option<f64>,
+        max_quantity: Option<f64>,
+        currency_precision: Option<u32>,
     ) -> Self {
         Self {
             lot_size,
             alloted_capital,
             existing_qty,
             avg_price,
+            max_quantity,
+            currency_precision,
             stop_config: None,
             target_config: None,
         }
@@ -453,6 +491,8 @@ impl From<&PyInstrumentConfig> for InstrumentConfig {
             target: py_config.target_config,
             existing_qty: py_config.existing_qty,
             avg_price: py_config.avg_price,
+            max_quantity: py_config.max_quantity,
+            currency_precision: py_config.currency_precision,
         }
     }
 }

@@ -16,6 +16,8 @@ pub enum RejectReason {
     /// Requested size rounded/computed to zero units (e.g. size fraction too
     /// small for the lot size, or insufficient capital at this price).
     ZeroSize,
+    /// Requested size exceeds the instrument's declared maximum quantity.
+    MaxQuantity,
     /// The instrument has expired; no further entries are possible.
     Expired,
     /// The instrument is not yet active at this bar's timestamp.
@@ -33,6 +35,7 @@ impl RejectReason {
             RejectReason::MaxPositions => "max_positions",
             RejectReason::DrawdownHalt => "drawdown_halt",
             RejectReason::ZeroSize => "zero_size",
+            RejectReason::MaxQuantity => "max_quantity",
             RejectReason::Expired => "expired",
             RejectReason::Inactive => "inactive",
             RejectReason::InsufficientCapital => "insufficient_capital",

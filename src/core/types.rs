@@ -324,6 +324,16 @@ pub struct BacktestConfig {
     pub initial_capital: f64,
     /// Transaction fees as fraction (0.001 = 0.1%).
     pub fees: f64,
+    /// Optional fee per share/contract. When non-zero, replaces `fees` as the
+    /// base brokerage calculation.
+    #[serde(default)]
+    pub fee_per_share: f64,
+    /// Optional minimum commission charged per fill/order.
+    #[serde(default)]
+    pub fee_minimum: f64,
+    /// Optional maximum commission as a fraction of trade notional.
+    #[serde(default)]
+    pub fee_max_pct: f64,
     /// Slippage as fraction.
     pub slippage: f64,
     /// Stop-loss configuration.
@@ -493,6 +503,9 @@ impl Default for BacktestConfig {
         Self {
             initial_capital: 100_000.0,
             fees: 0.001,
+            fee_per_share: 0.0,
+            fee_minimum: 0.0,
+            fee_max_pct: 0.0,
             slippage: 0.0,
             stop: StopConfig::None,
             target: TargetConfig::None,
@@ -540,6 +553,15 @@ impl BacktestConfig {
     /// erroring, matching how the rest of the config degrades.
     pub fn fee_model(&self) -> crate::execution::FeeModel {
         use crate::execution::{indian_costs::Segment, FeeModel};
+
+        if self.fee_per_share > 0.0 || self.fee_minimum > 0.0 || self.fee_max_pct > 0.0 {
+            return FeeModel::brokerage(
+                self.fees,
+                self.fee_per_share,
+                self.fee_minimum,
+                self.fee_max_pct,
+            );
+        }
 
         let Some(spec) = self.fee_segment.as_deref() else {
             return FeeModel::percentage(self.fees);
@@ -594,6 +616,17 @@ pub struct InstrumentConfig {
     pub existing_qty: Option<f64>,
     /// Existing position average price (future use).
     pub avg_price: Option<f64>,
+    /// Maximum permitted order/position quantity. `None` is unlimited.
+    ///
+    /// Venue instrument definitions use this to reject an explicit order
+    /// before it can create a position (for example Binance spot metadata in
+    /// Nautilus caps the generic crypto instrument at 9,000 units).
+    #[serde(default)]
+    pub max_quantity: Option<f64>,
+    /// Settlement-currency decimal precision. `None` preserves unquantized
+    /// floating-point cash arithmetic; `Some(2)` models USD/AUD cents.
+    #[serde(default)]
+    pub currency_precision: Option<u32>,
 }
 
 impl InstrumentConfig {

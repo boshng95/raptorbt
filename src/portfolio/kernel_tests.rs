@@ -28,6 +28,70 @@ fn exact_fractional_lot_is_not_dropped_at_binary_boundary() {
     assert!((below - 0.10184).abs() < 1e-15, "below={below:.17}");
 }
 
+#[test]
+fn declared_currency_precision_quantizes_crypto_fees_and_pnl() {
+    let config = BacktestConfig { fees: 0.001, ..BacktestConfig::default() };
+    let fee_model = config.fee_model();
+    let instrument = InstrumentConfig {
+        lot_size: Some(0.00001),
+        currency_precision: Some(8),
+        ..InstrumentConfig::default()
+    };
+    let mut kernel = EngineKernel::new(
+        config,
+        fee_model,
+        SlippageModel::None,
+        FillPrice::Close,
+        "ETHUSDT".to_string(),
+        Direction::Long,
+        Some(&instrument),
+    );
+    let entered = kernel.open_at(
+        0,
+        &bar(0, 3223.91),
+        Direction::Long,
+        3223.91,
+        None,
+        Some(2.93546),
+        0.0,
+        None,
+        None,
+    );
+    assert!(matches!(entered, Some(EngineEvent::Entered { .. })));
+    let exited = kernel.close_at(1, &bar(1, 2923.12), 0, 2923.12, ExitReason::Signal);
+    match exited {
+        Some(EngineEvent::Exited { trade, .. }) => {
+            assert_eq!(trade.entry_fees, 9.46365885);
+            assert_eq!(trade.exit_fees, 8.58070184);
+            assert_eq!(trade.pnl, -901.00137409);
+        }
+        other => panic!("expected exit, got {other:?}"),
+    }
+}
+
+#[test]
+fn declared_currency_precision_quantizes_cash_and_equity_to_cents() {
+    let config = BacktestConfig { fees: 0.00088, fee_minimum: 6.60, ..BacktestConfig::default() };
+    let fee_model = config.fee_model();
+    let instrument = InstrumentConfig {
+        lot_size: Some(1.0),
+        currency_precision: Some(2),
+        ..InstrumentConfig::default()
+    };
+    let mut kernel = EngineKernel::new(
+        config,
+        fee_model,
+        SlippageModel::None,
+        FillPrice::Close,
+        "CBA".to_string(),
+        Direction::Long,
+        Some(&instrument),
+    );
+    kernel.set_cash(10_117.7602928);
+    assert_eq!(kernel.cash(), 10_117.76);
+    assert_eq!(kernel.equity(150.123456), 10_117.76);
+}
+
 fn bar(idx: i64, price: Price) -> KernelBar {
     KernelBar {
         timestamp: idx,
@@ -412,6 +476,8 @@ fn zero_size_entry_emits_rejection() {
         target: None,
         existing_qty: None,
         avg_price: None,
+        max_quantity: None,
+        currency_precision: None,
     };
     let mut kernel = EngineKernel::new(
         config,
@@ -430,6 +496,43 @@ fn zero_size_entry_emits_rejection() {
         }
         other => panic!("expected zero-size rejection, got {other:?}"),
     }
+    assert!(!kernel.is_in_position());
+}
+
+#[test]
+fn instrument_maximum_quantity_rejects_an_oversized_entry() {
+    let config = BacktestConfig::default();
+    let fee_model = config.fee_model();
+    let inst = InstrumentConfig {
+        lot_size: Some(0.00001),
+        max_quantity: Some(9_000.0),
+        ..InstrumentConfig::default()
+    };
+    let mut kernel = EngineKernel::new(
+        config,
+        fee_model,
+        SlippageModel::None,
+        FillPrice::Close,
+        "ADAUSDT".to_string(),
+        Direction::Long,
+        Some(&inst),
+    );
+
+    let result = kernel.open_at(
+        0,
+        &bar(0, 0.4),
+        Direction::Long,
+        0.4,
+        None,
+        Some(23_750.0),
+        0.0,
+        None,
+        None,
+    );
+    assert!(matches!(
+        result,
+        Some(EngineEvent::EntryRejected { reason: RejectReason::MaxQuantity, .. })
+    ));
     assert!(!kernel.is_in_position());
 }
 

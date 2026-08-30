@@ -18,6 +18,13 @@ pub enum FeeModel {
     Tiered(Vec<(f64, f64)>), // (threshold, rate)
     /// Custom fee function (stored as percentage for simplicity).
     Custom { base: f64, per_share: f64 },
+    /// Brokerage schedule with optional per-order floor and notional cap.
+    ///
+    /// A non-zero `per_share` replaces the percentage component. This covers
+    /// brokers such as IB, where US equities are charged per share while ASX
+    /// equities are charged as a percentage of notional. The minimum and cap
+    /// are applied to either base calculation.
+    Brokerage { percentage: f64, per_share: f64, minimum: f64, max_percentage: f64 },
     /// Itemized Indian regulatory costs for a market segment.
     ///
     /// Unlike the other variants this produces a per-component breakdown, so
@@ -45,6 +52,11 @@ impl FeeModel {
     /// Create a new per-share fee model.
     pub fn per_share(rate: f64) -> Self {
         FeeModel::PerShare(rate)
+    }
+
+    /// Create a brokerage schedule with an optional minimum and notional cap.
+    pub fn brokerage(percentage: f64, per_share: f64, minimum: f64, max_percentage: f64) -> Self {
+        FeeModel::Brokerage { percentage, per_share, minimum, max_percentage }
     }
 
     /// Calculate fee for a trade.
@@ -77,6 +89,20 @@ impl FeeModel {
                 trade_value * applicable_rate
             }
             FeeModel::Custom { base, per_share } => base + size.abs() * per_share,
+            FeeModel::Brokerage { percentage, per_share, minimum, max_percentage } => {
+                let mut fee = if *per_share > 0.0 {
+                    size.abs() * per_share
+                } else {
+                    trade_value * percentage
+                };
+                if *minimum > 0.0 {
+                    fee = fee.max(*minimum);
+                }
+                if *max_percentage > 0.0 {
+                    fee = fee.min(trade_value * max_percentage);
+                }
+                fee
+            }
             FeeModel::Indian { segment } => {
                 indian_costs::calculate_side(*segment, trade_value, _direction, true).total()
             }
@@ -188,6 +214,23 @@ mod tests {
         let fee = FeeModel::per_share(0.01);
         let result = fee.calculate(100.0, 100.0, Direction::Long);
         assert!((result - 1.0).abs() < 1e-10); // 100 * 0.01 = 1
+    }
+
+    #[test]
+    fn brokerage_models_ib_us_minimum_and_cap() {
+        let fee = FeeModel::brokerage(0.0, 0.005, 1.0, 0.01);
+
+        assert!((fee.calculate(258.26, 36.0, Direction::Long) - 1.0).abs() < 1e-10);
+        assert!((fee.calculate(100.0, 1_000.0, Direction::Long) - 5.0).abs() < 1e-10);
+        assert!((fee.calculate(1.0, 10.0, Direction::Long) - 0.10).abs() < 1e-10);
+    }
+
+    #[test]
+    fn brokerage_models_ib_asx_percentage_and_minimum() {
+        let fee = FeeModel::brokerage(0.00088, 0.0, 6.60, 0.0);
+
+        assert!((fee.calculate(150.0, 10.0, Direction::Long) - 6.60).abs() < 1e-10);
+        assert!((fee.calculate(150.0, 100.0, Direction::Long) - 13.20).abs() < 1e-10);
     }
 
     #[test]
