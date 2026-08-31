@@ -56,6 +56,7 @@ class BacktestConfig:
     order_latency_ns: int
     session_tz_offset_ns: int
     limit_slippage: float
+    bar_volume_slices: float
     liquidate_on_margin_call: bool
     fill_seed: int
     bar_path_adaptive: bool
@@ -86,6 +87,7 @@ class BacktestConfig:
         order_latency_ns: int = ...,
         session_tz_offset_ns: int = ...,
         limit_slippage: float = ...,
+        bar_volume_slices: float = ...,
         liquidate_on_margin_call: bool = ...,
         squareoff_time: str | None = ...,
         fill_timing: str | None = ...,
@@ -108,6 +110,7 @@ class InstrumentConfig:
     avg_price: float | None
     max_quantity: float | None
     currency_precision: int | None
+    price_increment: float | None
 
     def __init__(
         self,
@@ -117,6 +120,7 @@ class InstrumentConfig:
         avg_price: float | None = ...,
         max_quantity: float | None = ...,
         currency_precision: int | None = ...,
+        price_increment: float | None = ...,
     ) -> None: ...
     def set_fixed_stop(self, percent: float) -> None: ...
     def set_atr_stop(self, multiplier: float, period: int) -> None: ...
@@ -1069,6 +1073,9 @@ class EngineEvent:
     reject_reason: str | None
     order_id: int | None
     client_order_id: str | None
+    commission: float | None
+    leaves: float | None
+    gross_realized: float | None
 
 class PositionSnapshot:
     position_id: int

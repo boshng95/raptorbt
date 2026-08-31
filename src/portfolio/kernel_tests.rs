@@ -29,6 +29,28 @@ fn exact_fractional_lot_is_not_dropped_at_binary_boundary() {
 }
 
 #[test]
+fn a_lot_grid_size_is_bit_exact_and_not_one_ulp_high() {
+    // `lots.floor() * lot` reconstructs the size in binary, so an exact
+    // decimal size can come back an ULP high: 0.10379 became
+    // 0.10379000000000001. Nautilus holds the same quantity as a decimal, and
+    // a percentage fee charged on `size * price` turns that ULP into a
+    // last-decimal commission difference. Pin equality, not a tolerance.
+    for (raw, lot, expected) in [
+        (0.10379_f64, 0.00001_f64, 0.10379_f64),
+        (0.10185, 0.00001, 0.10185),
+        (0.101849, 0.00001, 0.10184),
+        (1.5, 0.1, 1.5),
+        (7.0, 1.0, 7.0),
+    ] {
+        let actual = floor_to_lot(raw, lot);
+        assert_eq!(
+            actual, expected,
+            "floor_to_lot({raw}, {lot}) = {actual:.17}, want {expected:.17}"
+        );
+    }
+}
+
+#[test]
 fn declared_currency_precision_quantizes_crypto_fees_and_pnl() {
     let config = BacktestConfig { fees: 0.001, ..BacktestConfig::default() };
     let fee_model = config.fee_model();
@@ -56,13 +78,20 @@ fn declared_currency_precision_quantizes_crypto_fees_and_pnl() {
         0.0,
         None,
         None,
+        FillTerms::WHOLE,
     );
-    assert!(matches!(entered, Some(EngineEvent::Entered { .. })));
-    let exited = kernel.close_at(1, &bar(1, 2923.12), 0, 2923.12, ExitReason::Signal);
+    assert!(matches!(entered, Some(OpenResult { event: EngineEvent::Entered { .. }, .. })));
+    let exited = kernel.close_at(1, &bar(1, 2923.12), 0, 2923.12, ExitReason::Signal, None);
     match exited {
         Some(EngineEvent::Exited { trade, .. }) => {
             assert_eq!(trade.entry_fees, 9.46365885);
             assert_eq!(trade.exit_fees, 8.58070184);
+            // The round trip settles in the same units the fees do: the
+            // entry fee is booked when it is charged and the close books
+            // what it realized less what it cost. Raw float arithmetic over
+            // the same terms lands an ULP below this, at
+            // -901.0013740899999, which is not a number the account could
+            // ever hold.
             assert_eq!(trade.pnl, -901.00137409);
         }
         other => panic!("expected exit, got {other:?}"),
@@ -90,6 +119,77 @@ fn declared_currency_precision_quantizes_cash_and_equity_to_cents() {
     kernel.set_cash(10_117.7602928);
     assert_eq!(kernel.cash(), 10_117.76);
     assert_eq!(kernel.equity(150.123456), 10_117.76);
+}
+
+/// A kernel whose instrument settles in cents, as a listed equity does.
+fn cents_kernel() -> EngineKernel {
+    let config = BacktestConfig::default();
+    let fee_model = config.fee_model();
+    let instrument =
+        InstrumentConfig { currency_precision: Some(2), ..InstrumentConfig::default() };
+    EngineKernel::new(
+        config,
+        fee_model,
+        SlippageModel::None,
+        FillPrice::Close,
+        "KO".to_string(),
+        Direction::Long,
+        Some(&instrument),
+    )
+}
+
+/// The realized gross of the close that exposed the rule.
+///
+/// Thirty shares bought as 25 at 70.04 and 5 at 70.05 average to
+/// 70.041666..., so taking 27 of them back at 69.98 realizes
+/// `27 * -0.061666...` -- exactly minus one and sixty-six and a half cents.
+fn half_cent_gross() -> f64 {
+    let avg_entry = (25.0 * 70.04 + 5.0 * 70.05) / 30.0;
+    27.0 * (69.98 - avg_entry)
+}
+
+#[test]
+fn an_account_settles_each_amount_it_books_rather_than_their_sum() {
+    // Half a cent has to settle one way or the other, and a venue settles
+    // it as it books it -- Nautilus by making every item a `Money` before
+    // it reaches the account. Carrying the fraction into the balance and
+    // rounding the total instead keeps it alive, and on the balance below
+    // the two answers are a cent apart. That is how a run drifts a cent
+    // away from the venue's own statement without any trade differing.
+    let gross = half_cent_gross();
+    let mut kernel = cents_kernel();
+    kernel.set_cash(128.05);
+    kernel.book_cash(&[gross]);
+    assert_eq!(kernel.cash(), 126.38);
+
+    // Kept rather than described: this is what rounding only the sum says,
+    // so the difference the rule makes is visible in the test itself.
+    assert_eq!(quantize_money(128.05 + gross, Some(2)), 126.39);
+}
+
+#[test]
+fn every_amount_settles_including_the_fee_beside_it() {
+    // Two items, and each is money on its own: the fill's realized gross
+    // and the commission charged on it. Booking them as one sum would
+    // settle their total, which is not what either of them was.
+    let gross = half_cent_gross();
+    let mut kernel = cents_kernel();
+    kernel.set_cash(128.05);
+    kernel.book_cash(&[gross, -1.0]);
+    assert_eq!(kernel.cash(), 125.38);
+}
+
+#[test]
+fn an_instrument_with_no_currency_precision_books_cash_untouched() {
+    // No declared unit is no unit to settle in, so every amount passes
+    // through and the balance is the same additions in the same order
+    // stock Raptor has always made -- bit for bit, which is what the golden
+    // fixtures pin.
+    let gross = half_cent_gross();
+    let mut kernel = make_kernel();
+    kernel.set_cash(128.05);
+    kernel.book_cash(&[gross, -1.0]);
+    assert_eq!(kernel.cash(), 128.05 + gross - 1.0);
 }
 
 fn bar(idx: i64, price: Price) -> KernelBar {
@@ -158,6 +258,565 @@ fn step_quote_does_not_move_the_trailing_watermark() {
     assert_eq!(before.stop_price, after.stop_price);
     assert_eq!(kernel.best_bid(), Some(500.0));
     assert_eq!(kernel.best_ask(), Some(501.0));
+}
+
+/// A kernel that replays each bar as four prints, like Nautilus does.
+fn bounded_kernel(policy: PositionPolicy) -> EngineKernel {
+    let config = BacktestConfig { bar_volume_slices: 4.0, ..BacktestConfig::default() };
+    let fee_model = config.fee_model();
+    let mut kernel = EngineKernel::new(
+        config,
+        fee_model,
+        SlippageModel::None,
+        FillPrice::Close,
+        "TEST".to_string(),
+        Direction::Long,
+        None,
+    );
+    kernel.set_position_policy(policy);
+    kernel
+}
+
+/// A bounded kernel on a discrete price grid, so a sweep has a next level
+/// to land on rather than collapsing onto the price it swept.
+fn bounded_kernel_on_a_grid(policy: PositionPolicy, increment: f64) -> EngineKernel {
+    let mut kernel = bounded_kernel(policy);
+    kernel.configured_price_increment = Some(increment);
+    kernel
+}
+
+/// A bounded kernel whose sizes sit on a whole-unit lot grid, so a bar's
+/// prints have something to round onto.
+fn bounded_kernel_on_a_lot(policy: PositionPolicy, lot: f64) -> EngineKernel {
+    let config = BacktestConfig {
+        bar_volume_slices: 4.0,
+        same_bar_marketable_limit_on_close: true,
+        ..BacktestConfig::default()
+    };
+    let fee_model = config.fee_model();
+    let inst = InstrumentConfig { lot_size: Some(lot), ..InstrumentConfig::default() };
+    let mut kernel = EngineKernel::new(
+        config,
+        fee_model,
+        SlippageModel::None,
+        FillPrice::Close,
+        "TEST".to_string(),
+        Direction::Long,
+        Some(&inst),
+    );
+    kernel.set_position_policy(policy);
+    kernel
+}
+
+/// A kernel funded with a known amount under a chosen account mode, so a
+/// test can put an order against capital that does or does not fund it.
+fn make_kernel_with_capital(capital: f64, account: AccountMode) -> EngineKernel {
+    let config = BacktestConfig {
+        initial_capital: capital,
+        same_bar_marketable_limit_on_close: true,
+        ..BacktestConfig::default()
+    };
+    let fee_model = config.fee_model();
+    let mut kernel = EngineKernel::new(
+        config,
+        fee_model,
+        SlippageModel::None,
+        FillPrice::Close,
+        "TEST".to_string(),
+        Direction::Long,
+        None,
+    )
+    .with_account_mode(account);
+    kernel.set_position_policy(PositionPolicy::Net);
+    kernel
+}
+
+fn bar_with_volume(idx: i64, price: Price, volume: f64) -> KernelBar {
+    KernelBar { volume, ..bar(idx, price) }
+}
+
+fn order_status(kernel: &EngineKernel, id: u64) -> OrderStatus {
+    kernel.orders.get(id).expect("order").status
+}
+
+/// A margin account of infinite leverage locks nothing, so a sized order
+/// fills however little cash is on hand. This is the Nautilus equity venue:
+/// its instruments declare `margin_init = 0`, so its accounts refuse no
+/// order for want of capital, and a cash account is not a mirror of one --
+/// it would refuse the very orders that venue filled.
+#[test]
+fn an_unfunded_margin_account_never_refuses_a_sized_order() {
+    let capital = 500.0;
+    let submit = |kernel: &mut EngineKernel| {
+        kernel.submit_order_full(
+            OrderSide::Buy,
+            QtySpec::Units(10.0),
+            OrderKind::Limit { price: 105.0 },
+            TimeInForce::Ioc,
+            0,
+            0,
+            "entry".to_string(),
+            None,
+            None,
+            false,
+            false,
+            false,
+            None,
+        );
+        kernel.step(0, &bar(0, 100.0), StepInput::default())
+    };
+
+    // Fully funded, 1,000 of notional does not fit in 500 of cash.
+    let mut cash = make_kernel_with_capital(capital, AccountMode::Cash);
+    let refused = submit(&mut cash);
+    assert!(
+        refused.iter().any(|event| matches!(
+            event,
+            EngineEvent::OrderRejected { reason: "insufficient_capital", .. }
+        )),
+        "cash should refuse what it cannot fund: {refused:?}"
+    );
+
+    // The same order against a venue that locks no margin.
+    let mut unfunded =
+        make_kernel_with_capital(capital, AccountMode::Margin { leverage: f64::INFINITY });
+    let filled = submit(&mut unfunded);
+    assert!(
+        filled.iter().any(|event| matches!(event, EngineEvent::Entered { .. })),
+        "an unfunded venue posts nothing against the position: {filled:?}"
+    );
+    assert_eq!(unfunded.locked_margin(), 0.0, "an unfunded venue posts no margin");
+}
+
+/// The same account leaves a capital fraction with nothing to divide by, so
+/// it names no size. Refusing says so; dividing would open a position of
+/// infinite size.
+#[test]
+fn a_capital_fraction_is_refused_by_an_account_that_funds_nothing() {
+    let mut kernel =
+        make_kernel_with_capital(500.0, AccountMode::Margin { leverage: f64::INFINITY });
+    kernel.submit_order_full(
+        OrderSide::Buy,
+        QtySpec::CapitalFrac(0.5),
+        OrderKind::Limit { price: 105.0 },
+        TimeInForce::Ioc,
+        0,
+        0,
+        "entry".to_string(),
+        None,
+        None,
+        false,
+        false,
+        false,
+        None,
+    );
+    let events = kernel.step(0, &bar(0, 100.0), StepInput::default());
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            EngineEvent::OrderRejected { reason: "unfunded_sizing", .. }
+        )),
+        "a fraction of capital names no size here: {events:?}"
+    );
+    assert!(kernel.position_snapshot().is_none(), "nothing should have opened");
+}
+
+/// An order the venue received before this bar's print transacted when it
+/// arrived: it met the book standing then, and the round trip it opens and
+/// closes is dated to those instants rather than to the bars it beat.
+#[test]
+fn a_fill_taken_before_a_bar_is_dated_when_the_order_arrived() {
+    let mut kernel = make_kernel();
+    kernel.set_position_policy(PositionPolicy::Net);
+    let at = |ts: i64, idx: i64, price: Price| KernelBar { timestamp: ts, ..bar(idx, price) };
+
+    // A first bar leaves a book at 100.
+    kernel.step(0, &at(100, 0, 100.0), StepInput::default());
+
+    // Sent at 150, between the bars: it crosses the standing book at 100.
+    kernel.submit_order_full(
+        OrderSide::Buy,
+        QtySpec::Units(10.0),
+        OrderKind::Limit { price: 105.0 },
+        TimeInForce::Ioc,
+        1,
+        150,
+        "entry".to_string(),
+        None,
+        None,
+        false,
+        false,
+        true,
+        None,
+    );
+    kernel.step(1, &at(200, 1, 110.0), StepInput::default());
+    assert_eq!(kernel.position_snapshot().expect("open").entry_price, 100.0);
+
+    // The close arrives the same way, ahead of the third bar.
+    kernel.submit_order_full(
+        OrderSide::Sell,
+        QtySpec::Units(10.0),
+        OrderKind::Limit { price: 95.0 },
+        TimeInForce::Ioc,
+        2,
+        250,
+        "exit".to_string(),
+        None,
+        None,
+        false,
+        true,
+        true,
+        None,
+    );
+    let events = kernel.step(2, &at(300, 2, 120.0), StepInput::default());
+    let trade = events
+        .iter()
+        .find_map(|event| match event {
+            EngineEvent::Exited { trade, .. } => Some(trade),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no round trip, got {events:?}"));
+    assert_eq!((trade.entry_price, trade.exit_price), (100.0, 110.0));
+    assert_eq!(
+        (trade.entry_time, trade.exit_time),
+        (150, 250),
+        "a fill dated by the bar it beat would read (200, 300)"
+    );
+}
+
+#[test]
+fn a_bar_bounds_an_entry_to_one_print_of_its_volume() {
+    let mut kernel = bounded_kernel(PositionPolicy::Net);
+    // Resting on the bar's low: the market came down to the order and
+    // turned, so only the print that touched it was ever on offer.
+    let id = kernel.submit_order(
+        OrderSide::Buy,
+        QtySpec::Units(100.0),
+        OrderKind::Limit { price: 99.0 },
+        TimeInForce::Gtc,
+        0,
+        0,
+        "e".to_string(),
+        None,
+        None,
+    );
+    // 40 traded, four prints, so the one that touched the order shows 10.
+    let events = kernel.step(1, &bar_with_volume(1, 100.0, 40.0), StepInput::default());
+    let filled: Vec<f64> = events
+        .iter()
+        .filter_map(|e| match e {
+            EngineEvent::OrderFilled { size, .. } => Some(*size),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(filled, vec![10.0], "got {events:?}");
+    assert_eq!(kernel.position_snapshot().unwrap().size, 10.0);
+    assert_eq!(order_status(&kernel, id), OrderStatus::PartiallyFilled);
+}
+
+#[test]
+fn an_ioc_entry_that_fills_short_dies_with_its_remainder() {
+    let mut kernel = bounded_kernel(PositionPolicy::Net);
+    let id = kernel.submit_order(
+        OrderSide::Buy,
+        QtySpec::Units(100.0),
+        OrderKind::Market,
+        TimeInForce::Ioc,
+        0,
+        0,
+        "ioc".to_string(),
+        None,
+        None,
+    );
+    // A market order would cross the book and fill whole -- but this one is
+    // canceled the instant its first fill lands, so it gets one print.
+    let events = kernel.step(0, &bar_with_volume(0, 100.0, 40.0), StepInput::default());
+    assert!(
+        events.iter().any(|e| matches!(e, EngineEvent::OrderCanceled { .. })),
+        "the unfilled remainder must be canceled, got {events:?}"
+    );
+    assert_eq!(order_status(&kernel, id), OrderStatus::Canceled);
+    assert_eq!(kernel.position_snapshot().unwrap().size, 10.0);
+}
+
+#[test]
+fn a_working_entry_takes_more_size_on_the_next_bar() {
+    // A resting order is not done when a bar runs out of size; it keeps
+    // taking prints until it has the whole quantity it asked for.
+    let mut kernel = bounded_kernel(PositionPolicy::NetAveraging);
+    let id = kernel.submit_order(
+        OrderSide::Buy,
+        QtySpec::Units(20.0),
+        OrderKind::Limit { price: 99.0 },
+        TimeInForce::Gtc,
+        0,
+        0,
+        "g".to_string(),
+        None,
+        None,
+    );
+    // The bar bottoms out exactly on the order: 40 traded, so 10 of the 20
+    // fill and the rest keeps resting.
+    kernel.step(1, &bar_with_volume(1, 100.0, 40.0), StepInput::default());
+    assert_eq!(order_status(&kernel, id), OrderStatus::PartiallyFilled);
+    assert_eq!(kernel.position_snapshot().unwrap().size, 10.0);
+
+    // The next bar trades *through* 99, emptying the book beneath the
+    // order, and the remainder fills at once.
+    kernel.step(2, &bar_with_volume(2, 99.0, 400.0), StepInput::default());
+    assert_eq!(order_status(&kernel, id), OrderStatus::Filled);
+
+    let snapshot = kernel.position_snapshot().unwrap();
+    assert_eq!(snapshot.size, 20.0, "both fills belong to one position");
+    // Both fills came off at the resting limit, so averaging them returns
+    // that price exactly. The weighting across *differing* prices is pinned
+    // in the ledger tests.
+    assert_eq!(snapshot.entry_price, 99.0);
+}
+
+#[test]
+fn an_exit_bounded_by_volume_leaves_the_position_open() {
+    let mut kernel = bounded_kernel(PositionPolicy::Net);
+    kernel.submit_order(
+        OrderSide::Buy,
+        QtySpec::Units(20.0),
+        OrderKind::Market,
+        TimeInForce::Gtc,
+        0,
+        0,
+        "in".to_string(),
+        None,
+        None,
+    );
+    kernel.step(0, &bar_with_volume(0, 100.0, 400.0), StepInput::default());
+    assert_eq!(kernel.position_snapshot().unwrap().size, 20.0);
+
+    let exit_id = kernel.submit_order(
+        OrderSide::Sell,
+        QtySpec::FullPosition,
+        OrderKind::Limit { price: 111.0 },
+        TimeInForce::Gtc,
+        0,
+        0,
+        "out".to_string(),
+        None,
+        None,
+    );
+    // The bar tops out exactly on the exit and turns: 40 traded, so only
+    // the 10 shown by the print that touched it can come off.
+    let events = kernel.step(1, &bar_with_volume(1, 110.0, 40.0), StepInput::default());
+    assert!(
+        !events.iter().any(|e| matches!(e, EngineEvent::Exited { .. })),
+        "a partial exit is not a round trip, got {events:?}"
+    );
+    assert_eq!(kernel.position_snapshot().unwrap().size, 10.0);
+    assert_eq!(order_status(&kernel, exit_id), OrderStatus::PartiallyFilled);
+
+    // The rest comes off on a bar that trades through the exit, and only
+    // then is there a trade -- one trade, spanning both exit fills.
+    let events = kernel.step(2, &bar_with_volume(2, 120.0, 4_000.0), StepInput::default());
+    let trades: Vec<&Trade> = events
+        .iter()
+        .filter_map(|e| match e {
+            EngineEvent::Exited { trade, .. } => Some(trade),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(trades.len(), 1, "got {events:?}");
+    assert_eq!(trades[0].size, 20.0, "one trade spanning both exit fills");
+    // Both fills came off at the resting limit, so the size-weighted exit
+    // is that price. The weighting itself is pinned in the ledger tests.
+    assert_eq!(trades[0].exit_price, 111.0);
+    assert!(!kernel.is_in_position());
+}
+
+#[test]
+fn a_bar_that_trades_through_an_order_fills_it_whole() {
+    // The counterpart to the bounded case: the bar did not stop at the
+    // order, it went past it. There was nothing left resting underneath, so
+    // the whole quantity fills even though the bar traded far less volume
+    // than the order asked for.
+    let mut kernel = bounded_kernel(PositionPolicy::Net);
+    let id = kernel.submit_order(
+        OrderSide::Buy,
+        QtySpec::Units(100.0),
+        OrderKind::Limit { price: 99.5 },
+        TimeInForce::Gtc,
+        0,
+        0,
+        "thru".to_string(),
+        None,
+        None,
+    );
+    // 40 traded against an order for 100, and the low of 99 is through it.
+    kernel.step(1, &bar_with_volume(1, 100.0, 40.0), StepInput::default());
+    assert_eq!(order_status(&kernel, id), OrderStatus::Filled);
+    assert_eq!(kernel.position_snapshot().unwrap().size, 100.0);
+}
+
+#[test]
+fn a_resting_order_the_market_moves_through_fills_at_its_own_price() {
+    // Two fills, not one: the print that reached the order, then the rest.
+    // Both at 99.5, because the order was resting there before the market
+    // came down -- it is the side being traded against, not the side
+    // crossing, so it never pays up for its own remainder.
+    let mut kernel = bounded_kernel_on_a_grid(PositionPolicy::Net, 0.25);
+    let id = kernel.submit_order(
+        OrderSide::Buy,
+        QtySpec::Units(100.0),
+        OrderKind::Limit { price: 99.5 },
+        TimeInForce::Gtc,
+        0,
+        0,
+        "through".to_string(),
+        None,
+        None,
+    );
+    // A quarter of 40 prints at the low of 99, which is through the order.
+    kernel.step(1, &bar_with_volume(1, 100.0, 40.0), StepInput::default());
+    assert_eq!(order_status(&kernel, id), OrderStatus::Filled);
+    let position = kernel.position_snapshot().expect("position");
+    assert_eq!(position.size, 100.0);
+    assert!(
+        (position.entry_price - 99.5).abs() < 1e-9,
+        "entry {} should be the resting limit",
+        position.entry_price
+    );
+}
+
+#[test]
+fn a_sweep_pays_one_increment_worse_than_the_book_it_emptied() {
+    // The aggressive counterpart: an order submitted while the bar was
+    // being observed crosses the book it finds. It takes what the book was
+    // showing, and the remainder pays one increment up for the level
+    // behind it.
+    let mut kernel = bounded_kernel_on_a_grid(PositionPolicy::Net, 0.25);
+    let id = kernel.submit_order(
+        OrderSide::Buy,
+        QtySpec::Units(100.0),
+        OrderKind::Market,
+        TimeInForce::Gtc,
+        1,
+        1,
+        "sweep".to_string(),
+        None,
+        None,
+    );
+    // The bar closed at 100 showing a quarter of its 40 volume; the order
+    // is priced through that, so the other 90 sweep the next level up.
+    kernel.step(1, &bar_with_volume(1, 100.0, 40.0), StepInput::default());
+    assert_eq!(order_status(&kernel, id), OrderStatus::Filled);
+    let position = kernel.position_snapshot().expect("position");
+    assert_eq!(position.size, 100.0);
+    let expected = (10.0 * 100.0 + 90.0 * 100.25) / 100.0;
+    assert!(
+        (position.entry_price - expected).abs() < 1e-9,
+        "swept entry {} should average {expected}",
+        position.entry_price
+    );
+}
+
+#[test]
+fn the_closing_print_of_a_bar_carries_the_rounding_remainder() {
+    // A quarter of 41 is 10.25, off a whole-unit lot grid, so the first
+    // three prints show 10 and the close shows the 11 they left behind --
+    // the four summing to the bar's volume exactly rather than to 40.
+    let mut kernel = bounded_kernel_on_a_lot(PositionPolicy::Net, 1.0);
+    let id = kernel.submit_order(
+        OrderSide::Buy,
+        QtySpec::Units(100.0),
+        OrderKind::Limit { price: 100.0 },
+        TimeInForce::Ioc,
+        1,
+        1,
+        "remainder".to_string(),
+        None,
+        None,
+    );
+    // Submitted while bar 1 was observed, so the close is the only print
+    // still ahead of it -- and the close is where the remainder lives.
+    // Reading the bar's range instead would be look-ahead.
+    kernel.step(1, &bar_with_volume(1, 100.0, 41.0), StepInput::default());
+    // Immediate-or-cancel, so what the close could not absorb is killed and
+    // the size that did trade is the remainder alone.
+    assert_eq!(order_status(&kernel, id), OrderStatus::Canceled);
+    assert_eq!(kernel.position_snapshot().expect("position").size, 11.0);
+}
+
+#[test]
+fn each_fill_reports_the_fees_it_paid_and_what_it_left_outstanding() {
+    // A partial fill is only describable if the event says how much of the
+    // order survived it and what that slice alone cost. Re-deriving either
+    // from the position afterwards cannot separate the two fills.
+    let config =
+        BacktestConfig { bar_volume_slices: 4.0, fees: 0.001, ..BacktestConfig::default() };
+    let fee_model = config.fee_model();
+    let mut kernel = EngineKernel::new(
+        config,
+        fee_model,
+        SlippageModel::None,
+        FillPrice::Close,
+        "TEST".to_string(),
+        Direction::Long,
+        None,
+    );
+    kernel.set_position_policy(PositionPolicy::Net);
+    kernel.configured_price_increment = Some(0.25);
+    let id = kernel.submit_order(
+        OrderSide::Buy,
+        QtySpec::Units(100.0),
+        OrderKind::Limit { price: 99.5 },
+        TimeInForce::Gtc,
+        0,
+        0,
+        "fees".to_string(),
+        None,
+        None,
+    );
+    let events = kernel.step(1, &bar_with_volume(1, 100.0, 40.0), StepInput::default());
+    let fills: Vec<(f64, f64, f64)> = events
+        .iter()
+        .filter_map(|event| match event {
+            EngineEvent::OrderFilled { order_id, size, commission, leaves, .. }
+                if *order_id == id =>
+            {
+                Some((*size, *commission, *leaves))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(fills.len(), 2, "a swept order fills twice: {fills:?}");
+    let (first_size, first_fee, first_leaves) = fills[0];
+    let (second_size, second_fee, second_leaves) = fills[1];
+    assert_eq!(first_size, 10.0);
+    assert_eq!(first_leaves, 90.0);
+    assert_eq!(second_size, 90.0);
+    assert_eq!(second_leaves, 0.0);
+    // Each fill pays for its own units at its own price, not a share of a
+    // blended average.
+    assert!((first_fee - 10.0 * 99.5 * 0.001).abs() < 1e-9, "first fee {first_fee}");
+    assert!((second_fee - 90.0 * 99.5 * 0.001).abs() < 1e-9, "second fee {second_fee}");
+}
+
+#[test]
+fn an_unbounded_kernel_still_fills_whole_orders() {
+    // The default must be untouched: without a slice count configured,
+    // volume says nothing about how much fills.
+    let mut kernel = make_kernel();
+    let id = kernel.submit_order(
+        OrderSide::Buy,
+        QtySpec::Units(100.0),
+        OrderKind::Market,
+        TimeInForce::Ioc,
+        0,
+        0,
+        "u".to_string(),
+        None,
+        None,
+    );
+    kernel.step(0, &bar_with_volume(0, 100.0, 4.0), StepInput::default());
+    assert_eq!(order_status(&kernel, id), OrderStatus::Filled);
+    assert_eq!(kernel.position_snapshot().unwrap().size, 100.0);
 }
 
 #[test]
@@ -561,6 +1220,7 @@ fn zero_size_entry_emits_rejection() {
     // Lot of 10,000 units at price 100 with 100k capital -> raw size
     // ~999 units floors to zero lots.
     let inst = InstrumentConfig {
+        price_increment: None,
         lot_size: Some(10_000.0),
         alloted_capital: None,
         stop: None,
@@ -619,10 +1279,14 @@ fn instrument_maximum_quantity_rejects_an_oversized_entry() {
         0.0,
         None,
         None,
+        FillTerms::WHOLE,
     );
     assert!(matches!(
         result,
-        Some(EngineEvent::EntryRejected { reason: RejectReason::MaxQuantity, .. })
+        Some(OpenResult {
+            event: EngineEvent::EntryRejected { reason: RejectReason::MaxQuantity, .. },
+            ..
+        })
     ));
     assert!(!kernel.is_in_position());
 }
@@ -1517,6 +2181,7 @@ fn market_order(
         None,
         false,
         reduce_only,
+        false,
         None,
     );
     kernel.step(idx, &bar(idx as i64, price), StepInput::default())
@@ -1603,6 +2268,234 @@ fn a_reduce_only_order_never_opens_and_is_counted() {
         _ => panic!("expected a rejection, got {events:?}"),
     }
     assert_eq!(kernel.rejected_entries(), 1, "a refusal must be observable");
+}
+
+/// Submit a market order for an explicit unit count and step one bar so it
+/// fills.
+fn sized_order(
+    kernel: &mut EngineKernel,
+    idx: usize,
+    price: Price,
+    side: OrderSide,
+    units: f64,
+) -> Vec<EngineEvent> {
+    kernel.submit_order_full(
+        side,
+        QtySpec::Units(units),
+        OrderKind::Market,
+        TimeInForce::Gtc,
+        idx,
+        idx as i64,
+        format!("o{idx}"),
+        None,
+        None,
+        false,
+        false,
+        false,
+        None,
+    );
+    kernel.step(idx, &bar(idx as i64, price), StepInput::default())
+}
+
+/// The same, for an order that may only reduce exposure.
+fn reduce_only_order(
+    kernel: &mut EngineKernel,
+    idx: usize,
+    price: Price,
+    side: OrderSide,
+    units: f64,
+) -> Vec<EngineEvent> {
+    kernel.submit_order_full(
+        side,
+        QtySpec::Units(units),
+        OrderKind::Market,
+        TimeInForce::Gtc,
+        idx,
+        idx as i64,
+        format!("o{idx}"),
+        None,
+        None,
+        false,
+        true,
+        false,
+        None,
+    );
+    kernel.step(idx, &bar(idx as i64, price), StepInput::default())
+}
+
+/// Submit a market order without stepping, so a caller can hand the match
+/// a book of its own choosing.
+fn submit_sized(kernel: &mut EngineKernel, idx: usize, side: OrderSide, units: f64) -> u64 {
+    kernel.submit_order_full(
+        side,
+        QtySpec::Units(units),
+        OrderKind::Market,
+        TimeInForce::Gtc,
+        idx,
+        idx as i64,
+        format!("o{idx}"),
+        None,
+        None,
+        false,
+        false,
+        false,
+        None,
+    )
+}
+
+#[test]
+fn a_closing_order_reduces_by_the_size_it_asks_for() {
+    // The bug this fixes: the close ignored the order's own size and sold
+    // the whole position, so a one-lot trim of eleven held units flattened
+    // the book -- ten units of exposure a venue would still have been
+    // holding.
+    let mut kernel = make_kernel();
+    sized_order(&mut kernel, 0, 100.0, OrderSide::Buy, 11.0);
+    assert_eq!(kernel.position_snapshot().expect("a position").size, 11.0);
+
+    let events = sized_order(&mut kernel, 1, 110.0, OrderSide::Sell, 1.0);
+
+    match events.iter().find(|e| matches!(e, EngineEvent::OrderFilled { .. })) {
+        Some(EngineEvent::OrderFilled { size, leaves, .. }) => {
+            assert_eq!(*size, 1.0, "it asked for one unit");
+            assert_eq!(*leaves, 0.0, "and it got all of what it asked for");
+        }
+        _ => panic!("expected a fill, got {events:?}"),
+    }
+    assert!(
+        !events.iter().any(|e| matches!(e, EngineEvent::Exited { .. })),
+        "the position survives a partial reduction: {events:?}"
+    );
+    assert_eq!(kernel.position_snapshot().expect("ten units left").size, 10.0);
+}
+
+#[test]
+fn a_closing_order_larger_than_the_position_reverses_it() {
+    // A netting venue handed more than it holds does not stop at flat: it
+    // closes what it has and opens the remainder the other way. This is the
+    // only way a long/short book ever reverses a name -- one rebalance order
+    // that sells the long and establishes the short in a single fill -- and
+    // it is what Nautilus does, splitting one venue fill into a closing leg
+    // and an opening one.
+    let mut kernel = make_kernel();
+    sized_order(&mut kernel, 0, 100.0, OrderSide::Buy, 11.0);
+
+    let events = sized_order(&mut kernel, 1, 110.0, OrderSide::Sell, 50.0);
+
+    let fills: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            EngineEvent::OrderFilled { size, leaves, price, .. } => Some((*size, *leaves, *price)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(fills.len(), 2, "one fill per leg: {events:?}");
+    assert_eq!(fills[0].0, 11.0, "the closing leg takes the whole position");
+    assert_eq!(fills[0].1, 39.0, "and leaves the remainder outstanding");
+    assert_eq!(fills[1].0, 39.0, "the opening leg takes the rest");
+    assert_eq!(fills[1].1, 0.0, "which finishes the order");
+    assert_eq!(fills[0].2, fills[1].2, "both legs are one fill, at one price");
+
+    assert!(
+        events.iter().any(|e| matches!(e, EngineEvent::Exited { .. })),
+        "the long is closed: {events:?}"
+    );
+    let opened = kernel.position_snapshot().expect("a reversed position");
+    assert_eq!(opened.size, 39.0);
+    assert_eq!(opened.direction, Direction::Short);
+}
+
+#[test]
+fn a_reduce_only_order_larger_than_the_position_stops_at_flat() {
+    // Reduce-only exists to say "never increase exposure". A protective leg
+    // left working after a stop already trimmed the position must close what
+    // is left and stop, not reverse into a fresh short.
+    let mut kernel = make_kernel();
+    sized_order(&mut kernel, 0, 100.0, OrderSide::Buy, 11.0);
+
+    let events = reduce_only_order(&mut kernel, 1, 110.0, OrderSide::Sell, 50.0);
+
+    match events.iter().find(|e| matches!(e, EngineEvent::OrderFilled { .. })) {
+        Some(EngineEvent::OrderFilled { size, leaves, .. }) => {
+            assert_eq!(*size, 11.0);
+            assert_eq!(*leaves, 0.0, "nothing is left working to reverse into");
+        }
+        _ => panic!("expected a fill, got {events:?}"),
+    }
+    assert!(!kernel.is_in_position());
+}
+
+#[test]
+fn a_bar_too_thin_to_pass_the_position_closes_without_reversing() {
+    // The bar bounds the whole fill, not each leg. A fill that could not
+    // reach past the position never had a remainder to flip into, so the
+    // order closes and keeps working for the rest -- which is a partial
+    // fill, not a reversal.
+    let mut kernel = make_kernel();
+    sized_order(&mut kernel, 0, 100.0, OrderSide::Buy, 11.0);
+    let bar = bar(1, 110.0);
+
+    let order_id = submit_sized(&mut kernel, 1, OrderSide::Sell, 50.0);
+    // A venue acknowledges an order before it can match it, and every caller
+    // of `apply_match_outcome` reaches it through a step that has already
+    // done so. Bounding the depth is what forces this test to hand the
+    // kernel an outcome directly, so it has to acknowledge the order itself.
+    let accepted = kernel
+        .orders
+        .get_mut(order_id)
+        .expect("the order just submitted")
+        .transition(OrderStatus::Accepted);
+    assert!(accepted, "the venue takes the order before it matches it");
+    let mut events = Vec::new();
+    kernel.apply_match_outcome(
+        1,
+        &bar,
+        MatchOutcome::Fill {
+            order_id,
+            price: 110.0,
+            depth: FillDepth::single(11.0, Tail::Rests),
+            on_arrival: false,
+        },
+        &mut events,
+    );
+
+    assert!(!kernel.is_in_position(), "the long is closed: {events:?}");
+    match events.iter().find(|e| matches!(e, EngineEvent::OrderFilled { .. })) {
+        Some(EngineEvent::OrderFilled { size, leaves, .. }) => {
+            assert_eq!(*size, 11.0);
+            assert_eq!(*leaves, 39.0, "the rest is still outstanding");
+        }
+        _ => panic!("expected a fill, got {events:?}"),
+    }
+}
+
+#[test]
+fn a_close_all_order_names_no_size_and_takes_the_whole_position() {
+    let mut kernel = make_kernel();
+    sized_order(&mut kernel, 0, 100.0, OrderSide::Buy, 11.0);
+    kernel.submit_order_full(
+        OrderSide::Sell,
+        QtySpec::FullPosition,
+        OrderKind::Market,
+        TimeInForce::Gtc,
+        1,
+        1,
+        "close-all".to_string(),
+        None,
+        None,
+        false,
+        true,
+        false,
+        None,
+    );
+
+    let events = kernel.step(1, &bar(1, 110.0), StepInput::default());
+
+    match events.iter().find(|e| matches!(e, EngineEvent::OrderFilled { .. })) {
+        Some(EngineEvent::OrderFilled { size, .. }) => assert_eq!(*size, 11.0),
+        _ => panic!("expected a fill, got {events:?}"),
+    }
+    assert!(!kernel.is_in_position());
 }
 
 #[test]
@@ -1870,6 +2763,164 @@ fn next_bar_open_market_order_fills_at_the_next_bars_open() {
         assert!(filled, "tif {tif:?}: expected a fill at 104.0 on bar 1, got {events:?}");
         assert!(kernel.is_in_position());
     }
+}
+
+/// Settle one round trip, taking the exit off in the given pieces, and
+/// report the cash it left behind.
+fn cash_after_unwinding_in(pieces: &[f64]) -> f64 {
+    let mut kernel = make_kernel();
+    kernel.set_cash(10_000.0);
+    let entered = kernel.open_at(
+        0,
+        &bar(0, 100.0),
+        Direction::Long,
+        100.0,
+        None,
+        Some(10.0),
+        0.0,
+        None,
+        None,
+        FillTerms::WHOLE,
+    );
+    assert!(matches!(entered, Some(OpenResult { event: EngineEvent::Entered { .. }, .. })));
+    for cap in pieces {
+        kernel.reduce_at(1, &bar(1, 110.0), 0, 110.0, ExitReason::Signal, *cap, None, None);
+    }
+    assert_eq!(kernel.ledger.open_count(), 0, "the position must end flat");
+    kernel.cash()
+}
+
+#[test]
+fn the_number_of_fills_an_exit_takes_does_not_change_the_account() {
+    // The same ten units off at the same price, once in a single fill and
+    // once split in two. Settling the round trip on the closing fill --
+    // rather than each fill as it lands -- pays the first fill's proceeds a
+    // second time and leaves the split kernel richer for nothing.
+    let whole = cash_after_unwinding_in(&[10.0]);
+    assert_eq!(cash_after_unwinding_in(&[4.0, 6.0]), whole);
+    assert_eq!(cash_after_unwinding_in(&[1.0, 1.0, 8.0]), whole);
+}
+
+#[test]
+fn each_closing_fill_reports_only_the_pnl_it_realized() {
+    // A closing fill realizes its own units at its own price. Reporting the
+    // round trip on the fill that goes flat would count the earlier fills a
+    // second time -- the same error that once paid the account twice for
+    // them.
+    let mut kernel = make_kernel();
+    kernel.set_cash(10_000.0);
+    let entered = kernel.open_at(
+        0,
+        &bar(0, 100.0),
+        Direction::Long,
+        100.0,
+        None,
+        Some(10.0),
+        0.0,
+        None,
+        None,
+        FillTerms::WHOLE,
+    );
+    assert!(matches!(entered, Some(OpenResult { event: EngineEvent::Entered { .. }, .. })));
+
+    let first = kernel.reduce_at(1, &bar(1, 110.0), 0, 110.0, ExitReason::Signal, 4.0, None, None);
+    let second = kernel.reduce_at(1, &bar(1, 110.0), 0, 110.0, ExitReason::Signal, 6.0, None, None);
+    let ReduceResult::Reduced { gross_realized: first_gross, fees: first_fees, .. } = &first else {
+        panic!("expected a partial reduction, got {first:?}");
+    };
+    let ReduceResult::Closed { gross_realized: second_gross, fees: second_fees, event, .. } =
+        &second
+    else {
+        panic!("expected a close, got {second:?}");
+    };
+    // Ten a unit gross on four units, then on six.
+    assert!((first_gross - 40.0).abs() < 1e-9, "first {first_gross}");
+    assert!((second_gross - 60.0).abs() < 1e-9, "second {second_gross}");
+
+    let EngineEvent::Exited { trade, .. } = event else {
+        panic!("expected an exit, got {event:?}")
+    };
+    // Netting each fill against its own fee accounts for the whole round
+    // trip and nothing more.
+    let fills = (first_gross - first_fees) + (second_gross - second_fees);
+    let round_trip = trade.pnl + trade.entry_fees;
+    assert!((fills - round_trip).abs() < 1e-9, "fills {fills} against round trip {round_trip}");
+}
+
+#[test]
+fn a_position_closed_in_full_leaves_no_dust_behind() {
+    // The bug this fixes: an entry filled in two pieces held
+    // 0.03835 + 0.04381 = 0.08216000000000001 units, and selling the
+    // 0.08216 it had bought left 1.4e-17 of a coin open. Nothing could
+    // ever close that -- no order asks for a hundredth of a femto-lot --
+    // so every later entry averaged into the same position and the run
+    // reported one round trip that never ended in place of the forty-odd
+    // it actually made.
+    let inst = InstrumentConfig { lot_size: Some(0.00001), ..InstrumentConfig::default() };
+    let config = BacktestConfig::default();
+    let fee_model = config.fee_model();
+    let mut kernel = EngineKernel::new(
+        config,
+        fee_model,
+        SlippageModel::None,
+        FillPrice::Close,
+        "BTCUSDT".to_string(),
+        Direction::Long,
+        Some(&inst),
+    );
+    kernel.set_position_policy(PositionPolicy::NetAveraging);
+    sized_order(&mut kernel, 0, 100.0, OrderSide::Buy, 0.03835);
+    sized_order(&mut kernel, 1, 100.0, OrderSide::Buy, 0.04381);
+    assert_eq!(
+        kernel.position_snapshot().expect("a position").size,
+        0.08216,
+        "two fills on the grid hold a size on the grid"
+    );
+
+    let events = sized_order(&mut kernel, 2, 110.0, OrderSide::Sell, 0.08216);
+
+    assert!(
+        events.iter().any(|e| matches!(e, EngineEvent::Exited { .. })),
+        "selling all of it closes it, got {events:?}"
+    );
+    assert!(
+        kernel.position_snapshot().is_none(),
+        "nothing is left open: {:?}",
+        kernel.position_snapshot().map(|p| p.size)
+    );
+}
+
+#[test]
+fn a_resumed_order_asks_for_the_remainder_the_venue_still_owes() {
+    // The bug this fixes: 0.07841 units filled down to 0.06531 leave
+    // 0.013099999999999987 -- 1309.9999999999986 lots -- and flooring that
+    // asked for 0.01309, a lot less than the venue still owed. The order
+    // never finished, and every later fill inherited the shortfall.
+    let mut kernel = bounded_kernel_on_a_lot(PositionPolicy::NetAveraging, 0.00001);
+    let id = kernel.submit_order(
+        OrderSide::Buy,
+        QtySpec::Units(0.07841),
+        OrderKind::Limit { price: 99.0 },
+        TimeInForce::Gtc,
+        0,
+        0,
+        "g".to_string(),
+        None,
+        None,
+    );
+    // A quarter of the bar's volume is all one aggressive order may take.
+    kernel.step(1, &bar_with_volume(1, 100.0, 0.26126), StepInput::default());
+    assert_eq!(order_status(&kernel, id), OrderStatus::PartiallyFilled);
+    assert_eq!(kernel.position_snapshot().expect("a position").size, 0.06531);
+
+    kernel.step(2, &bar_with_volume(2, 99.0, 400.0), StepInput::default());
+
+    assert_eq!(order_status(&kernel, id), OrderStatus::Filled);
+    assert_eq!(
+        kernel.position_snapshot().expect("a position").size,
+        0.07841,
+        "the two fills add up to the size the order asked for"
+    );
 }
 
 // ── Short-option margin: the SPAN-style deposit on a sold option ──────────

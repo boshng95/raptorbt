@@ -104,9 +104,11 @@ pub enum TimeInForce {
     Gtd { expire_ns: Timestamp },
     /// Match against exactly one bar, then cancel.
     Ioc,
-    /// Fill completely against one bar or cancel. With `partial_fills` on,
-    /// a print smaller than the remainder cancels the order untouched;
-    /// without it, behaves like [`TimeInForce::Ioc`].
+    /// Fill completely against one bar or cancel.
+    ///
+    /// Not yet distinguished from [`TimeInForce::Ioc`] on this branch: a
+    /// bounded fill takes what the bar offers and the remainder is
+    /// canceled, where a true fill-or-kill would take nothing at all.
     Fok,
     /// Market order queued to fill at the next bar's open.
     AtOpen,
@@ -126,8 +128,13 @@ pub enum OrderStatus {
     Accepted,
     /// Stop trigger touched; a stop-limit now rests as a limit.
     Triggered,
-    /// Working: some of the quantity has filled (`filled_qty`), the rest
-    /// still rests. Only reachable with `partial_fills` on.
+    /// Working: some size has filled and the rest is still resting.
+    ///
+    /// Reached only when a liquidity model bounds a fill -- see
+    /// [`BarLiquidity`]. Without one every fill is for the order's whole
+    /// size and this state is unreachable.
+    ///
+    /// [`BarLiquidity`]: crate::execution::fill::BarLiquidity
     PartiallyFilled,
     /// Terminal: filled.
     Filled,
@@ -156,6 +163,9 @@ impl OrderStatus {
     }
 
     /// Whether this is an end state.
+    ///
+    /// [`PartiallyFilled`](Self::PartiallyFilled) is deliberately not one:
+    /// the unfilled remainder is still working and must keep matching.
     #[inline]
     pub fn is_terminal(self) -> bool {
         matches!(
@@ -253,6 +263,17 @@ pub struct Order {
     /// Limit orders only: reject instead of filling if marketable at the
     /// open of the first bar the order rests into.
     pub post_only: bool,
+    /// The order reached the venue before the bar it was submitted on did,
+    /// so it meets the book the *previous* step left behind.
+    ///
+    /// A venue processes market data one instrument at a time. A strategy
+    /// trading a basket decides on the bar of whichever name printed first
+    /// and sends orders for the rest, whose bars for that same instant have
+    /// not reached the venue yet: those orders are matched against a book
+    /// one bar older than their own timestamp. `false`, the default, keeps
+    /// the book the submission bar leaves behind.
+    #[serde(default)]
+    pub arrives_before_bar: bool,
     /// Reject fills that would open a position (closing fills only).
     pub reduce_only: bool,
     /// One-triggers-other: held (not matched) until the parent order fills;
@@ -269,10 +290,27 @@ pub struct Order {
     pub trail_watermark: Option<Price>,
     /// Trailing stop-limit: the limit price fixed at trigger time.
     pub trail_limit: Option<Price>,
-    /// Units filled so far. Non-zero only while `PartiallyFilled` (or once
-    /// `Filled`); a whole-fill engine leaves it at the full size on fill.
+    /// Whether this order's stop trigger has been touched.
+    ///
+    /// Kept apart from [`OrderStatus::Triggered`] because the two answer
+    /// different questions. The status is a lifecycle state and a partly
+    /// filled order has to report [`OrderStatus::PartiallyFilled`]; whether
+    /// its trigger already fired is a separate fact that must survive that,
+    /// or a stop-limit would arm itself twice.
+    #[serde(default)]
+    pub triggered: bool,
+    /// Units filled so far. Nonzero only under a bounding liquidity model.
     #[serde(default)]
     pub filled_qty: f64,
+    /// The unit count this order's [`QtySpec`] resolved to, fixed at its
+    /// first fill.
+    ///
+    /// A capital-fraction order has no unit count until something prices
+    /// it, and the remainder after a partial fill has to be the rest of
+    /// *that* size -- re-sizing it against a later bar would let one order
+    /// quietly grow or shrink between fills.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_qty: Option<f64>,
 }
 
 /// What became of one order, once the run is over.
@@ -416,13 +454,62 @@ impl Order {
             stop_price: None,
             target_price: None,
             post_only: false,
+            arrives_before_bar: false,
             reduce_only: false,
             parent_id: None,
             algo_id: None,
             oco_group: None,
             trail_watermark: None,
             trail_limit: None,
+            triggered: false,
             filled_qty: 0.0,
+            resolved_qty: None,
+        }
+    }
+
+    /// The remainder under which an order counts as wholly filled.
+    ///
+    /// Fill sizes are accumulated in floating point and can land a fraction
+    /// of an ULP short of the total they were measured against; a venue
+    /// holds quantities as fixed-precision decimals and has no such
+    /// remainder. One tolerance governs both the leaves and the status, so
+    /// an order can never report itself filled while still showing size to
+    /// fill, nor chase a sliver no instrument can express.
+    #[inline]
+    fn residual_tolerance(total: f64) -> f64 {
+        f64::EPSILON * total.abs().max(1.0) * 4.0
+    }
+
+    /// Units still to fill, once the order's size has been resolved.
+    ///
+    /// `None` before the first fill, when a capital-fraction order has no
+    /// unit count yet.
+    #[inline]
+    pub fn leaves_qty(&self) -> Option<f64> {
+        self.resolved_qty.map(|total| {
+            let leaves = total - self.filled_qty;
+            if leaves <= Self::residual_tolerance(total) {
+                0.0
+            } else {
+                leaves
+            }
+        })
+    }
+
+    /// Record `units` as filled, returning the status the order now holds.
+    ///
+    /// `total` is the size the order resolved to; it is pinned on the first
+    /// fill and every later fill is measured against that same number.
+    pub fn record_fill(&mut self, units: f64, total: f64) -> OrderStatus {
+        let total = *self.resolved_qty.get_or_insert(total);
+        self.filled_qty += units;
+        // A fill that lands within a rounding error of the whole order is
+        // the whole order.
+        let done = total - self.filled_qty <= Self::residual_tolerance(total);
+        if done {
+            OrderStatus::Filled
+        } else {
+            OrderStatus::PartiallyFilled
         }
     }
 
@@ -447,15 +534,17 @@ impl Order {
                 | (Submitted, Canceled)
                 | (Accepted, Triggered)
                 | (Accepted, Filled)
+                | (Accepted, PartiallyFilled)
                 | (Accepted, Canceled)
                 | (Accepted, Expired)
                 | (Accepted, Rejected)
                 | (Triggered, Filled)
+                | (Triggered, PartiallyFilled)
                 | (Triggered, Canceled)
                 | (Triggered, Expired)
                 | (Triggered, Rejected)
-                | (Accepted, PartiallyFilled)
-                | (Triggered, PartiallyFilled)
+                // A partly-filled order is still working: it may take more
+                // size, be finished off, or die with its remainder unfilled.
                 | (PartiallyFilled, PartiallyFilled)
                 | (PartiallyFilled, Filled)
                 | (PartiallyFilled, Canceled)
@@ -464,6 +553,9 @@ impl Order {
         );
         if ok {
             self.status = to;
+            // Latch the trigger here rather than at the call sites, so no
+            // path can arm an order without recording that it armed.
+            self.triggered |= to == Triggered;
         }
         debug_assert!(ok, "illegal order transition {:?} -> {to:?}", self.status);
         ok
@@ -472,7 +564,7 @@ impl Order {
     /// The price a resting order would currently fill or trigger at.
     #[inline]
     pub fn working_price(&self) -> Option<Price> {
-        let triggered = self.limit_live();
+        let triggered = self.triggered;
         match self.kind {
             OrderKind::Market | OrderKind::MarketToLimit => None,
             OrderKind::Limit { price } => Some(price),

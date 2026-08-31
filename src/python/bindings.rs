@@ -148,6 +148,11 @@ pub struct PyBacktestConfig {
     /// Adverse adjustment on limit fills, as a fraction of the limit price.
     #[pyo3(get, set)]
     pub limit_slippage: f64,
+    /// Prints one bar is replayed as, bounding how much of its volume a
+    /// single aggressive order can take. `0.0` leaves fills unbounded;
+    /// `4.0` matches Nautilus Trader's bar-execution model.
+    #[pyo3(get, set)]
+    pub bar_volume_slices: f64,
     /// Force-close positions on a margin call instead of only halting entries.
     #[pyo3(get, set)]
     pub liquidate_on_margin_call: bool,
@@ -196,6 +201,7 @@ impl PyBacktestConfig {
         order_latency_ns=0,
         session_tz_offset_ns=0,
         limit_slippage=0.0,
+        bar_volume_slices=0.0,
         liquidate_on_margin_call=false,
         squareoff_time=None,
         fill_timing=None,
@@ -227,6 +233,7 @@ impl PyBacktestConfig {
         order_latency_ns: i64,
         session_tz_offset_ns: i64,
         limit_slippage: f64,
+        bar_volume_slices: f64,
         liquidate_on_margin_call: bool,
         squareoff_time: Option<String>,
         fill_timing: Option<String>,
@@ -259,6 +266,7 @@ impl PyBacktestConfig {
             order_latency_ns,
             session_tz_offset_ns,
             limit_slippage,
+            bar_volume_slices,
             liquidate_on_margin_call,
             fill_prob_slippage,
             fill_seed,
@@ -397,6 +405,7 @@ impl From<&PyBacktestConfig> for BacktestConfig {
             order_latency_ns: py_config.order_latency_ns,
             session_tz_offset_ns: py_config.session_tz_offset_ns,
             limit_slippage: py_config.limit_slippage,
+            bar_volume_slices: py_config.bar_volume_slices,
             liquidate_on_margin_call: py_config.liquidate_on_margin_call,
             fill_prob_slippage: py_config.fill_prob_slippage,
             fill_seed: py_config.fill_seed,
@@ -412,6 +421,9 @@ impl From<&PyBacktestConfig> for BacktestConfig {
 pub struct PyInstrumentConfig {
     #[pyo3(get, set)]
     pub lot_size: Option<f64>,
+    /// Minimum price step; `None` leaves prices unquantized.
+    #[pyo3(get, set)]
+    pub price_increment: Option<f64>,
     #[pyo3(get, set)]
     pub alloted_capital: Option<f64>,
     #[pyo3(get, set)]
@@ -438,7 +450,9 @@ impl PyInstrumentConfig {
         avg_price=None,
         max_quantity=None,
         currency_precision=None,
+        price_increment=None,
     ))]
+    #[allow(clippy::too_many_arguments)]
     fn new(
         lot_size: Option<f64>,
         alloted_capital: Option<f64>,
@@ -446,9 +460,11 @@ impl PyInstrumentConfig {
         avg_price: Option<f64>,
         max_quantity: Option<f64>,
         currency_precision: Option<u32>,
+        price_increment: Option<f64>,
     ) -> Self {
         Self {
             lot_size,
+            price_increment,
             alloted_capital,
             existing_qty,
             avg_price,
@@ -501,6 +517,7 @@ impl From<&PyInstrumentConfig> for InstrumentConfig {
     fn from(py_config: &PyInstrumentConfig) -> Self {
         InstrumentConfig {
             lot_size: py_config.lot_size,
+            price_increment: py_config.price_increment,
             alloted_capital: py_config.alloted_capital,
             stop: py_config.stop_config,
             target: py_config.target_config,
