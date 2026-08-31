@@ -1,6 +1,6 @@
 # Nautilus parity branch
 
-This branch is based on upstream `v0.10.1` and carries five narrowly scoped
+This branch is based on upstream `v0.10.4` and carries five narrowly scoped
 compatibility corrections used by algotrade-nautilus backtest experiments.
 The corrections are opt-in or default-neutral for existing callers.
 
@@ -30,7 +30,7 @@ The corrections are opt-in or default-neutral for existing callers.
 
 ## Evidence
 
-- All 514 Rust library tests pass with `RAYON_NUM_THREADS=4`.
+- All 518 Rust library tests pass with `RAYON_NUM_THREADS=4`.
 - The algotrade-nautilus strict BTC callback case matched 230 of 230 canonical
   data, indicator, decision, order, fill, fee, position, equity, and metric
   events over 2026-01-01 through 2026-02-01, twice per engine.
