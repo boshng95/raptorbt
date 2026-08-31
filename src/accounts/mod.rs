@@ -40,14 +40,38 @@ impl MarginBook {
         self.locked.values().sum()
     }
 
-    /// Lock margin for a newly opened position.
+    /// Lock margin for an opening fill.
+    ///
+    /// Accumulates, so a position grown by a second fill carries the margin
+    /// for both. For a position id seen for the first time this is exactly
+    /// an insert.
     pub fn lock(&mut self, position_id: u64, amount: f64) {
-        self.locked.insert(position_id, amount);
+        *self.locked.entry(position_id).or_insert(0.0) += amount;
     }
 
     /// Release a closed position's margin, returning the amount.
     pub fn release(&mut self, position_id: u64) -> f64 {
         self.locked.remove(&position_id).unwrap_or(0.0)
+    }
+
+    /// Release the share of a position's margin that a partial close frees.
+    ///
+    /// A `fraction` of one or more releases the whole entry through
+    /// [`Self::release`], so a position that closes in one fill follows the
+    /// exact path it always did rather than a proportional approximation
+    /// of it.
+    pub fn release_fraction(&mut self, position_id: u64, fraction: f64) -> f64 {
+        if !(fraction < 1.0) {
+            return self.release(position_id);
+        }
+        match self.locked.get_mut(&position_id) {
+            Some(locked) => {
+                let freed = *locked * fraction;
+                *locked -= freed;
+                freed
+            }
+            None => 0.0,
+        }
     }
 
     /// Whether the margin-call kill-switch has tripped.

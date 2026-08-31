@@ -90,6 +90,19 @@ pub struct PyEngineEvent {
     /// Caller-supplied order identifier, for `order_*` events.
     #[pyo3(get)]
     pub client_order_id: Option<String>,
+    /// Fees this fill alone paid, for `order_filled` events.
+    #[pyo3(get)]
+    pub commission: Option<f64>,
+    /// Quantity the order still has outstanding after this fill; `0.0`
+    /// means the fill completed it. For `order_filled` events.
+    #[pyo3(get)]
+    pub leaves: Option<f64>,
+    /// PnL this fill alone realized, before its own commission; `0.0` for
+    /// a fill that opened or grew a position. An account moves by
+    /// `gross_realized - commission` on every fill, whichever it was.
+    /// For `order_filled` events.
+    #[pyo3(get)]
+    pub gross_realized: Option<f64>,
 }
 
 #[pymethods]
@@ -111,6 +124,9 @@ impl From<EngineEvent> for PyEngineEvent {
             reject_reason: None,
             order_id: None,
             client_order_id: None,
+            commission: None,
+            leaves: None,
+            gross_realized: None,
         };
         match event {
             EngineEvent::Entered { idx, price, size, direction } => Self {
@@ -150,13 +166,25 @@ impl From<EngineEvent> for PyEngineEvent {
                 client_order_id: Some(client_id),
                 ..empty
             },
-            EngineEvent::OrderFilled { idx, order_id, client_id, price, size } => Self {
+            EngineEvent::OrderFilled {
+                idx,
+                order_id,
+                client_id,
+                price,
+                size,
+                commission,
+                leaves,
+                gross_realized,
+            } => Self {
                 kind: "order_filled".to_string(),
                 idx,
                 price: Some(price),
                 size: Some(size),
                 order_id: Some(order_id),
                 client_order_id: Some(client_id),
+                commission: Some(commission),
+                leaves: Some(leaves),
+                gross_realized: Some(gross_realized),
                 ..empty
             },
             EngineEvent::OrderCanceled { idx, order_id, client_id } => Self {
@@ -282,10 +310,11 @@ impl PyKernelSession {
 
         let policy = match oms_type {
             "netting" => crate::portfolio::ledger::PositionPolicy::Net,
+            "netting-averaging" => crate::portfolio::ledger::PositionPolicy::NetAveraging,
             "hedging" => crate::portfolio::ledger::PositionPolicy::Independent,
             other => {
                 return Err(PyValueError::new_err(format!(
-                    "oms_type must be 'netting' or 'hedging', got {other:?}"
+                    "oms_type must be 'netting', 'netting-averaging' or 'hedging', got {other:?}"
                 )))
             }
         };

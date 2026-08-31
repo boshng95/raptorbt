@@ -1,5 +1,6 @@
 //! Fee calculation models.
 
+use crate::core::decimals::decimal_product;
 use crate::core::types::{Direction, Price};
 use crate::execution::indian_costs::{self, FeeBreakdown, Segment};
 
@@ -73,7 +74,7 @@ impl FeeModel {
 
         match self {
             FeeModel::None => 0.0,
-            FeeModel::Percentage(rate) => trade_value * rate,
+            FeeModel::Percentage(rate) => rate_on_notional(price, size.abs(), *rate),
             FeeModel::Fixed(amount) => *amount,
             FeeModel::PerShare(rate) => size.abs() * rate,
             FeeModel::Tiered(tiers) => {
@@ -86,20 +87,20 @@ impl FeeModel {
                         break;
                     }
                 }
-                trade_value * applicable_rate
+                rate_on_notional(price, size.abs(), applicable_rate)
             }
             FeeModel::Custom { base, per_share } => base + size.abs() * per_share,
             FeeModel::Brokerage { percentage, per_share, minimum, max_percentage } => {
                 let mut fee = if *per_share > 0.0 {
                     size.abs() * per_share
                 } else {
-                    trade_value * percentage
+                    rate_on_notional(price, size.abs(), *percentage)
                 };
                 if *minimum > 0.0 {
                     fee = fee.max(*minimum);
                 }
                 if *max_percentage > 0.0 {
-                    fee = fee.min(trade_value * max_percentage);
+                    fee = fee.min(rate_on_notional(price, size.abs(), *max_percentage));
                 }
                 fee
             }
@@ -162,6 +163,34 @@ impl FeeModel {
     ) -> f64 {
         self.calculate(entry_price, size, direction) + self.calculate(exit_price, size, direction)
     }
+}
+
+/// `price * size * rate`, computed as the decimal it is.
+///
+/// A percentage fee is a rate applied to a notional, and the notional itself
+/// is a product. All three factors are decimals -- a quoted price, a size on
+/// a lot grid, a published rate -- and the venue multiplies them as such.
+/// Evaluating the same expression in binary rounds three times, and can land
+/// on the far side of a tie at the settlement currency's precision, which is
+/// where a commission is quantized. [`decimal_product`] forms the product
+/// exactly and converts it once; see its notes for the two real cases that
+/// straddle a tie in opposite directions.
+///
+/// When a factor is not a short decimal there is no decimal product to
+/// recover, and the best available answer is the correctly-rounded product
+/// of the floats themselves. `mul_add` is specified to round once, so
+/// `a.mul_add(b, -(a * b))` is the exact error of the first product, and
+/// carrying that error through the second multiplication gives it without
+/// pulling in a bignum type.
+#[inline]
+fn rate_on_notional(price: Price, size: f64, rate: f64) -> f64 {
+    if let Some(exact) = decimal_product(&[price, size, rate]) {
+        return exact;
+    }
+    let notional = price * size;
+    let notional_err = price.mul_add(size, -notional);
+    let fee = notional * rate;
+    fee + notional_err.mul_add(rate, notional.mul_add(rate, -fee))
 }
 
 /// Broker-specific fee configurations.
@@ -277,6 +306,25 @@ mod tests {
 
     /// `calculate_side` returns the itemized total, or the flat fee when the
     /// model has no component structure.
+    #[test]
+    fn a_percentage_fee_rounds_the_notional_and_rate_together() {
+        // Both of these are exact ties at USDT's 8 decimals, and the venue
+        // settles them in opposite directions -- the first down, the second
+        // up. Only the exact decimal product reproduces both. See
+        // `rate_on_notional`.
+        let model = FeeModel::Percentage(0.001);
+
+        let btc = model.calculate(92104.5, 0.10379, Direction::Long);
+        assert_eq!((btc * 1e8).round() / 1e8, 9.55952605);
+        let naive: f64 = 92104.5 * 0.10379 * 0.001;
+        assert_ne!((naive * 1e8).round() / 1e8, 9.55952605);
+
+        let avax = model.calculate(11.79, 6.4125, Direction::Long);
+        assert_eq!((avax * 1e8).round() / 1e8, 0.07560338);
+        let naive: f64 = 11.79 * 6.4125 * 0.001;
+        assert_ne!((naive * 1e8).round() / 1e8, 0.07560338);
+    }
+
     #[test]
     fn calculate_side_matches_the_breakdown_it_reports() {
         use crate::execution::indian_costs::Segment;

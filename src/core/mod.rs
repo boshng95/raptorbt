@@ -1,6 +1,8 @@
 //! Core types and utilities for RaptorBT.
 
+pub mod decimals;
 pub mod error;
+pub mod lots;
 pub mod session;
 pub mod timeseries;
 pub mod types;

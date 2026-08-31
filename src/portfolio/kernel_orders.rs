@@ -6,11 +6,14 @@
 
 use crate::core::types::{Direction, ExitReason, Price};
 use crate::execution::algos::{AlgoError, ExecAlgorithm};
+use crate::execution::fill::{FillDepth, NextPrint};
 use crate::execution::orders::{
     MatchOutcome, Order, OrderEngine, OrderKind, OrderSide, OrderStatus, QtySpec, TimeInForce,
 };
 use crate::execution::queue::QueueVerdict;
-use crate::portfolio::kernel::{EngineEvent, EngineKernel, KernelBar};
+use crate::portfolio::kernel::{
+    EngineEvent, EngineKernel, FillTerms, KernelBar, OpenResult, ReduceResult,
+};
 use crate::portfolio::ledger::PositionPolicy;
 use crate::portfolio::risk::RiskGate;
 
@@ -239,14 +242,29 @@ impl EngineKernel {
         self.orders.modify(id, qty, limit_price, trigger_price)
     }
 
+    /// What an order still has outstanding, read after its fill was
+    /// recorded. Zero once nothing is left -- including for an order the
+    /// fill terminated, which no longer reports leaves at all.
+    fn leaves_after_fill(&self, id: u64) -> f64 {
+        self.orders.get(id).and_then(|order| order.leaves_qty()).unwrap_or(0.0).max(0.0)
+    }
+
     /// Shared view of an order by engine id.
     pub fn order(&self, id: u64) -> Option<&Order> {
         self.orders.get(id)
     }
 
-    /// Instrument tick size; `0.0` without a spec.
+    /// One price step on this instrument; `0.0` when prices are a
+    /// continuum, which is the case without either a spec or an explicit
+    /// increment.
+    ///
+    /// An explicit instrument config wins over the spec, the same way it
+    /// does for lot size.
     pub fn price_increment(&self) -> f64 {
-        self.spec.as_ref().map(|s| s.price_increment).unwrap_or(0.0)
+        self.configured_price_increment
+            .or_else(|| self.spec.as_ref().map(|spec| spec.price_increment))
+            .filter(|increment| *increment > 0.0 && increment.is_finite())
+            .unwrap_or(0.0)
     }
 
     /// All non-terminal orders, in submission order.
@@ -297,7 +315,7 @@ impl EngineKernel {
         outcome: MatchOutcome,
         events: &mut Vec<EngineEvent>,
     ) {
-        let (id, matched_price) = match outcome {
+        let (id, matched_price, depth) = match outcome {
             MatchOutcome::Trigger { order_id } => {
                 let client_id =
                     self.orders.get(order_id).map(|o| o.client_id.clone()).unwrap_or_default();
@@ -322,13 +340,27 @@ impl EngineKernel {
                 events.push(EngineEvent::OrderRejected { idx, order_id, client_id, reason });
                 return;
             }
-            MatchOutcome::Fill { order_id, price } => (order_id, price),
+            MatchOutcome::Fill { order_id, price, depth } => (order_id, price, depth),
+        };
+        // A venue cannot fill a fraction of a lot, so the size a print
+        // showed is quantized to the instrument's size grid before it can
+        // bound anything. Truncating (rather than rounding) is what
+        // Nautilus does, and the difference is observable: it decides
+        // whether an order ends the bar filled or one increment short.
+        let offered = depth.cap();
+        let cap = match offered.is_finite() {
+            true => self.round_size(offered),
+            false => offered,
         };
 
         let Some(order) = self.orders.get(id) else { return };
         let side = order.side;
         let qty = order.qty;
         let kind = order.kind;
+        let tif = order.tif;
+        // An order resumed after a partial fill asks for the rest of the
+        // size it already resolved to, not for a fresh sizing.
+        let leaves = order.leaves_qty();
         let status = order.status;
         let client_id = order.client_id.clone();
         let stop_attach = order.stop_price;
@@ -453,6 +485,13 @@ impl EngineKernel {
             }
         };
 
+        // The price the level actually traded at, which is what the next
+        // level is measured from. A market order arrives priced `NAN` and
+        // only resolves against the fill-price model inside the branches
+        // below, so reading the request back would price its sweep off a
+        // price that was never traded.
+        let mut executed: Option<Price> = None;
+
         if opens {
             if reduce_only {
                 // A reduce-only order must never increase exposure. Under
@@ -469,7 +508,20 @@ impl EngineKernel {
                 );
                 return;
             }
-            if !hedging && self.ledger.is_in_position() {
+            // Plain netting holds one position and refuses to add to it.
+            // Netting-with-averaging is the same account model with the
+            // refusal lifted: the fill grows the position instead, which is
+            // what a re-sent remainder needs.
+            //
+            // An order that has already filled part of its size is exempt:
+            // it is finishing the position it opened, not opening a second
+            // one, and refusing it would strand every order a bar could
+            // only partly absorb.
+            let resuming = leaves.is_some();
+            if !resuming
+                && self.ledger.policy() == PositionPolicy::Net
+                && self.ledger.is_in_position()
+            {
                 reject(
                     &mut self.orders,
                     &mut self.risk,
@@ -510,10 +562,11 @@ impl EngineKernel {
             } else {
                 matched_price
             };
-            let (size_mult, explicit_units) = match qty {
-                QtySpec::Units(u) => (None, Some(u)),
-                QtySpec::CapitalFrac(f) => (Some(f), None),
-                QtySpec::FullPosition => {
+            let (size_mult, explicit_units) = match (leaves, qty) {
+                (Some(left), _) => (None, Some(left)),
+                (None, QtySpec::Units(u)) => (None, Some(u)),
+                (None, QtySpec::CapitalFrac(f)) => (Some(f), None),
+                (None, QtySpec::FullPosition) => {
                     reject(
                         &mut self.orders,
                         &mut self.risk,
@@ -526,6 +579,7 @@ impl EngineKernel {
                     return;
                 }
             };
+            let terms = FillTerms { cap, all_or_none: tif == TimeInForce::Fok, resuming };
             match self.open_at(
                 idx,
                 bar,
@@ -539,22 +593,42 @@ impl EngineKernel {
                 self.last_atr,
                 stop_attach,
                 target_attach,
+                terms,
             ) {
-                Some(EngineEvent::Entered { price, size, direction, .. }) => {
-                    if let Some(order) = self.orders.get_mut(id) {
-                        let _ = order.transition(OrderStatus::Filled);
+                Some(OpenResult {
+                    event: EngineEvent::Entered { price, size, direction, .. },
+                    requested,
+                    fees,
+                }) => {
+                    executed = Some(price);
+                    let filled =
+                        self.orders.get_mut(id).map(|order| order.record_fill(size, requested));
+                    if let Some(status) = filled {
+                        if let Some(order) = self.orders.get_mut(id) {
+                            let _ = order.transition(status);
+                        }
                     }
                     events.push(EngineEvent::OrderFilled {
                         idx,
                         order_id: id,
-                        client_id,
+                        client_id: client_id.clone(),
                         price,
                         size,
+                        commission: fees,
+                        leaves: self.leaves_after_fill(id),
+                        // An opening fill realizes nothing; its cost is the
+                        // commission, which the fill reports on its own.
+                        gross_realized: 0.0,
                     });
                     events.push(EngineEvent::Entered { idx, price, size, direction });
-                    self.after_fill(idx, id, events);
+                    match filled {
+                        Some(OrderStatus::PartiallyFilled) => {
+                            self.expire_remainder(idx, id, tif, &client_id, events)
+                        }
+                        _ => self.after_fill(idx, id, events),
+                    }
                 }
-                Some(EngineEvent::EntryRejected { reason, .. }) => {
+                Some(OpenResult { event: EngineEvent::EntryRejected { reason, .. }, .. }) => {
                     // `open_at` already reported this; sizing arithmetic is
                     // not a constraint refusal, and the signal path does not
                     // count it either.
@@ -594,26 +668,154 @@ impl EngineKernel {
             } else {
                 matched_price
             };
-            match self.close_at(idx, bar, position_id, raw_price, ExitReason::Order) {
-                Some(EngineEvent::Exited { trade, .. }) => {
+            // An opposing order closes the position it meets; its own
+            // quantity does not size the close (long-standing behavior).
+            // What can size it down is the bar's liquidity.
+            let open_size = first.position.size;
+            match self.reduce_at(idx, bar, position_id, raw_price, ExitReason::Order, cap) {
+                ReduceResult::Closed { size, price, fees, gross_realized, event } => {
+                    executed = Some(price);
+                    let filled =
+                        self.orders.get_mut(id).map(|order| order.record_fill(size, open_size));
                     if let Some(order) = self.orders.get_mut(id) {
-                        let _ = order.transition(OrderStatus::Filled);
+                        let _ = order.transition(filled.unwrap_or(OrderStatus::Filled));
                     }
                     events.push(EngineEvent::OrderFilled {
                         idx,
                         order_id: id,
                         client_id,
-                        price: trade.exit_price,
-                        size: trade.size,
+                        price,
+                        size,
+                        commission: fees,
+                        leaves: self.leaves_after_fill(id),
+                        gross_realized,
                     });
-                    events.push(EngineEvent::Exited { idx, trade });
+                    events.push(event);
                     self.after_fill(idx, id, events);
+                }
+                ReduceResult::Reduced { size, price, fees, gross_realized } => {
+                    executed = Some(price);
+                    if let Some(order) = self.orders.get_mut(id) {
+                        let status = order.record_fill(size, open_size);
+                        let _ = order.transition(status);
+                    }
+                    events.push(EngineEvent::OrderFilled {
+                        idx,
+                        order_id: id,
+                        client_id: client_id.clone(),
+                        price,
+                        size,
+                        commission: fees,
+                        leaves: self.leaves_after_fill(id),
+                        gross_realized,
+                    });
+                    self.expire_remainder(idx, id, tif, &client_id, events);
                 }
                 // A close that could not fill is not a refused *entry*, so it
                 // stays out of the rejected-entries count.
-                _ => reject_uncounted(&mut self.orders, events, idx, id, &client_id, "unfillable"),
+                ReduceResult::None => {
+                    reject_uncounted(&mut self.orders, events, idx, id, &client_id, "unfillable");
+                    return;
+                }
             }
         }
+
+        if let Some(price) = executed {
+            self.take_next_level(idx, bar, id, price, depth, events);
+        }
+    }
+
+    /// Continue an order that the print it just took could not satisfy.
+    ///
+    /// `price` is the price that actually traded, not the price the match
+    /// asked for: a sweep steps off the level it emptied.
+    ///
+    /// The bar is not one price but a handful of prints, so an order that
+    /// emptied one of them may still find size in the next. Re-entering
+    /// [`Self::apply_match_outcome`] rather than looping here is deliberate:
+    /// a second fill has to pass through exactly the same open/close, risk
+    /// and bookkeeping paths as the first, and there is no way to forget one
+    /// of them if there is only ever one path.
+    fn take_next_level(
+        &mut self,
+        idx: usize,
+        bar: &KernelBar,
+        id: u64,
+        price: Price,
+        depth: FillDepth,
+        events: &mut Vec<EngineEvent>,
+    ) {
+        let outstanding = self
+            .orders
+            .get(id)
+            .filter(|order| !order.status.is_terminal())
+            .and_then(|order| order.leaves_qty())
+            .is_some_and(|leaves| leaves > 0.0);
+        if !outstanding {
+            return;
+        }
+        let (next_price, next_depth) = match depth.next() {
+            // Another print at the order's own price, showing its own size.
+            Some(NextPrint::Same(rest)) => (price, rest),
+            // The market moved through an order that was already resting:
+            // it was there first, so it is the side being traded against
+            // and the whole remainder fills at its own price.
+            Some(NextPrint::Through) => (price, FillDepth::UNLIMITED),
+            // An aggressive order emptied the book at the price it took, so
+            // the remainder crosses the next level, one increment worse. An
+            // instrument with no price grid has no discrete levels, and the
+            // sweep collapses onto the same price.
+            Some(NextPrint::Sweep) => {
+                let increment = self.price_increment();
+                let swept = match self.orders.get(id).map(|order| order.side) {
+                    Some(OrderSide::Buy) => price + increment,
+                    Some(OrderSide::Sell) => price - increment,
+                    None => return,
+                };
+                (swept, FillDepth::UNLIMITED)
+            }
+            None => return,
+        };
+        self.apply_match_outcome(
+            idx,
+            bar,
+            MatchOutcome::Fill { order_id: id, price: next_price, depth: next_depth },
+            events,
+        );
+    }
+
+    /// Decide what happens to the unfilled remainder of a partial fill.
+    ///
+    /// An immediate-or-cancel order lives for exactly one evaluation, so
+    /// what the bar could not absorb is killed and the strategy sees a
+    /// finished order that filled short. Anything else stays working and
+    /// takes more size on later bars.
+    ///
+    /// Contingencies deliberately do not fire here: a one-cancels-other
+    /// sibling must not be pulled, and a held child must not be activated,
+    /// while the order that would trigger them is still partly working.
+    /// Both happen through [`Self::after_fill`] when it completes -- or, for
+    /// an IOC order, not at all, which is right: a bracket whose entry only
+    /// half-filled never fully armed.
+    fn expire_remainder(
+        &mut self,
+        idx: usize,
+        id: u64,
+        tif: TimeInForce,
+        client_id: &str,
+        events: &mut Vec<EngineEvent>,
+    ) {
+        if !matches!(tif, TimeInForce::Ioc | TimeInForce::Fok) {
+            return;
+        }
+        if let Some(order) = self.orders.get_mut(id) {
+            let _ = order.transition(OrderStatus::Canceled);
+        }
+        events.push(EngineEvent::OrderCanceled {
+            idx,
+            order_id: id,
+            client_id: client_id.to_string(),
+        });
     }
 
     /// Contingency consequences of a fill: activate held one-triggers-other

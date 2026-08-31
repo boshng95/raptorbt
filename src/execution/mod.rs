@@ -10,7 +10,9 @@ pub mod slippage;
 
 pub use algos::{AlgoEngine, AlgoError, AlgoSchedule, ExecAlgorithm, PendingSlice};
 pub use fees::FeeModel;
-pub use fill::{FillModel, FillPrice};
+pub use fill::{
+    BarLiquidity, BarTape, FillDepth, FillModel, FillPrice, NextPrint, StepKind, Tail, Tape,
+};
 pub use indian_costs::{calculate_side, CostSchedule, FeeBreakdown, Segment};
 pub use queue::{QueueTracker, QueueVerdict};
 pub use slippage::SlippageModel;

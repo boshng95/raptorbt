@@ -452,6 +452,16 @@ pub struct BacktestConfig {
     #[serde(default)]
     pub limit_slippage: f64,
 
+    /// Prints one bar is replayed as, for bounding a fill by the volume
+    /// that actually traded.
+    ///
+    /// `0.0` (the default) leaves fills unbounded, which is what the engine
+    /// has always done. `4.0` reproduces Nautilus Trader's bar-execution
+    /// model: four synthetic ticks per bar, each carrying a quarter of its
+    /// volume, and one aggressive order takes at most one of them.
+    #[serde(default)]
+    pub bar_volume_slices: f64,
+
     /// Offset added to timestamps before deriving the trading date that
     /// `TimeInForce::Day` expires on.
     ///
@@ -524,6 +534,7 @@ impl Default for BacktestConfig {
             queue_fill_model: false,
             session_tz_offset_ns: 0,
             limit_slippage: 0.0,
+            bar_volume_slices: 0.0,
             liquidate_on_margin_call: false,
             fill_prob_slippage: 0.0,
             fill_seed: 0,
@@ -606,6 +617,11 @@ impl BacktestConfig {
 pub struct InstrumentConfig {
     /// Minimum tradeable quantity (1.0 for NSE EQ, 50.0 for NIFTY F&O, 0.01 for forex).
     pub lot_size: Option<f64>,
+    /// Minimum price step. `None` leaves prices unquantized and collapses
+    /// the book to a continuum, so an order that empties one level sweeps
+    /// the rest at the same price rather than one step worse.
+    #[serde(default)]
+    pub price_increment: Option<f64>,
     /// Per-instrument capital cap.
     pub alloted_capital: Option<f64>,
     /// Per-instrument stop override.

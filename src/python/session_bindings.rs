@@ -78,10 +78,11 @@ impl PyPortfolioSession {
             .ok_or_else(|| PyValueError::new_err("direction must be 1 or -1"))?;
         let policy = match oms_type {
             "netting" => PositionPolicy::Net,
+            "netting-averaging" => PositionPolicy::NetAveraging,
             "hedging" => PositionPolicy::Independent,
             other => {
                 return Err(PyValueError::new_err(format!(
-                    "oms_type must be 'netting' or 'hedging', got {other:?}"
+                    "oms_type must be 'netting', 'netting-averaging' or 'hedging', got {other:?}"
                 )))
             }
         };
