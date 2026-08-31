@@ -34,12 +34,15 @@ The corrections are opt-in or default-neutral for existing callers.
 - The algotrade-nautilus strict BTC callback case matched 230 of 230 canonical
   data, indicator, decision, order, fill, fee, position, equity, and metric
   events over 2026-01-01 through 2026-02-01, twice per engine.
-- The strict callback execution lane was 23.45x faster than Nautilus in that
-  case.
+- A nine-case venue certification over every downloaded Binance symbol plus
+  representative IB US and ASX instruments passed six strict ledgers and
+  identified three volume-limited partial-fill cases for Nautilus fallback.
+  AAPL matched 67/67 events including US sessions and pre-close behavior; CBA
+  matched 172/172 including ASX sessions, AUD settlement, and minimum fees.
 - The separate Raptor array lane completed the exact 3,773-run BTC atlas in
-  278.628 seconds with zero failures on this `v0.10.1` branch. The array API
-  still uses MARKET/IOC
-  semantics and is not claimed to have typed-order parity.
+  287.692 seconds with zero failures on this branch at eight workers: 13.11
+  runs/s and 600.64x faster than the observed two-day run. The array API still
+  uses MARKET/IOC semantics and is not claimed to have typed-order parity.
 
 Paper and live trading remain Nautilus-only. The branch is intended for a
 capability-gated hybrid backtest backend, with Nautilus fallback for unproven
