@@ -401,7 +401,8 @@ impl PyKernelSession {
         units=None, size_frac=None, limit_price=None, trigger_price=None,
         tif="gtc", expire_ns=None, stop_price=None, target_price=None,
         offset=None, offset_kind="price", limit_offset=0.0,
-        post_only=false, reduce_only=false, parent_id=None,
+        post_only=false, reduce_only=false, arrives_before_bar=false,
+        parent_id=None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn submit_order(
@@ -424,6 +425,7 @@ impl PyKernelSession {
         limit_offset: f64,
         post_only: bool,
         reduce_only: bool,
+        arrives_before_bar: bool,
         parent_id: Option<u64>,
     ) -> PyResult<u64> {
         submit_order_on(
@@ -446,6 +448,7 @@ impl PyKernelSession {
             limit_offset,
             post_only,
             reduce_only,
+            arrives_before_bar,
             parent_id,
         )
     }
@@ -704,6 +707,7 @@ pub(crate) fn submit_order_on(
     limit_offset: f64,
     post_only: bool,
     reduce_only: bool,
+    arrives_before_bar: bool,
     parent_id: Option<u64>,
 ) -> PyResult<u64> {
     let side = match side {
@@ -804,6 +808,7 @@ pub(crate) fn submit_order_on(
         target_price,
         post_only,
         reduce_only,
+        arrives_before_bar,
         parent_id,
     ))
 }

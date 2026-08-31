@@ -220,6 +220,7 @@ def run_strategy_backtest(
                     limit_offset=getattr(order, "limit_offset", 0.0),
                     post_only=getattr(order, "post_only", False),
                     reduce_only=order.reduce_only,
+                    arrives_before_bar=order.arrives_before_bar,
                     parent_id=parent_engine_id,
                 )
                 id_map[client_id] = engine_id
