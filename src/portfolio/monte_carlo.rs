@@ -211,7 +211,12 @@ pub fn simulate_portfolio_forward(
         .into_par_iter()
         .enumerate()
         .flat_map(|(chunk_idx, mut rng)| {
-            let start = chunk_idx * chunk_size;
+            // `chunk_size` is rounded up, so the last chunks can begin past
+            // the end of the work: 10 simulations over 8 threads gives a
+            // chunk size of 2 and a ninth thread's worth of range. Clamping
+            // the start leaves those chunks empty rather than asking for a
+            // capacity of `end - start` in wrapped arithmetic.
+            let start = (chunk_idx * chunk_size).min(config.n_simulations);
             let end = (start + chunk_size).min(config.n_simulations);
             let mut chunk_paths = Vec::with_capacity(end - start);
 
@@ -355,6 +360,25 @@ mod tests {
         assert_eq!(result.percentile_paths.len(), 5);
         // Expected return should be positive given positive drift
         assert!(result.expected_return > -50.0); // Sanity check
+    }
+
+    #[test]
+    fn fewer_simulations_than_threads_still_runs() {
+        // Rounding the chunk size up hands the last threads a range that
+        // starts past the end of the work: five simulations over four
+        // threads is a chunk size of two, and the fourth chunk would begin
+        // at six. Every simulation must still be run, and none twice.
+        let returns = vec![vec![0.001; 32], vec![-0.0005; 32]];
+        let weights = vec![0.5, 0.5];
+        let corr = vec![vec![1.0, 0.0], vec![0.0, 1.0]];
+        let config = MonteCarloConfig { n_simulations: 5, horizon_days: 4, seed: 7 };
+
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(4).build().unwrap();
+        let result = pool
+            .install(|| simulate_portfolio_forward(&returns, &weights, &corr, 1000.0, &config))
+            .unwrap();
+
+        assert_eq!(result.final_values.len(), 5);
     }
 
     #[test]
