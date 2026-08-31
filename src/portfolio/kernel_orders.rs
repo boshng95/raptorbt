@@ -81,6 +81,7 @@ impl EngineKernel {
                 None,
                 false,
                 slice.reduce_only,
+                false,
                 None,
             );
             self.orders.set_algo_id(order_id, Some(slice.algo_id));
@@ -142,6 +143,7 @@ impl EngineKernel {
             target_price,
             false,
             false,
+            false,
             None,
         )
     }
@@ -163,6 +165,7 @@ impl EngineKernel {
         target_price: Option<Price>,
         post_only: bool,
         reduce_only: bool,
+        arrives_before_bar: bool,
         parent_id: Option<u64>,
     ) -> u64 {
         let mut order = Order::plain(side, qty, kind, tif);
@@ -173,6 +176,7 @@ impl EngineKernel {
         order.target_price = target_price;
         order.post_only = post_only;
         order.reduce_only = reduce_only;
+        order.arrives_before_bar = arrives_before_bar;
         order.parent_id = parent_id;
         let id = self.orders.submit(order);
 

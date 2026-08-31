@@ -1805,6 +1805,7 @@ fn market_order(
         None,
         false,
         reduce_only,
+        false,
         None,
     );
     kernel.step(idx, &bar(idx as i64, price), StepInput::default())

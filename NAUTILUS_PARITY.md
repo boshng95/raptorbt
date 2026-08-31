@@ -1,7 +1,9 @@
 # Nautilus parity branch
 
-This branch is based on upstream `v0.10.4` and carries twelve narrowly scoped
-compatibility corrections used by algotrade-nautilus backtest experiments.
+This branch is based on upstream `v0.11.0` and carries thirteen narrowly
+scoped compatibility corrections used by algotrade-nautilus backtest
+experiments, plus one fix to a pre-existing upstream bug (see the end of this
+section).
 The corrections are opt-in or default-neutral for existing callers, except
 where a stated one is simply a more accurate reading of the same arithmetic.
 
@@ -143,14 +145,41 @@ where a stated one is simply a more accurate reading of the same arithmetic.
     `record_fill` already judged to have completed an order cannot leave
     `leaves_qty` reporting the 1e-13 of binary residue that made the same
     order `PARTIALLY_FILLED` to one caller and `FILLED` to another.
+13. `Order.arrives_before_bar` matches an order against the book the
+    *previous* bar left behind rather than the one its own bar leaves.
+
+    A venue prices one instrument's bar at a time. A strategy trading a
+    basket decides on the bar of whichever name printed first and sends
+    orders for the rest at that same instant -- and for those names the bar
+    has not reached the venue yet, so they are matched against a book one bar
+    older than their own timestamp. Nautilus does this because its simulated
+    exchange consumes the data stream element by element; nothing about it is
+    a choice the strategy made, and a replay cannot tell the two cases apart
+    without being told which is which. In a nine-name daily rebalance, nine
+    of the ten orders met the older book and only the tenth -- the name whose
+    bar triggered the rebalance -- met its own.
+
+    The flag is per order and defaults to `false`, which is the behaviour the
+    engine always had. It is independent of
+    `same_bar_marketable_limit_on_close` (item 1): an order that reached the
+    venue before its bar has already met a book, so it matches on the bar it
+    was submitted on whether or not same-bar matching is enabled generally.
+    An order that arrives before the very first bar meets no book at all and
+    rests, exactly as one submitted into an empty venue would.
+
+## Upstream fix
+
+`portfolio::monte_carlo` rounds its chunk size up, so with more threads than
+simulations the last chunks began past the end of the work and
+`Vec::with_capacity(end - start)` underflowed -- five simulations over four
+threads is a chunk size of two and a fourth chunk starting at six. The start
+is now clamped, leaving those chunks empty. This is not a parity change; it
+is a bug that predates this branch, and it is why the suite previously needed
+a bounded `RAYON_NUM_THREADS` on a many-core machine.
 
 ## Evidence
 
-- All 565 Rust library tests pass with `RAYON_NUM_THREADS=2`. (Unrelated to
-  this branch: `portfolio::monte_carlo`'s chunking underflows when Rayon has
-  many threads -- `Vec::with_capacity(end - start)` with `end < start` at
-  `monte_carlo.rs:216` -- so the suite needs a bounded thread count on a
-  16-core machine. Present before these changes.)
+- All 573 Rust library tests pass, at any thread count.
 - The algotrade-nautilus 81-case strategy matrix (27 strategies, three
   parameter variants each) has no divergent case: 29 full-ledger passes, two
   decision-only passes, four cases whose strategies never ordered, 42

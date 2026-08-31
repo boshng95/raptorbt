@@ -36,6 +36,11 @@ class _OrderBase:
     stop_price: float | None = None
     target_price: float | None = None
     reduce_only: bool = False
+    #: The order reaches the venue before the bar it is submitted on, so it
+    #: meets the book the previous bar left behind. Set it when a decision
+    #: made on one instrument's bar sends an order for another whose bar for
+    #: that same instant has not arrived yet.
+    arrives_before_bar: bool = False
     tags: dict = field(default_factory=dict)
 
     def __post_init__(self) -> None:

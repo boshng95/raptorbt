@@ -986,6 +986,7 @@ class KernelSession:
         limit_offset: float = ...,
         post_only: bool = ...,
         reduce_only: bool = ...,
+        arrives_before_bar: bool = ...,
         parent_id: int | None = ...,
     ) -> int: ...
     def link_oco(self, order_ids: list[int]) -> None: ...

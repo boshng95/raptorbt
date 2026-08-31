@@ -297,6 +297,9 @@ impl OrderEngine {
             MatchMode::Bar => StepKind::Bar,
             MatchMode::Trade => StepKind::Print,
         };
+        // The book as it stood before this step, for an order that reached
+        // the venue ahead of the bar it was submitted on.
+        let prior_book = self.tape;
         let tape = self.tape.replay(
             bar,
             fill_model.bar_liquidity,
@@ -316,7 +319,12 @@ impl OrderEngine {
                 continue;
             }
             let submitted_this_bar = order.submitted_idx == idx;
-            if submitted_this_bar && !self.same_bar_marketable_limit_on_close {
+            // An order that arrived ahead of its bar has already met a book
+            // -- the one standing when it was sent -- so it matches here
+            // whether or not same-bar matching is enabled generally.
+            if submitted_this_bar
+                && !(self.same_bar_marketable_limit_on_close || order.arrives_before_bar)
+            {
                 continue;
             }
 
@@ -358,12 +366,17 @@ impl OrderEngine {
                 (!depth.is_empty()).then_some(MatchOutcome::Fill { order_id: oid, price: p, depth })
             };
 
-            // A composite callback is delivered before the primary close in
-            // the Nautilus event ordering.  When compatibility is enabled,
-            // only a plain limit which crosses that close participates.  Do
-            // not inspect this bar's high/low: they occurred before the
-            // decision and would introduce look-ahead.
+            // An order submitted while this bar was being observed meets a
+            // standing book, not the bar: only a plain limit which crosses
+            // that book participates. Do not inspect this bar's high/low
+            // either way -- for a same-bar decision they occurred before
+            // the decision existed, and for an order that arrived ahead of
+            // the bar they have not happened yet. Both are look-ahead.
             if submitted_this_bar {
+                // Whichever book was standing when the order reached the
+                // venue: the one this step leaves behind, or -- for an
+                // order sent before this bar arrived -- the one before it.
+                let book = if order.arrives_before_bar { prior_book } else { book };
                 let outcome = match order.kind {
                     // Only the book the step left behind is still ahead of
                     // such an order; reading the bar's range here would be
@@ -612,6 +625,88 @@ mod tests {
             engine_with(OrderKind::Limit { price: 99.0 }, OrderSide::Buy, TimeInForce::Gtc);
         engine.same_bar_marketable_limit_on_close = true;
         assert!(engine.match_bar(0, &bar(0, 100.0, 102.0, 98.0, 100.5), &fm).is_empty());
+    }
+
+    /// An order that reached the venue before its bar meets the book the
+    /// previous bar left behind -- not the price this bar closes at, and
+    /// not its own limit.
+    #[test]
+    fn order_arriving_before_its_bar_meets_the_standing_book() {
+        let (mut engine, id) = engine_with(
+            OrderKind::Limit { price: 101.0 },
+            OrderSide::Buy,
+            TimeInForce::Gtd { expire_ns: 12 },
+        );
+        engine.get_mut(id).unwrap().arrives_before_bar = true;
+        let fm = FillModel::default();
+
+        // A first bar leaves the book at its close; the order was submitted
+        // on the second, before that bar reached the venue.
+        engine.orders[0].submitted_idx = 1;
+        assert!(engine.match_bar(0, &bar(0, 99.0, 100.0, 98.5, 99.5), &fm).is_empty());
+        let outcomes = engine.match_bar(1, &bar(1, 100.0, 102.0, 98.0, 100.5), &fm);
+        assert_eq!(outcomes, vec![filled(id, 99.5)]);
+    }
+
+    /// The same order without the flag takes this bar's close, which is
+    /// what a decision made *from* this bar meets.
+    #[test]
+    fn order_submitted_on_its_bar_meets_the_book_that_bar_leaves() {
+        let (mut engine, id) = engine_with(
+            OrderKind::Limit { price: 101.0 },
+            OrderSide::Buy,
+            TimeInForce::Gtd { expire_ns: 12 },
+        );
+        engine.same_bar_marketable_limit_on_close = true;
+        let fm = FillModel::default();
+
+        engine.orders[0].submitted_idx = 1;
+        assert!(engine.match_bar(0, &bar(0, 99.0, 100.0, 98.5, 99.5), &fm).is_empty());
+        let outcomes = engine.match_bar(1, &bar(1, 100.0, 102.0, 98.0, 100.5), &fm);
+        assert_eq!(outcomes, vec![filled(id, 100.5)]);
+    }
+
+    /// Arriving ahead of the bar is a fact about one order, not a session
+    /// mode: it matches with same-bar matching off, and orders without it
+    /// still wait for the next bar.
+    #[test]
+    fn arriving_before_the_bar_does_not_need_the_session_flag() {
+        let (mut engine, id) = engine_with(
+            OrderKind::Limit { price: 101.0 },
+            OrderSide::Buy,
+            TimeInForce::Gtd { expire_ns: 12 },
+        );
+        engine.get_mut(id).unwrap().arrives_before_bar = true;
+        assert!(!engine.same_bar_marketable_limit_on_close);
+        let fm = FillModel::default();
+
+        engine.orders[0].submitted_idx = 1;
+        assert!(engine.match_bar(0, &bar(0, 99.0, 100.0, 98.5, 99.5), &fm).is_empty());
+        assert_eq!(
+            engine.match_bar(1, &bar(1, 100.0, 102.0, 98.0, 100.5), &fm),
+            vec![filled(id, 99.5)]
+        );
+    }
+
+    /// Nothing has traded before the first bar, so an order that arrives
+    /// ahead of it meets no book at all and simply rests.
+    #[test]
+    fn arriving_before_the_first_bar_meets_no_book() {
+        let (mut engine, id) = engine_with(
+            OrderKind::Limit { price: 101.0 },
+            OrderSide::Buy,
+            TimeInForce::Gtc,
+        );
+        engine.get_mut(id).unwrap().arrives_before_bar = true;
+        let fm = FillModel::default();
+
+        assert!(engine.match_bar(0, &bar(0, 100.0, 102.0, 98.0, 100.5), &fm).is_empty());
+        // It rests as any working order does, and the next bar fills it at
+        // its own limit, like any resting limit the market comes to.
+        assert_eq!(
+            engine.match_bar(1, &bar(1, 100.0, 102.0, 98.0, 100.5), &fm),
+            vec![filled(id, 101.0)]
+        );
     }
 
     #[test]

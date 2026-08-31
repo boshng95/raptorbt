@@ -178,6 +178,17 @@ pub struct Order {
     /// Limit orders only: reject instead of filling if marketable at the
     /// open of the first bar the order rests into.
     pub post_only: bool,
+    /// The order reached the venue before the bar it was submitted on did,
+    /// so it meets the book the *previous* step left behind.
+    ///
+    /// A venue processes market data one instrument at a time. A strategy
+    /// trading a basket decides on the bar of whichever name printed first
+    /// and sends orders for the rest, whose bars for that same instant have
+    /// not reached the venue yet: those orders are matched against a book
+    /// one bar older than their own timestamp. `false`, the default, keeps
+    /// the book the submission bar leaves behind.
+    #[serde(default)]
+    pub arrives_before_bar: bool,
     /// Reject fills that would open a position (closing fills only).
     pub reduce_only: bool,
     /// One-triggers-other: held (not matched) until the parent order fills;
@@ -236,6 +247,7 @@ impl Order {
             stop_price: None,
             target_price: None,
             post_only: false,
+            arrives_before_bar: false,
             reduce_only: false,
             parent_id: None,
             algo_id: None,
