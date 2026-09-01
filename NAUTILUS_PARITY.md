@@ -1,8 +1,8 @@
 # Nautilus parity branch
 
-This branch is based on upstream `v0.11.0` and carries thirteen narrowly
+This branch is based on upstream `v0.11.0` and carries fourteen narrowly
 scoped compatibility corrections used by algotrade-nautilus backtest
-experiments, plus one fix to a pre-existing upstream bug (see the end of this
+experiments, plus two fixes to pre-existing upstream bugs (see the end of this
 section).
 The corrections are opt-in or default-neutral for existing callers, except
 where a stated one is simply a more accurate reading of the same arithmetic.
@@ -145,8 +145,10 @@ where a stated one is simply a more accurate reading of the same arithmetic.
     `record_fill` already judged to have completed an order cannot leave
     `leaves_qty` reporting the 1e-13 of binary residue that made the same
     order `PARTIALLY_FILLED` to one caller and `FILLED` to another.
-13. `Order.arrives_before_bar` matches an order against the book the
-    *previous* bar left behind rather than the one its own bar leaves.
+13. `Order.arrival_ns` (`arrives_before_bar` plus `submitted_ts` inside the
+    engine) matches an order against the book the *previous* bar left behind
+    rather than the one its own bar leaves, and dates what it fills there to
+    the instant it arrived.
 
     A venue prices one instrument's bar at a time. A strategy trading a
     basket decides on the bar of whichever name printed first and sends
@@ -159,15 +161,85 @@ where a stated one is simply a more accurate reading of the same arithmetic.
     of the ten orders met the older book and only the tenth -- the name whose
     bar triggered the rebalance -- met its own.
 
-    The flag is per order and defaults to `false`, which is the behaviour the
+    The same happens on one instrument whenever a bar aggregated on a clock
+    closes over a gap in the data: the window ends where nothing printed, and
+    the finished bar reaches the strategy only when a later bar advances the
+    clock past it. The order it sends is at the venue before that later bar
+    is, and Nautilus fills it against the book the last bar before the gap
+    left -- a 2021 Binance outage put two hours between the two, and the
+    fill's price was the pre-gap one.
+
+    Such a fill happened when the order arrived, not when the bar it beat
+    printed, so the position it opens and the round trip it closes are dated
+    to `arrival_ns`. Only a fill taken from that standing book is: whatever
+    the same order goes on to take from a print is dated by that print, like
+    any other fill.
+
+    An order that does not cross the standing book is not finished with the
+    bar it beat. It was working at the venue while that bar printed, so the
+    range is ahead of it in time rather than behind it: the bar fills it if
+    it trades through its limit, at its own limit, like any resting order the
+    market comes to. Nothing here is look-ahead -- the order was there first.
+    That is the ordinary case for a basket, where most names get a limit
+    priced off a bar that is minutes old by the time the venue sees it: it
+    does not cross on arrival, rests, and the bar it beat is usually the one
+    that fills it. An immediate order is the exception, executed against the
+    book it arrived at and killed; it never waits for a print. And an order
+    arriving before the very first bar meets no book at all, then rests into
+    that bar exactly as it would into any other.
+
+    The field is per order and defaults to `None`, which is the behaviour the
     engine always had. It is independent of
     `same_bar_marketable_limit_on_close` (item 1): an order that reached the
     venue before its bar has already met a book, so it matches on the bar it
     was submitted on whether or not same-bar matching is enabled generally.
-    An order that arrives before the very first bar meets no book at all and
-    rests, exactly as one submitted into an empty venue would.
+    An order submitted *from* its bar still never meets that bar's range --
+    those prints came before the decision that sent it.
 
-## Upstream fix
+14. `AccountMode::Margin` accepts an infinite `leverage`: the venue that
+    locks no initial margin at all. The per-position margin rate is the
+    instrument's `margin_init` when it declares one and `1 / leverage`
+    otherwise, so an infinite leverage makes that rate zero -- nothing is
+    locked, no order is refused for want of capital, and the balance moves
+    only with realized PnL and fees.
+
+    That is not a degenerate configuration; it is what a Nautilus MARGIN
+    account trades like for these instruments. Every instrument the project
+    builds declares `margin_init = 0`, and Nautilus computes initial margin
+    as `notional / leverage * margin_init`. A cash account is not a mirror of
+    one: it debits the full notional of every entry, shorts included, and
+    refuses orders such a venue filled. Both replay lanes hand Raptor sizes
+    Nautilus already decided, so the account's only remaining job is to gate,
+    and it has to gate the same way or the lane measures the harness instead
+    of the engine. A cross-sectional long/short case failed exactly there,
+    silently: Nautilus filled every short, Raptor's cash account rejected
+    them with `insufficient_capital`, and the canonical projection kept only
+    the submitted orders -- so the two ledgers agreed on every order and
+    disagreed on everything after.
+
+    A size given as a fraction of capital is refused against such an account
+    with `RejectReason::UnfundedSizing` (`unfunded_sizing`). The fraction
+    answers "how many units can this account afford", and an account that
+    affords any size cannot answer it. The division previously fell through
+    to the fee rate alone -- and to infinity where there was no fee -- sizing
+    a position at hundreds of times the balance. Explicit unit sizes are
+    unaffected.
+
+## Upstream fixes
+
+A closing order reduced by the whole position and ignored its own quantity,
+so a one-lot trim of eleven held units flattened the book: ten units of
+exposure a venue would still have been holding, and every later fill and mark
+measured against a position that no longer existed. A venue sells what the
+order says. The close is now bounded by the order's size as well as by the
+position and the bar's liquidity, and an order asking for less than is held
+reports itself filled rather than leaving a phantom remainder to expire.
+Asking for the whole position is still spelled by naming no size at all
+(`QtySpec::FullPosition`, which is what the Python API builds when a closing
+order names neither `units` nor `size_frac`), and a capital fraction still
+names units of an entry rather than of a reduction, so neither changes. This
+is what a nine-name portfolio replay found: Nautilus trimmed one share of a
+GOOGL position and Raptor sold all eleven.
 
 `portfolio::monte_carlo` rounds its chunk size up, so with more threads than
 simulations the last chunks began past the end of the work and
@@ -179,14 +251,19 @@ a bounded `RAYON_NUM_THREADS` on a many-core machine.
 
 ## Evidence
 
-- All 573 Rust library tests pass, at any thread count.
+- All 583 Rust library tests pass, at any thread count.
+- All 432 of the fork's own Python tests pass, the bit-exact golden gate
+  included. Its baselines were regenerated once, for the fee arithmetic of
+  item 6; see the changelog for what moved and by how much.
 - The algotrade-nautilus 81-case strategy matrix (27 strategies, three
-  parameter variants each) has no divergent case: 29 full-ledger passes, two
-  decision-only passes, four cases whose strategies never ordered, 42
-  portfolio strategies the adapter does not implement, and four
-  `SMAGoldenCross` cases the oracle replay cannot express because they
-  alternate long and short against Raptor's run-level direction. Before the
-  bar-liquidity work three of those cases diverged on partial fills.
+  parameter variants each) has no divergent case: 46 passes, two decision-only
+  passes, 29 cases whose strategies never ordered in the tested window, and
+  four `SMAGoldenCross` cases the oracle replay cannot express because they
+  alternate long and short against Raptor's run-level direction. Of the
+  passes, 13 are full independent ledgers, 16 replay Nautilus's decisions and
+  17 replay a portfolio's order flow. The 42 portfolio cases were unsupported
+  before this branch replayed order flow, and the last two failures were a
+  settlement row compared against Nautilus's unrounded mark.
 - The algotrade-nautilus strict BTC callback case matched 230 of 230 canonical
   data, indicator, decision, order, fill, fee, position, equity, and metric
   events over 2026-01-01 through 2026-02-01, twice per engine.
