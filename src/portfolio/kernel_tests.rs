@@ -81,7 +81,7 @@ fn declared_currency_precision_quantizes_crypto_fees_and_pnl() {
         FillTerms::WHOLE,
     );
     assert!(matches!(entered, Some(OpenResult { event: EngineEvent::Entered { .. }, .. })));
-    let exited = kernel.close_at(1, &bar(1, 2923.12), 0, 2923.12, ExitReason::Signal);
+    let exited = kernel.close_at(1, &bar(1, 2923.12), 0, 2923.12, ExitReason::Signal, None);
     match exited {
         Some(EngineEvent::Exited { trade, .. }) => {
             assert_eq!(trade.entry_fees, 9.46365885);
@@ -348,6 +348,69 @@ fn a_capital_fraction_is_refused_by_an_account_that_funds_nothing() {
         "a fraction of capital names no size here: {events:?}"
     );
     assert!(kernel.position_snapshot().is_none(), "nothing should have opened");
+}
+
+/// An order the venue received before this bar's print transacted when it
+/// arrived: it met the book standing then, and the round trip it opens and
+/// closes is dated to those instants rather than to the bars it beat.
+#[test]
+fn a_fill_taken_before_a_bar_is_dated_when_the_order_arrived() {
+    let mut kernel = make_kernel();
+    kernel.set_position_policy(PositionPolicy::Net);
+    let at = |ts: i64, idx: i64, price: Price| KernelBar { timestamp: ts, ..bar(idx, price) };
+
+    // A first bar leaves a book at 100.
+    kernel.step(0, &at(100, 0, 100.0), StepInput::default());
+
+    // Sent at 150, between the bars: it crosses the standing book at 100.
+    kernel.submit_order_full(
+        OrderSide::Buy,
+        QtySpec::Units(10.0),
+        OrderKind::Limit { price: 105.0 },
+        TimeInForce::Ioc,
+        1,
+        150,
+        "entry".to_string(),
+        None,
+        None,
+        false,
+        false,
+        true,
+        None,
+    );
+    kernel.step(1, &at(200, 1, 110.0), StepInput::default());
+    assert_eq!(kernel.position_snapshot().expect("open").entry_price, 100.0);
+
+    // The close arrives the same way, ahead of the third bar.
+    kernel.submit_order_full(
+        OrderSide::Sell,
+        QtySpec::Units(10.0),
+        OrderKind::Limit { price: 95.0 },
+        TimeInForce::Ioc,
+        2,
+        250,
+        "exit".to_string(),
+        None,
+        None,
+        false,
+        true,
+        true,
+        None,
+    );
+    let events = kernel.step(2, &at(300, 2, 120.0), StepInput::default());
+    let trade = events
+        .iter()
+        .find_map(|event| match event {
+            EngineEvent::Exited { trade, .. } => Some(trade),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no round trip, got {events:?}"));
+    assert_eq!((trade.entry_price, trade.exit_price), (100.0, 110.0));
+    assert_eq!(
+        (trade.entry_time, trade.exit_time),
+        (150, 250),
+        "a fill dated by the bar it beat would read (200, 300)"
+    );
 }
 
 #[test]
@@ -2285,7 +2348,7 @@ fn cash_after_unwinding_in(pieces: &[f64]) -> f64 {
     );
     assert!(matches!(entered, Some(OpenResult { event: EngineEvent::Entered { .. }, .. })));
     for cap in pieces {
-        kernel.reduce_at(1, &bar(1, 110.0), 0, 110.0, ExitReason::Signal, *cap);
+        kernel.reduce_at(1, &bar(1, 110.0), 0, 110.0, ExitReason::Signal, *cap, None);
     }
     assert_eq!(kernel.ledger.open_count(), 0, "the position must end flat");
     kernel.cash()
@@ -2324,8 +2387,8 @@ fn each_closing_fill_reports_only_the_pnl_it_realized() {
     );
     assert!(matches!(entered, Some(OpenResult { event: EngineEvent::Entered { .. }, .. })));
 
-    let first = kernel.reduce_at(1, &bar(1, 110.0), 0, 110.0, ExitReason::Signal, 4.0);
-    let second = kernel.reduce_at(1, &bar(1, 110.0), 0, 110.0, ExitReason::Signal, 6.0);
+    let first = kernel.reduce_at(1, &bar(1, 110.0), 0, 110.0, ExitReason::Signal, 4.0, None);
+    let second = kernel.reduce_at(1, &bar(1, 110.0), 0, 110.0, ExitReason::Signal, 6.0, None);
     let ReduceResult::Reduced { gross_realized: first_gross, fees: first_fees, .. } = &first else {
         panic!("expected a partial reduction, got {first:?}");
     };

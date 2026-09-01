@@ -319,7 +319,7 @@ impl EngineKernel {
         outcome: MatchOutcome,
         events: &mut Vec<EngineEvent>,
     ) {
-        let (id, matched_price, depth) = match outcome {
+        let (id, matched_price, depth, on_arrival) = match outcome {
             MatchOutcome::Trigger { order_id } => {
                 let client_id =
                     self.orders.get(order_id).map(|o| o.client_id.clone()).unwrap_or_default();
@@ -344,7 +344,9 @@ impl EngineKernel {
                 events.push(EngineEvent::OrderRejected { idx, order_id, client_id, reason });
                 return;
             }
-            MatchOutcome::Fill { order_id, price, depth } => (order_id, price, depth),
+            MatchOutcome::Fill { order_id, price, depth, on_arrival } => {
+                (order_id, price, depth, on_arrival)
+            }
         };
         // A venue cannot fill a fraction of a lot, so the size a print
         // showed is quantized to the instrument's size grid before it can
@@ -370,6 +372,12 @@ impl EngineKernel {
         let stop_attach = order.stop_price;
         let target_attach = order.target_price;
         let reduce_only = order.reduce_only;
+        // A fill taken from the book standing when the order reached the
+        // venue happened at that instant, not when the bar it beat printed.
+        // Anything the same order goes on to take from a print -- including
+        // from the very bar it beat, which it rested through -- happened
+        // when that print did, like any other fill.
+        let arrived_at = on_arrival.then_some(order.submitted_ts);
 
         // Stochastic fills: a marketable resting limit may be passed over
         // (queue position, exhausted liquidity); it stays working. Stop and
@@ -583,7 +591,8 @@ impl EngineKernel {
                     return;
                 }
             };
-            let terms = FillTerms { cap, all_or_none: tif == TimeInForce::Fok, resuming };
+            let terms =
+                FillTerms { cap, all_or_none: tif == TimeInForce::Fok, resuming, at: arrived_at };
             match self.open_at(
                 idx,
                 bar,
@@ -676,7 +685,15 @@ impl EngineKernel {
             // quantity does not size the close (long-standing behavior).
             // What can size it down is the bar's liquidity.
             let open_size = first.position.size;
-            match self.reduce_at(idx, bar, position_id, raw_price, ExitReason::Order, cap) {
+            match self.reduce_at(
+                idx,
+                bar,
+                position_id,
+                raw_price,
+                ExitReason::Order,
+                cap,
+                arrived_at,
+            ) {
                 ReduceResult::Closed { size, price, fees, gross_realized, event } => {
                     executed = Some(price);
                     let filled =
@@ -725,14 +742,16 @@ impl EngineKernel {
         }
 
         if let Some(price) = executed {
-            self.take_next_level(idx, bar, id, price, depth, events);
+            self.take_next_level(idx, bar, id, price, depth, on_arrival, events);
         }
     }
 
     /// Continue an order that the print it just took could not satisfy.
     ///
     /// `price` is the price that actually traded, not the price the match
-    /// asked for: a sweep steps off the level it emptied.
+    /// asked for: a sweep steps off the level it emptied. `on_arrival` is
+    /// carried through unchanged: the continuation is the same fill walking
+    /// the book it already met, so it happened when that fill did.
     ///
     /// The bar is not one price but a handful of prints, so an order that
     /// emptied one of them may still find size in the next. Re-entering
@@ -747,6 +766,7 @@ impl EngineKernel {
         id: u64,
         price: Price,
         depth: FillDepth,
+        on_arrival: bool,
         events: &mut Vec<EngineEvent>,
     ) {
         let outstanding = self
@@ -783,7 +803,12 @@ impl EngineKernel {
         self.apply_match_outcome(
             idx,
             bar,
-            MatchOutcome::Fill { order_id: id, price: next_price, depth: next_depth },
+            MatchOutcome::Fill {
+                order_id: id,
+                price: next_price,
+                depth: next_depth,
+                on_arrival,
+            },
             events,
         );
     }

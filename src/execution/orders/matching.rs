@@ -31,7 +31,12 @@ pub enum MatchOutcome {
     /// `depth` carries raw, un-quantized sizes: the kernel rounds them to
     /// the instrument's size grid before clamping, because a venue cannot
     /// fill a fraction of a lot any more than it can quote one.
-    Fill { order_id: u64, price: Price, depth: FillDepth },
+    ///
+    /// `on_arrival` marks a fill taken from the book standing when the
+    /// order reached the venue, ahead of this bar -- it happened at that
+    /// instant, not when the bar printed. Every other fill, including one
+    /// the same order takes from the bar it beat, happened with its print.
+    Fill { order_id: u64, price: Price, depth: FillDepth, on_arrival: bool },
     /// A stop-limit's trigger was touched; its limit now rests and becomes
     /// marketable from the next bar.
     Trigger { order_id: u64 },
@@ -348,7 +353,15 @@ impl OrderEngine {
                 continue;
             }
 
-            let first_bar = order.submitted_idx + 1 == idx;
+            // The first bar this order rests through -- the one whose open
+            // it would have crossed had it been there for it. For an order
+            // that reached the venue ahead of its bar, that is the very bar
+            // it beat; for any other, the bar after the one it was sent
+            // from, since the bar it was sent from had already printed.
+            let first_bar = match order.arrives_before_bar {
+                true => submitted_this_bar,
+                false => order.submitted_idx + 1 == idx,
+            };
             let (direction, is_entry) = side_as_fill_args(order.side);
             let oid = order.id;
             // Copied out of `order` and `bar` so the fill closure stays
@@ -363,47 +376,69 @@ impl OrderEngine {
             // would on any other barren bar.
             let fill = move |p: Price| {
                 let depth = tape.offered(p, buying, immediate);
-                (!depth.is_empty()).then_some(MatchOutcome::Fill { order_id: oid, price: p, depth })
+                (!depth.is_empty()).then_some(MatchOutcome::Fill {
+                    order_id: oid,
+                    price: p,
+                    depth,
+                    on_arrival: false,
+                })
             };
 
-            // An order submitted while this bar was being observed meets a
-            // standing book, not the bar: only a plain limit which crosses
-            // that book participates. Do not inspect this bar's high/low
-            // either way -- for a same-bar decision they occurred before
-            // the decision existed, and for an order that arrived ahead of
-            // the bar they have not happened yet. Both are look-ahead.
+            // An order that reached the venue while this bar was being
+            // observed meets a standing book, not the bar: only a plain
+            // limit which crosses that book participates here. This bar's
+            // high and low are not read for that -- they are either behind
+            // the order, for one sent from this bar's close, or ahead of
+            // it, for one that beat the bar; neither is a book it could
+            // have crossed on arrival.
             if submitted_this_bar {
                 // Whichever book was standing when the order reached the
                 // venue: the one this step leaves behind, or -- for an
                 // order sent before this bar arrived -- the one before it.
-                let book = if order.arrives_before_bar { prior_book } else { book };
+                let standing = if order.arrives_before_bar { prior_book } else { book };
                 let outcome = match order.kind {
-                    // Only the book the step left behind is still ahead of
-                    // such an order; reading the bar's range here would be
-                    // look-ahead. It crosses that book, so it fills at the
+                    // The standing book is what is in front of such an
+                    // order. It crosses that book, so it fills at the
                     // book's price, not at its own limit, and a limit
                     // strictly through it empties the level beneath.
                     OrderKind::Limit { price } => {
-                        let depth = book.offered(price, buying, immediate);
-                        let at = book.book().map(|(price, _)| price);
+                        let depth = standing.offered(price, buying, immediate);
+                        let at = standing.book().map(|(price, _)| price);
                         match (depth.is_empty(), at) {
-                            (false, Some(at)) => {
-                                Some(MatchOutcome::Fill { order_id: oid, price: at, depth })
-                            }
+                            (false, Some(at)) => Some(MatchOutcome::Fill {
+                                order_id: oid,
+                                price: at,
+                                depth,
+                                // Only an order that beat the bar met its
+                                // book at an instant of its own; one sent
+                                // from this bar met it as the bar closed.
+                                on_arrival: order.arrives_before_bar,
+                            }),
                             _ => None,
                         }
                     }
                     _ => None,
                 };
                 match outcome {
-                    Some(outcome) => actions.push(outcome),
-                    None if matches!(order.tif, TimeInForce::Ioc | TimeInForce::Fok) => {
+                    Some(outcome) => {
+                        actions.push(outcome);
+                        continue;
+                    }
+                    // An immediate order is executed against the book it
+                    // arrived at and killed; it never waits for a print.
+                    None if immediate => {
                         let _ = order.transition(OrderStatus::Canceled);
                         actions.push(MatchOutcome::Cancel { order_id: order.id });
+                        continue;
                     }
-                    None => {}
+                    // An order that beat this bar to the venue was working
+                    // while the bar printed, so the range is not ahead of
+                    // it in time: it is the market coming to a resting
+                    // order, and it matches below like any other. One
+                    // submitted *from* this bar has no such claim on it.
+                    None if order.arrives_before_bar => {}
+                    None => continue,
                 }
-                continue;
             }
 
             let outcome = match order.kind {
@@ -568,7 +603,13 @@ mod tests {
     /// The expected fill for a test running the default, unbounded fill
     /// model — where every match offers more depth than any order needs.
     fn filled(order_id: u64, price: Price) -> MatchOutcome {
-        MatchOutcome::Fill { order_id, price, depth: FillDepth::UNLIMITED }
+        MatchOutcome::Fill { order_id, price, depth: FillDepth::UNLIMITED, on_arrival: false }
+    }
+
+    /// The same, for a fill taken from the book standing when the order
+    /// reached the venue rather than from the bar it beat.
+    fn filled_on_arrival(order_id: u64, price: Price) -> MatchOutcome {
+        MatchOutcome::Fill { order_id, price, depth: FillDepth::UNLIMITED, on_arrival: true }
     }
 
     use super::*;
@@ -645,7 +686,7 @@ mod tests {
         engine.orders[0].submitted_idx = 1;
         assert!(engine.match_bar(0, &bar(0, 99.0, 100.0, 98.5, 99.5), &fm).is_empty());
         let outcomes = engine.match_bar(1, &bar(1, 100.0, 102.0, 98.0, 100.5), &fm);
-        assert_eq!(outcomes, vec![filled(id, 99.5)]);
+        assert_eq!(outcomes, vec![filled_on_arrival(id, 99.5)]);
     }
 
     /// The same order without the flag takes this bar's close, which is
@@ -684,14 +725,15 @@ mod tests {
         assert!(engine.match_bar(0, &bar(0, 99.0, 100.0, 98.5, 99.5), &fm).is_empty());
         assert_eq!(
             engine.match_bar(1, &bar(1, 100.0, 102.0, 98.0, 100.5), &fm),
-            vec![filled(id, 99.5)]
+            vec![filled_on_arrival(id, 99.5)]
         );
     }
 
     /// Nothing has traded before the first bar, so an order that arrives
-    /// ahead of it meets no book at all and simply rests.
+    /// ahead of it meets no book at all -- and then rests through that very
+    /// bar, which prints through its limit and fills it there.
     #[test]
-    fn arriving_before_the_first_bar_meets_no_book() {
+    fn arriving_before_the_first_bar_meets_no_book_and_rests_into_it() {
         let (mut engine, id) = engine_with(
             OrderKind::Limit { price: 101.0 },
             OrderSide::Buy,
@@ -700,12 +742,76 @@ mod tests {
         engine.get_mut(id).unwrap().arrives_before_bar = true;
         let fm = FillModel::default();
 
-        assert!(engine.match_bar(0, &bar(0, 100.0, 102.0, 98.0, 100.5), &fm).is_empty());
-        // It rests as any working order does, and the next bar fills it at
-        // its own limit, like any resting limit the market comes to.
+        assert_eq!(
+            engine.match_bar(0, &bar(0, 100.0, 102.0, 98.0, 100.5), &fm),
+            vec![filled(id, 101.0)]
+        );
+    }
+
+    /// An order that reached the venue before its bar and did not cross the
+    /// book standing there was working while that bar printed: the range is
+    /// ahead of it in time, so the bar it beat is the one that fills it --
+    /// at its own limit, like any resting order the market comes to.
+    #[test]
+    fn order_arriving_before_its_bar_rests_into_the_bar_it_beat() {
+        let (mut engine, id) = engine_with(
+            OrderKind::Limit { price: 99.0 },
+            OrderSide::Buy,
+            TimeInForce::Gtc,
+        );
+        engine.get_mut(id).unwrap().arrives_before_bar = true;
+        let fm = FillModel::default();
+
+        // The first bar leaves the book at 99.5: a buy at 99.0 does not
+        // cross it. The second, which the order beat to the venue, trades
+        // down to 98.0 -- through the limit -- and fills it there.
+        engine.orders[0].submitted_idx = 1;
+        assert!(engine.match_bar(0, &bar(0, 99.0, 100.0, 98.5, 99.5), &fm).is_empty());
         assert_eq!(
             engine.match_bar(1, &bar(1, 100.0, 102.0, 98.0, 100.5), &fm),
-            vec![filled(id, 101.0)]
+            vec![filled(id, 99.0)]
+        );
+    }
+
+    /// The same order arriving with its own bar rather than ahead of it has
+    /// no claim on that bar's range: the prints came before the decision
+    /// that sent it, and reading them would be look-ahead.
+    #[test]
+    fn order_submitted_from_its_bar_never_meets_that_bar_range() {
+        let (mut engine, id) = engine_with(
+            OrderKind::Limit { price: 99.0 },
+            OrderSide::Buy,
+            TimeInForce::Gtc,
+        );
+        let fm = FillModel::default();
+
+        engine.orders[0].submitted_idx = 1;
+        assert!(engine.match_bar(0, &bar(0, 99.0, 100.0, 98.5, 99.5), &fm).is_empty());
+        assert!(engine.match_bar(1, &bar(1, 100.0, 102.0, 98.0, 100.5), &fm).is_empty());
+        // It is working from the next bar on, like any resting limit.
+        assert_eq!(
+            engine.match_bar(2, &bar(2, 100.0, 102.0, 98.0, 100.5), &fm),
+            vec![filled(id, 99.0)]
+        );
+    }
+
+    /// An immediate order that beat its bar is executed against the book it
+    /// arrived at and killed -- it does not rest into the bar's prints.
+    #[test]
+    fn an_immediate_order_arriving_before_its_bar_does_not_rest_into_it() {
+        let (mut engine, id) = engine_with(
+            OrderKind::Limit { price: 99.0 },
+            OrderSide::Buy,
+            TimeInForce::Ioc,
+        );
+        engine.get_mut(id).unwrap().arrives_before_bar = true;
+        let fm = FillModel::default();
+
+        engine.orders[0].submitted_idx = 1;
+        assert!(engine.match_bar(0, &bar(0, 99.0, 100.0, 98.5, 99.5), &fm).is_empty());
+        assert_eq!(
+            engine.match_bar(1, &bar(1, 100.0, 102.0, 98.0, 100.5), &fm),
+            vec![MatchOutcome::Cancel { order_id: id }]
         );
     }
 

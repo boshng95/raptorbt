@@ -215,12 +215,15 @@ def apply_commands_on(strategy, session, ctx, symbols, id_map):
                     if mapped[0] != instrument:
                         raise ValueError("parent order belongs to a different symbol")
                     parent_engine_id = mapped[1]
+                # An order the venue received ahead of this bar is stamped
+                # with when it arrived, not with the bar it beat.
+                arrival = None if order.arrival_ns is None else int(order.arrival_ns)
                 engine_id = session.submit_order(
                     instrument,
                     side=order.side,
                     kind=order.kind,
                     submitted_idx=local_idx,
-                    submitted_ts=ts,
+                    submitted_ts=ts if arrival is None else arrival,
                     client_id=client_id,
                     units=order.units,
                     size_frac=order.size_frac,
@@ -235,7 +238,7 @@ def apply_commands_on(strategy, session, ctx, symbols, id_map):
                     limit_offset=getattr(order, "limit_offset", 0.0),
                     post_only=getattr(order, "post_only", False),
                     reduce_only=order.reduce_only,
-                    arrives_before_bar=order.arrives_before_bar,
+                    arrives_before_bar=arrival is not None,
                     parent_id=parent_engine_id,
                 )
                 id_map[client_id] = (instrument, engine_id)

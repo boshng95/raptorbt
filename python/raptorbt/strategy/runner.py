@@ -209,11 +209,14 @@ def run_strategy_backtest(
                 parent_engine_id = id_map.get(parent) if parent else None
                 if parent and parent_engine_id is None:
                     raise ValueError(f"unknown parent order {parent!r}")
+                # An order the venue received ahead of this bar is stamped
+                # with when it arrived, not with the bar it beat.
+                arrival = None if order.arrival_ns is None else int(order.arrival_ns)
                 engine_id = session.submit_order(
                     side=order.side,
                     kind=order.kind,
                     submitted_idx=i,
-                    submitted_ts=int(timestamps[i]),
+                    submitted_ts=int(timestamps[i]) if arrival is None else arrival,
                     client_id=client_id,
                     units=order.units,
                     size_frac=order.size_frac,
@@ -228,7 +231,7 @@ def run_strategy_backtest(
                     limit_offset=getattr(order, "limit_offset", 0.0),
                     post_only=getattr(order, "post_only", False),
                     reduce_only=order.reduce_only,
-                    arrives_before_bar=order.arrives_before_bar,
+                    arrives_before_bar=arrival is not None,
                     parent_id=parent_engine_id,
                 )
                 id_map[client_id] = engine_id

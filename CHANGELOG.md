@@ -62,6 +62,23 @@ at the open the market actually traded, exactly like the equity runners.**
   ratio. No trade count, fill price, size or exit reason changed in any
   fixture, and the frozen inputs are byte-identical.
 
+### Fixed
+
+- **An order that reached the venue before its bar now rests into that bar.**
+  An order carrying `arrival_ns` was matched against the book standing when
+  it arrived and, if it did not cross, sat out the rest of that bar entirely
+  -- it could not fill before the *next* one, even though it had been working
+  at the venue the whole time that bar printed. A basket's limits are priced
+  off a bar the venue has not seen yet and mostly do not cross on arrival, so
+  this delayed a large share of a portfolio run's fills by a bar and priced
+  them at the wrong print. The bar an order beat is now its own to be filled
+  from, at its limit, like any resting order the market comes to; reading its
+  range is not look-ahead, because the order was there before it printed. An
+  immediate (IOC/FOK) order still dies against the book it arrived at, and an
+  order submitted *from* its bar still never meets that bar's range.
+  `MatchOutcome::Fill` gained `on_arrival` so a fill is dated to the arrival
+  instant only when it was actually taken from the standing book.
+
 ## [0.11.0] - 2026-08-31
 
 Open-mode execution no longer trades on information from the future.

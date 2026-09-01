@@ -335,11 +335,18 @@ pub(crate) struct FillTerms {
     /// to add does not apply to it, and under any netting policy the fill
     /// grows the position already on the book.
     pub resuming: bool,
+    /// When this fill happened, if that is not when the bar printed. An
+    /// order which reached the venue ahead of the bar is matched against the
+    /// book standing then, so what it opens was opened at that instant --
+    /// the bar it beat has not happened yet. `None` stamps the bar, which is
+    /// when every other fill occurs.
+    pub at: Option<Timestamp>,
 }
 
 impl FillTerms {
     /// Terms for a fill nothing constrains: a whole, fresh order.
-    pub const WHOLE: Self = Self { cap: f64::INFINITY, all_or_none: false, resuming: false };
+    pub const WHOLE: Self =
+        Self { cap: f64::INFINITY, all_or_none: false, resuming: false, at: None };
 }
 
 /// What one opening fill did.
@@ -989,7 +996,7 @@ impl EngineKernel {
                         };
                         let price = self.fill_price_for(bar, direction, false);
                         if let Some(event) =
-                            self.close_at(idx, bar, position_id, price, ExitReason::Signal)
+                            self.close_at(idx, bar, position_id, price, ExitReason::Signal, None)
                         {
                             events.push(event);
                         }
@@ -1084,7 +1091,7 @@ impl EngineKernel {
                 None => continue,
             };
             let price = self.fill_price_for(bar, direction, false);
-            if let Some(event) = self.close_at(idx, bar, position_id, price, ExitReason::Signal) {
+            if let Some(event) = self.close_at(idx, bar, position_id, price, ExitReason::Signal, None) {
                 events.push(event);
             }
         }
@@ -1234,7 +1241,18 @@ impl EngineKernel {
             self.apply_match_outcome(
                 idx,
                 bar,
-                MatchOutcome::Fill { order_id: id, price: f64::NAN, depth },
+                MatchOutcome::Fill {
+                    order_id: id,
+                    price: f64::NAN,
+                    depth,
+                    // A market order sent before this bar reached the venue
+                    // crossed the book standing when it arrived; one sent
+                    // from this bar crossed the book the bar left showing.
+                    on_arrival: self
+                        .orders
+                        .get(id)
+                        .is_some_and(|order| order.arrives_before_bar),
+                },
                 &mut events,
             );
         }
@@ -1314,7 +1332,7 @@ impl EngineKernel {
         }
 
         let reason = exit_reason?;
-        self.close_at(idx, bar, position_id, exit_price, reason)
+        self.close_at(idx, bar, position_id, exit_price, reason, None)
     }
 
     /// Apply a close at a determined raw price: slippage, fees, position
@@ -1327,8 +1345,9 @@ impl EngineKernel {
         position_id: u64,
         exit_price: Price,
         reason: ExitReason,
+        at: Option<Timestamp>,
     ) -> Option<EngineEvent> {
-        match self.reduce_at(idx, bar, position_id, exit_price, reason, f64::INFINITY) {
+        match self.reduce_at(idx, bar, position_id, exit_price, reason, f64::INFINITY, at) {
             ReduceResult::Closed { event, .. } => Some(event),
             _ => None,
         }
@@ -1352,6 +1371,7 @@ impl EngineKernel {
         exit_price: Price,
         reason: ExitReason,
         cap: f64,
+        at: Option<Timestamp>,
     ) -> ReduceResult {
         let Some(managed) = self.ledger.get(position_id) else { return ReduceResult::None };
         let direction = managed.position.direction;
@@ -1387,7 +1407,7 @@ impl EngineKernel {
             size,
             ExitDetails {
                 idx,
-                timestamp: bar.timestamp,
+                timestamp: at.unwrap_or(bar.timestamp),
                 price: exit_price,
                 entry_timestamp: entry_ts,
                 reason,
@@ -1701,7 +1721,7 @@ impl EngineKernel {
             }
             None => self.ledger.open_position(
                 idx,
-                bar.timestamp,
+                terms.at.unwrap_or(bar.timestamp),
                 adjusted_price,
                 size,
                 direction,
@@ -1757,7 +1777,7 @@ impl EngineKernel {
                 continue;
             }
             if let Some(event) =
-                self.close_at(idx, bar, position_id, bar.close, ExitReason::Liquidation)
+                self.close_at(idx, bar, position_id, bar.close, ExitReason::Liquidation, None)
             {
                 events.push(event);
             }
