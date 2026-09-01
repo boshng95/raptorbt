@@ -92,6 +92,28 @@ at the open the market actually traded, exactly like the equity runners.**
   fraction still names units of an entry rather than of a reduction, so
   neither changes.
 
+- **A position's size stays on the instrument's lot grid.** A position opened
+  by two fills held their float sum, and that sum need not land where either
+  fill did: 0.03835 + 0.04381 is 0.08216000000000001, so selling the 0.08216
+  that was bought left 1.4e-17 of a coin open. Nothing could ever close that,
+  so the position never went flat and every later entry averaged into it --
+  a run of forty-odd round trips reported one that never ended, at an entry
+  price no fill was made at. The cash account was correct throughout; only
+  the book was wrong. The ledger now snaps a position size back onto the
+  instrument's size grid after every add and reduction, and reports a round
+  trip's closed size the same way. Without an instrument declaring a grid,
+  nothing changes.
+
+- **A resumed order asks for the remainder the venue still owes.** An order's
+  total and the fills against it are grid quantities, but their binary
+  difference need not be: 0.07841 filled down to 0.06531 leaves
+  1309.9999999999986 lots, and flooring that asked for 0.01309 -- a lot less
+  than the 0.01310 still outstanding. The order finished short, called itself
+  partially filled with a sliver no bar would absorb, and left the shortfall
+  in the book. The remainder is now read off the same grid the order's
+  quantities sit on, both where a resumed order sizes itself and where a fill
+  reports its leaves.
+
 ## [0.11.0] - 2026-08-31
 
 Open-mode execution no longer trades on information from the future.

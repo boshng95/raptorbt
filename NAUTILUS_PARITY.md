@@ -2,8 +2,8 @@
 
 This branch is based on upstream `v0.11.0` and carries fourteen narrowly
 scoped compatibility corrections used by algotrade-nautilus backtest
-experiments, plus two fixes to pre-existing upstream bugs (see the end of this
-section).
+experiments, plus four fixes to pre-existing upstream bugs (see the end of
+this section).
 The corrections are opt-in or default-neutral for existing callers, except
 where a stated one is simply a more accurate reading of the same arithmetic.
 
@@ -241,6 +241,25 @@ names units of an entry rather than of a reduction, so neither changes. This
 is what a nine-name portfolio replay found: Nautilus trimmed one share of a
 GOOGL position and Raptor sold all eleven.
 
+A position held the float sum of the fills that opened it, and that sum need
+not land where either fill did: 0.03835 + 0.04381 is 0.08216000000000001, so
+selling the 0.08216 that was bought left 1.4e-17 of a coin open. Nothing
+asks for a hundredth of a femto-lot, so the position never went flat and
+every later entry averaged into it -- a resampled BTC replay of forty-odd
+round trips reported one that never ended. The cash account was right to the
+cent throughout; only the book was wrong. A venue holds a whole number of
+lots, so the ledger now puts a position size back on the instrument's size
+grid after every add and reduction, and reports a round trip's closed size
+the same way.
+
+The same grid was missing from an order's unfilled remainder. A total and
+its fills are grid quantities, but their difference need not be: 0.07841
+filled down to 0.06531 leaves 1309.9999999999986 lots, and flooring that
+asked for a lot less than the venue still owed. The order finished short and
+called itself partially filled with a sliver no bar would absorb. The
+remainder is now read off the grid at the two points that consume it -- the
+size a resumed order asks for, and the leaves a fill reports.
+
 `portfolio::monte_carlo` rounds its chunk size up, so with more threads than
 simulations the last chunks began past the end of the work and
 `Vec::with_capacity(end - start)` underflowed -- five simulations over four
@@ -251,19 +270,23 @@ a bounded `RAYON_NUM_THREADS` on a many-core machine.
 
 ## Evidence
 
-- All 583 Rust library tests pass, at any thread count.
+- All 585 Rust library tests pass, at any thread count.
 - All 432 of the fork's own Python tests pass, the bit-exact golden gate
   included. Its baselines were regenerated once, for the fee arithmetic of
   item 6; see the changelog for what moved and by how much.
 - The algotrade-nautilus 81-case strategy matrix (27 strategies, three
-  parameter variants each) has no divergent case: 46 passes, two decision-only
-  passes, 29 cases whose strategies never ordered in the tested window, and
-  four `SMAGoldenCross` cases the oracle replay cannot express because they
-  alternate long and short against Raptor's run-level direction. Of the
-  passes, 13 are full independent ledgers, 16 replay Nautilus's decisions and
-  17 replay a portfolio's order flow. The 42 portfolio cases were unsupported
-  before this branch replayed order flow, and the last two failures were a
-  settlement row compared against Nautilus's unrounded mark.
+  parameter variants each) has no divergent case and no erroring case: 50
+  passes, two decision-only passes, and 29 cases whose strategies never
+  ordered in the tested window. Of the passes, 13 are full independent
+  ledgers, 16 replay Nautilus's decisions as entry/exit signals, four replay a
+  single name's typed order flow, and 17 replay a portfolio's order flow. The
+  42 portfolio cases were unsupported before this branch replayed order flow;
+  the two failures before that were a settlement row compared against
+  Nautilus's unrounded mark; and the four `SMAGoldenCross` cases that used to
+  error are the ones the signal lane cannot express -- a reduce-only order
+  against a position it has already closed whole -- which now route to typed
+  order replay instead. That fallback is what exposed the two lot-grid bugs
+  fixed above.
 - The algotrade-nautilus strict BTC callback case matched 230 of 230 canonical
   data, indicator, decision, order, fill, fee, position, equity, and metric
   events over 2026-01-01 through 2026-02-01, twice per engine.
