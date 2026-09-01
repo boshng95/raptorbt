@@ -98,6 +98,14 @@ def run_strategy_backtest(
     ``run_single_backtest``, so downstream result handling is identical for
     both paths.
 
+    ``account_type`` is ``"cash"`` (fully funded, the default) or
+    ``"margin"``, which locks ``1 / leverage`` of the notional per position
+    instead of all of it. A ``leverage`` of ``float("inf")`` locks nothing:
+    the venue refuses no order for want of capital, which is how an
+    instrument requiring no initial margin trades. Size those entries in
+    units -- a ``size_frac`` has no denominator against such an account and
+    is refused.
+
     Per bar: ``on_bar`` runs first, queued intents are applied through the
     engine (exits before entries, stop > target > signal), and resulting
     events are dispatched to the ``on_order_*`` / ``on_position_*`` hooks

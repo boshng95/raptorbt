@@ -24,6 +24,11 @@ pub enum RejectReason {
     Inactive,
     /// An explicit-size order costs more than the available capital.
     InsufficientCapital,
+    /// A size expressed as a fraction of capital was asked of an account
+    /// that requires no capital to hold the position (an unfunded margin
+    /// venue, `margin_init = 0`). There is no denominator to divide by, so
+    /// the fraction names no size.
+    UnfundedSizing,
     /// Capital-fraction sizing produced zero units because the instrument's
     /// margin requirement (a short option's SPAN-style deposit, a future's
     /// initial margin) exceeds the available capital — the lot itself was
@@ -44,6 +49,7 @@ impl RejectReason {
             RejectReason::Expired => "expired",
             RejectReason::Inactive => "inactive",
             RejectReason::InsufficientCapital => "insufficient_capital",
+            RejectReason::UnfundedSizing => "unfunded_sizing",
             RejectReason::InsufficientMargin => "insufficient_margin",
             RejectReason::MarginCall => "margin_call",
         }
