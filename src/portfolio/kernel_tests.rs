@@ -2509,3 +2509,46 @@ fn each_closing_fill_reports_only_the_pnl_it_realized() {
     let round_trip = trade.pnl + trade.entry_fees;
     assert!((fills - round_trip).abs() < 1e-9, "fills {fills} against round trip {round_trip}");
 }
+
+#[test]
+fn a_position_closed_in_full_leaves_no_dust_behind() {
+    // The bug this fixes: an entry filled in two pieces held
+    // 0.03835 + 0.04381 = 0.08216000000000001 units, and selling the
+    // 0.08216 it had bought left 1.4e-17 of a coin open. Nothing could
+    // ever close that -- no order asks for a hundredth of a femto-lot --
+    // so every later entry averaged into the same position and the run
+    // reported one round trip that never ended in place of the forty-odd
+    // it actually made.
+    let inst = InstrumentConfig { lot_size: Some(0.00001), ..InstrumentConfig::default() };
+    let config = BacktestConfig::default();
+    let fee_model = config.fee_model();
+    let mut kernel = EngineKernel::new(
+        config,
+        fee_model,
+        SlippageModel::None,
+        FillPrice::Close,
+        "BTCUSDT".to_string(),
+        Direction::Long,
+        Some(&inst),
+    );
+    kernel.set_position_policy(PositionPolicy::NetAveraging);
+    sized_order(&mut kernel, 0, 100.0, OrderSide::Buy, 0.03835);
+    sized_order(&mut kernel, 1, 100.0, OrderSide::Buy, 0.04381);
+    assert_eq!(
+        kernel.position_snapshot().expect("a position").size,
+        0.08216,
+        "two fills on the grid hold a size on the grid"
+    );
+
+    let events = sized_order(&mut kernel, 2, 110.0, OrderSide::Sell, 0.08216);
+
+    assert!(
+        events.iter().any(|e| matches!(e, EngineEvent::Exited { .. })),
+        "selling all of it closes it, got {events:?}"
+    );
+    assert!(
+        kernel.position_snapshot().is_none(),
+        "nothing is left open: {:?}",
+        kernel.position_snapshot().map(|p| p.size)
+    );
+}

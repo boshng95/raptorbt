@@ -20,6 +20,7 @@
 //! [`PositionManager`]: crate::portfolio::position::PositionManager
 
 use crate::core::decimals::quantize_money;
+use crate::core::lots::snap_to_lot_grid;
 use crate::core::types::{Direction, ExitReason, Position, Price, Timestamp, Trade};
 use crate::execution::indian_costs::FeeBreakdown;
 use crate::portfolio::position::ExitDetails;
@@ -223,6 +224,9 @@ pub struct PositionLedger {
     /// Decimal places the settlement currency counts in, when it declares
     /// any; see [`ManagedPosition::realized`].
     currency_precision: Option<u32>,
+    /// Size increment the instrument trades in; `0.0` when it declares
+    /// none. See [`PositionLedger::set_size_grid`].
+    size_grid: f64,
 }
 
 impl PositionLedger {
@@ -235,7 +239,27 @@ impl PositionLedger {
             next_position_id: 0,
             contract_multiplier: 1.0,
             currency_precision: None,
+            size_grid: 0.0,
         }
+    }
+
+    /// Declare the size increment the instrument trades in.
+    ///
+    /// A venue holds a whole number of lots, so every size this ledger
+    /// carries is put back on that grid after it moves. Fills arrive on it
+    /// already, but their float sum need not stay there: 0.03835 + 0.04381
+    /// is 0.08216000000000001, and selling the 0.08216 that was bought then
+    /// leaves a hundredth of a femto-lot behind -- dust no venue could
+    /// hold, which nonetheless reads as an open position and swallows every
+    /// later round trip into one that never closes.
+    pub fn set_size_grid(&mut self, grid: f64) {
+        self.size_grid = if grid > 0.0 { grid } else { 0.0 };
+    }
+
+    /// Put a size back on the instrument's grid; a no-op without one.
+    #[inline]
+    fn on_grid(&self, size: f64) -> f64 {
+        snap_to_lot_grid(size, self.size_grid)
     }
 
     /// Declare the settlement currency's precision.
@@ -373,6 +397,7 @@ impl PositionLedger {
             return false;
         }
         let precision = self.currency_precision;
+        let grid = self.size_grid;
         let Some(managed) = self.open.iter_mut().find(|p| p.id == id) else {
             return false;
         };
@@ -384,7 +409,7 @@ impl PositionLedger {
         // position that never gets added to must keep the exact entry price
         // it opened at.
         pos.entry_price = (pos.entry_price * pos.size + price * size) / (pos.size + size);
-        pos.size += size;
+        pos.size = snap_to_lot_grid(pos.size + size, grid);
         pos.entry_fees += entry_fees;
         merge_breakdown(&mut managed.entry_breakdown, entry_breakdown);
         managed.settle(0.0, entry_fees, precision);
@@ -405,6 +430,7 @@ impl PositionLedger {
         };
         let contract_multiplier = self.contract_multiplier;
         let precision = self.currency_precision;
+        let grid = self.size_grid;
         let managed = &mut self.open[index];
         let filled = size.min(managed.position.size);
         if !(filled > 0.0) {
@@ -422,7 +448,7 @@ impl PositionLedger {
             (exit.idx, exit.timestamp, exit.reason),
         );
         managed.settle(gross_pnl, exit.fees, precision);
-        managed.position.size -= filled;
+        managed.position.size = snap_to_lot_grid(managed.position.size - filled, grid);
 
         if managed.position.size > 0.0 {
             return ReduceOutcome::Reduced {
@@ -472,7 +498,10 @@ impl PositionLedger {
         // nine, and the settled figure is what the venue's books carry.
         let pnl = managed.realized.unwrap_or(closing.gross_pnl - total_fees);
 
-        let cost_basis = pos.entry_price * closing.size * self.contract_multiplier;
+        // The round trip's own size, on the grid for the same reason the
+        // position's is: it is a sum of fills, and a venue reports lots.
+        let closed_size = self.on_grid(closing.size);
+        let cost_basis = pos.entry_price * closed_size * self.contract_multiplier;
         let return_pct = if cost_basis > 0.0 { pnl / cost_basis * 100.0 } else { 0.0 };
 
         Trade {
@@ -482,7 +511,7 @@ impl PositionLedger {
             exit_idx,
             entry_price: pos.entry_price,
             exit_price: closing.price,
-            size: closing.size,
+            size: closed_size,
             direction: pos.direction,
             pnl,
             return_pct,

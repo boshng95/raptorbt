@@ -393,6 +393,9 @@ impl EngineKernel {
         let currency_precision = inst_config.and_then(|ic| ic.currency_precision);
         let mut ledger = PositionLedger::new(symbol, PositionPolicy::Net);
         ledger.set_currency_precision(currency_precision);
+        // The same grid the fill model floors prints onto: what the venue
+        // trades in is what the book can hold.
+        ledger.set_size_grid(inst_config.and_then(|ic| ic.lot_size).unwrap_or(0.0));
 
         Self {
             config,
@@ -457,6 +460,7 @@ impl EngineKernel {
         let mut ledger = PositionLedger::new(self.ledger.symbol().to_string(), policy);
         ledger.set_contract_multiplier(self.ledger.contract_multiplier());
         ledger.set_currency_precision(self.currency_precision);
+        ledger.set_size_grid(self.fill_model.size_quantum);
         self.ledger = ledger;
     }
 
@@ -553,6 +557,7 @@ impl EngineKernel {
             .filter(|increment| *increment > 0.0);
         self.fill_model.size_quantum =
             increment.or(self.lot_size).filter(|q| *q > 0.0).unwrap_or(0.0);
+        self.ledger.set_size_grid(self.fill_model.size_quantum);
     }
 
     /// Contract point value; `1.0` without a spec.
