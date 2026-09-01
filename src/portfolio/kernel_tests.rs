@@ -2552,3 +2552,36 @@ fn a_position_closed_in_full_leaves_no_dust_behind() {
         kernel.position_snapshot().map(|p| p.size)
     );
 }
+
+#[test]
+fn a_resumed_order_asks_for_the_remainder_the_venue_still_owes() {
+    // The bug this fixes: 0.07841 units filled down to 0.06531 leave
+    // 0.013099999999999987 -- 1309.9999999999986 lots -- and flooring that
+    // asked for 0.01309, a lot less than the venue still owed. The order
+    // never finished, and every later fill inherited the shortfall.
+    let mut kernel = bounded_kernel_on_a_lot(PositionPolicy::NetAveraging, 0.00001);
+    let id = kernel.submit_order(
+        OrderSide::Buy,
+        QtySpec::Units(0.07841),
+        OrderKind::Limit { price: 99.0 },
+        TimeInForce::Gtc,
+        0,
+        0,
+        "g".to_string(),
+        None,
+        None,
+    );
+    // A quarter of the bar's volume is all one aggressive order may take.
+    kernel.step(1, &bar_with_volume(1, 100.0, 0.26126), StepInput::default());
+    assert_eq!(order_status(&kernel, id), OrderStatus::PartiallyFilled);
+    assert_eq!(kernel.position_snapshot().expect("a position").size, 0.06531);
+
+    kernel.step(2, &bar_with_volume(2, 99.0, 400.0), StepInput::default());
+
+    assert_eq!(order_status(&kernel, id), OrderStatus::Filled);
+    assert_eq!(
+        kernel.position_snapshot().expect("a position").size,
+        0.07841,
+        "the two fills add up to the size the order asked for"
+    );
+}

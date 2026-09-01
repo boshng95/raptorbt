@@ -4,6 +4,7 @@
 //! Split out of `kernel.rs` to keep that file reviewable; this is the same
 //! `impl EngineKernel`, not a separate type.
 
+use crate::core::lots::snap_to_lot_grid;
 use crate::core::types::{Direction, ExitReason, Price};
 use crate::execution::algos::{AlgoError, ExecAlgorithm};
 use crate::execution::fill::{FillDepth, NextPrint};
@@ -246,11 +247,27 @@ impl EngineKernel {
         self.orders.modify(id, qty, limit_price, trigger_price)
     }
 
+    /// What an order still owes, on the instrument's size grid.
+    ///
+    /// An order's resolved total and every fill against it are grid
+    /// quantities, but their binary difference need not be one: 0.07841
+    /// filled down to 0.06531 leaves 1309.9999999999986 lots, and flooring
+    /// that asks for one lot less than the 0.01310 a venue counting in
+    /// decimals still owes -- so the order ends a lot short and reports
+    /// itself partially filled forever. Reading the remainder off the grid
+    /// is how it finishes at the size it was sent for.
+    fn leaves_on_grid(&self, id: u64) -> Option<f64> {
+        self.orders
+            .get(id)
+            .and_then(|order| order.leaves_qty())
+            .map(|leaves| snap_to_lot_grid(leaves, self.fill_model.size_quantum))
+    }
+
     /// What an order still has outstanding, read after its fill was
     /// recorded. Zero once nothing is left -- including for an order the
     /// fill terminated, which no longer reports leaves at all.
     fn leaves_after_fill(&self, id: u64) -> f64 {
-        self.orders.get(id).and_then(|order| order.leaves_qty()).unwrap_or(0.0).max(0.0)
+        self.leaves_on_grid(id).unwrap_or(0.0).max(0.0)
     }
 
     /// Shared view of an order by engine id.
@@ -359,14 +376,14 @@ impl EngineKernel {
             false => offered,
         };
 
+        // An order resumed after a partial fill asks for the rest of the
+        // size it already resolved to, not for a fresh sizing.
+        let leaves = self.leaves_on_grid(id);
         let Some(order) = self.orders.get(id) else { return };
         let side = order.side;
         let qty = order.qty;
         let kind = order.kind;
         let tif = order.tif;
-        // An order resumed after a partial fill asks for the rest of the
-        // size it already resolved to, not for a fresh sizing.
-        let leaves = order.leaves_qty();
         let status = order.status;
         let client_id = order.client_id.clone();
         let stop_attach = order.stop_price;
@@ -796,8 +813,8 @@ impl EngineKernel {
             .orders
             .get(id)
             .filter(|order| !order.status.is_terminal())
-            .and_then(|order| order.leaves_qty())
-            .is_some_and(|leaves| leaves > 0.0);
+            .is_some()
+            && self.leaves_on_grid(id).is_some_and(|leaves| leaves > 0.0);
         if !outstanding {
             return;
         }
