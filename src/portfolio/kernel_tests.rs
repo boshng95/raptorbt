@@ -2062,6 +2062,107 @@ fn a_reduce_only_order_never_opens_and_is_counted() {
     assert_eq!(kernel.rejected_entries(), 1, "a refusal must be observable");
 }
 
+/// Submit a market order for an explicit unit count and step one bar so it
+/// fills.
+fn sized_order(
+    kernel: &mut EngineKernel,
+    idx: usize,
+    price: Price,
+    side: OrderSide,
+    units: f64,
+) -> Vec<EngineEvent> {
+    kernel.submit_order_full(
+        side,
+        QtySpec::Units(units),
+        OrderKind::Market,
+        TimeInForce::Gtc,
+        idx,
+        idx as i64,
+        format!("o{idx}"),
+        None,
+        None,
+        false,
+        false,
+        false,
+        None,
+    );
+    kernel.step(idx, &bar(idx as i64, price), StepInput::default())
+}
+
+#[test]
+fn a_closing_order_reduces_by_the_size_it_asks_for() {
+    // The bug this fixes: the close ignored the order's own size and sold
+    // the whole position, so a one-lot trim of eleven held units flattened
+    // the book -- ten units of exposure a venue would still have been
+    // holding.
+    let mut kernel = make_kernel();
+    sized_order(&mut kernel, 0, 100.0, OrderSide::Buy, 11.0);
+    assert_eq!(kernel.position_snapshot().expect("a position").size, 11.0);
+
+    let events = sized_order(&mut kernel, 1, 110.0, OrderSide::Sell, 1.0);
+
+    match events.iter().find(|e| matches!(e, EngineEvent::OrderFilled { .. })) {
+        Some(EngineEvent::OrderFilled { size, leaves, .. }) => {
+            assert_eq!(*size, 1.0, "it asked for one unit");
+            assert_eq!(*leaves, 0.0, "and it got all of what it asked for");
+        }
+        _ => panic!("expected a fill, got {events:?}"),
+    }
+    assert!(
+        !events.iter().any(|e| matches!(e, EngineEvent::Exited { .. })),
+        "the position survives a partial reduction: {events:?}"
+    );
+    assert_eq!(kernel.position_snapshot().expect("ten units left").size, 10.0);
+}
+
+#[test]
+fn a_closing_order_larger_than_the_position_takes_what_is_there() {
+    let mut kernel = make_kernel();
+    sized_order(&mut kernel, 0, 100.0, OrderSide::Buy, 11.0);
+
+    let events = sized_order(&mut kernel, 1, 110.0, OrderSide::Sell, 50.0);
+
+    match events.iter().find(|e| matches!(e, EngineEvent::OrderFilled { .. })) {
+        Some(EngineEvent::OrderFilled { size, leaves, .. }) => {
+            assert_eq!(*size, 11.0);
+            // A reduction can never take more than is held, so nothing is
+            // left working to take the rest.
+            assert_eq!(*leaves, 0.0);
+        }
+        _ => panic!("expected a fill, got {events:?}"),
+    }
+    assert!(!kernel.is_in_position());
+}
+
+#[test]
+fn a_close_all_order_names_no_size_and_takes_the_whole_position() {
+    let mut kernel = make_kernel();
+    sized_order(&mut kernel, 0, 100.0, OrderSide::Buy, 11.0);
+    kernel.submit_order_full(
+        OrderSide::Sell,
+        QtySpec::FullPosition,
+        OrderKind::Market,
+        TimeInForce::Gtc,
+        1,
+        1,
+        "close-all".to_string(),
+        None,
+        None,
+        false,
+        true,
+        false,
+        None,
+    );
+
+    let events = kernel.step(1, &bar(1, 110.0), StepInput::default());
+
+    match events.iter().find(|e| matches!(e, EngineEvent::OrderFilled { .. })) {
+        Some(EngineEvent::OrderFilled { size, .. }) => assert_eq!(*size, 11.0),
+        _ => panic!("expected a fill, got {events:?}"),
+    }
+    assert!(!kernel.is_in_position());
+}
+
 #[test]
 fn a_leg_can_flip_side_within_one_run() {
     // The whole point: long, flat, then short on the same kernel.

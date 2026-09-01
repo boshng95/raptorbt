@@ -681,23 +681,36 @@ impl EngineKernel {
             } else {
                 matched_price
             };
-            // An opposing order closes the position it meets; its own
-            // quantity does not size the close (long-standing behavior).
-            // What can size it down is the bar's liquidity.
+            // A closing order reduces by the size it asks for. A venue
+            // does not read the position to decide how much of it to sell:
+            // a SELL 1 against a long 11 sells one and leaves ten. An order
+            // asking for more than is held closes what is there and is done
+            // -- there is no remainder a reduction could ever take.
+            //
+            // `QtySpec::FullPosition` is how an order asks for the whole
+            // position (the Python API's default when no size is named),
+            // and a capital fraction names units of an entry, not of a
+            // reduction; both leave the close bounded only by the position
+            // and the bar's liquidity.
             let open_size = first.position.size;
+            let asked = match (leaves, qty) {
+                (Some(left), _) => left.min(open_size),
+                (None, QtySpec::Units(units)) => units.min(open_size),
+                (None, QtySpec::CapitalFrac(_) | QtySpec::FullPosition) => open_size,
+            };
             match self.reduce_at(
                 idx,
                 bar,
                 position_id,
                 raw_price,
                 ExitReason::Order,
-                cap,
+                cap.min(asked),
                 arrived_at,
             ) {
                 ReduceResult::Closed { size, price, fees, gross_realized, event } => {
                     executed = Some(price);
                     let filled =
-                        self.orders.get_mut(id).map(|order| order.record_fill(size, open_size));
+                        self.orders.get_mut(id).map(|order| order.record_fill(size, asked));
                     if let Some(order) = self.orders.get_mut(id) {
                         let _ = order.transition(filled.unwrap_or(OrderStatus::Filled));
                     }
@@ -716,10 +729,11 @@ impl EngineKernel {
                 }
                 ReduceResult::Reduced { size, price, fees, gross_realized } => {
                     executed = Some(price);
-                    if let Some(order) = self.orders.get_mut(id) {
-                        let status = order.record_fill(size, open_size);
+                    let filled = self.orders.get_mut(id).map(|order| {
+                        let status = order.record_fill(size, asked);
                         let _ = order.transition(status);
-                    }
+                        status
+                    });
                     events.push(EngineEvent::OrderFilled {
                         idx,
                         order_id: id,
@@ -730,7 +744,16 @@ impl EngineKernel {
                         leaves: self.leaves_after_fill(id),
                         gross_realized,
                     });
-                    self.expire_remainder(idx, id, tif, &client_id, events);
+                    // The position outlived the reduction, but the order
+                    // need not have: one that asked for less than is held
+                    // is finished, and only what still shows size to fill
+                    // has a remainder to expire.
+                    match filled {
+                        Some(OrderStatus::PartiallyFilled) => {
+                            self.expire_remainder(idx, id, tif, &client_id, events)
+                        }
+                        _ => self.after_fill(idx, id, events),
+                    }
                 }
                 // A close that could not fill is not a refused *entry*, so it
                 // stays out of the rejected-entries count.

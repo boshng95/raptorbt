@@ -188,6 +188,33 @@ class TestFlags:
         assert strategy.rejects == ["reduce_only"]
 
 
+    def test_a_closing_order_trims_by_the_size_it_asks_for(self):
+        # A venue sells what the order says, not what the position holds:
+        # a four-lot reduce-only sell against ten held leaves six.
+        class S(EventLog):
+            def __init__(self, config=None):
+                super().__init__(config)
+                self.held = []
+
+            def on_bar(self, ctx):
+                if ctx.idx == 0:
+                    self.submit_order(orders.Market(side="buy", units=10.0))
+                elif ctx.idx == 2:
+                    self.submit_order(
+                        orders.Market(side="sell", units=4.0, reduce_only=True)
+                    )
+                self.held.append(ctx.position.size if ctx.position else 0.0)
+
+        data = _bars([100.0, 101.0, 102.0, 103.0, 104.0])
+        strategy = S()
+        result = run_strategy_backtest(strategy, **data, config=_zero_fee_config())
+
+        assert strategy.held[-1] == pytest.approx(6.0)
+        assert strategy.kinds().count("order_filled") == 2
+        # The trim is not a round trip: the position is still open at the end.
+        assert len(result.trades()) == 1
+
+
 class TestBrackets:
     def _bracket_strategy(self):
         class S(EventLog):

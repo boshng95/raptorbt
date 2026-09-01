@@ -79,6 +79,19 @@ at the open the market actually traded, exactly like the equity runners.**
   `MatchOutcome::Fill` gained `on_arrival` so a fill is dated to the arrival
   instant only when it was actually taken from the standing book.
 
+- **A closing order now reduces by the size it asks for.** An order meeting
+  an open position closed all of it and ignored its own quantity, so a
+  one-lot trim of eleven held units flattened the book -- ten units of
+  exposure a venue would still have been holding, and every later fill and
+  mark measured against a position that no longer existed. The close is now
+  bounded by the order's size as well as by the position and the bar's
+  liquidity, and an order that asked for less than is held reports itself
+  filled rather than leaving a phantom remainder to expire. Asking for the
+  whole position is still spelled by naming no size at all
+  (`QtySpec::FullPosition`, the Python API's default), and a capital
+  fraction still names units of an entry rather than of a reduction, so
+  neither changes.
+
 ## [0.11.0] - 2026-08-31
 
 Open-mode execution no longer trades on information from the future.
