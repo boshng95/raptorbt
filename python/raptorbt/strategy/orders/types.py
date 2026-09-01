@@ -36,11 +36,19 @@ class _OrderBase:
     stop_price: float | None = None
     target_price: float | None = None
     reduce_only: bool = False
-    #: The order reaches the venue before the bar it is submitted on, so it
-    #: meets the book the previous bar left behind. Set it when a decision
-    #: made on one instrument's bar sends an order for another whose bar for
-    #: that same instant has not arrived yet.
-    arrives_before_bar: bool = False
+    #: When the venue received the order, if it reached the venue before the
+    #: bar it is submitted on -- so it meets the book the previous bar left
+    #: behind, and what it fills there happened at this instant rather than
+    #: when that bar printed. Not crossing that book does not finish it with
+    #: the bar it beat: it was working while that bar printed, so the bar
+    #: fills it if it trades through, like any resting order (an immediate
+    #: order is the exception, killed against the book it arrived at). Set it
+    #: when a decision made on one instrument's bar sends an order for
+    #: another whose bar for that same instant has not arrived yet, or when a
+    #: bar aggregated on a clock is handed to the strategy by a later bar.
+    #: ``None``, the default, is an order that arrived with its own bar's
+    #: print, and never meets that bar's range at all.
+    arrival_ns: int | None = None
     tags: dict = field(default_factory=dict)
 
     def __post_init__(self) -> None:
