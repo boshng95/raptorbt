@@ -237,12 +237,117 @@ fn bounded_kernel_on_a_lot(policy: PositionPolicy, lot: f64) -> EngineKernel {
     kernel
 }
 
+/// A kernel funded with a known amount under a chosen account mode, so a
+/// test can put an order against capital that does or does not fund it.
+fn make_kernel_with_capital(capital: f64, account: AccountMode) -> EngineKernel {
+    let config = BacktestConfig {
+        initial_capital: capital,
+        same_bar_marketable_limit_on_close: true,
+        ..BacktestConfig::default()
+    };
+    let fee_model = config.fee_model();
+    let mut kernel = EngineKernel::new(
+        config,
+        fee_model,
+        SlippageModel::None,
+        FillPrice::Close,
+        "TEST".to_string(),
+        Direction::Long,
+        None,
+    )
+    .with_account_mode(account);
+    kernel.set_position_policy(PositionPolicy::Net);
+    kernel
+}
+
 fn bar_with_volume(idx: i64, price: Price, volume: f64) -> KernelBar {
     KernelBar { volume, ..bar(idx, price) }
 }
 
 fn order_status(kernel: &EngineKernel, id: u64) -> OrderStatus {
     kernel.orders.get(id).expect("order").status
+}
+
+/// A margin account of infinite leverage locks nothing, so a sized order
+/// fills however little cash is on hand. This is the Nautilus equity venue:
+/// its instruments declare `margin_init = 0`, so its accounts refuse no
+/// order for want of capital, and a cash account is not a mirror of one --
+/// it would refuse the very orders that venue filled.
+#[test]
+fn an_unfunded_margin_account_never_refuses_a_sized_order() {
+    let capital = 500.0;
+    let submit = |kernel: &mut EngineKernel| {
+        kernel.submit_order_full(
+            OrderSide::Buy,
+            QtySpec::Units(10.0),
+            OrderKind::Limit { price: 105.0 },
+            TimeInForce::Ioc,
+            0,
+            0,
+            "entry".to_string(),
+            None,
+            None,
+            false,
+            false,
+            false,
+            None,
+        );
+        kernel.step(0, &bar(0, 100.0), StepInput::default())
+    };
+
+    // Fully funded, 1,000 of notional does not fit in 500 of cash.
+    let mut cash = make_kernel_with_capital(capital, AccountMode::Cash);
+    let refused = submit(&mut cash);
+    assert!(
+        refused.iter().any(|event| matches!(
+            event,
+            EngineEvent::OrderRejected { reason: "insufficient_capital", .. }
+        )),
+        "cash should refuse what it cannot fund: {refused:?}"
+    );
+
+    // The same order against a venue that locks no margin.
+    let mut unfunded =
+        make_kernel_with_capital(capital, AccountMode::Margin { leverage: f64::INFINITY });
+    let filled = submit(&mut unfunded);
+    assert!(
+        filled.iter().any(|event| matches!(event, EngineEvent::Entered { .. })),
+        "an unfunded venue posts nothing against the position: {filled:?}"
+    );
+    assert_eq!(unfunded.locked_margin(), 0.0, "an unfunded venue posts no margin");
+}
+
+/// The same account leaves a capital fraction with nothing to divide by, so
+/// it names no size. Refusing says so; dividing would open a position of
+/// infinite size.
+#[test]
+fn a_capital_fraction_is_refused_by_an_account_that_funds_nothing() {
+    let mut kernel =
+        make_kernel_with_capital(500.0, AccountMode::Margin { leverage: f64::INFINITY });
+    kernel.submit_order_full(
+        OrderSide::Buy,
+        QtySpec::CapitalFrac(0.5),
+        OrderKind::Limit { price: 105.0 },
+        TimeInForce::Ioc,
+        0,
+        0,
+        "entry".to_string(),
+        None,
+        None,
+        false,
+        false,
+        false,
+        None,
+    );
+    let events = kernel.step(0, &bar(0, 100.0), StepInput::default());
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            EngineEvent::OrderRejected { reason: "unfunded_sizing", .. }
+        )),
+        "a fraction of capital names no size here: {events:?}"
+    );
+    assert!(kernel.position_snapshot().is_none(), "nothing should have opened");
 }
 
 #[test]

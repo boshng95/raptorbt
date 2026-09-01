@@ -296,7 +296,12 @@ def run_portfolio_strategy(
     full notional and marks equity with direction-aware unrealized PnL.
     Under margin the account is shared: ``leverage`` applies across all
     instruments, and a margin call halts every one of them, surfacing as
-    ``on_margin_call`` plus ``halted``/``halted_at`` on the result.
+    ``on_margin_call`` plus ``halted``/``halted_at`` on the result. A
+    ``leverage`` of ``float("inf")`` locks nothing at all, which is how a
+    venue whose instruments require no initial margin behaves: no order is
+    refused for want of capital, and the balance moves only with realized
+    PnL and fees. Size those entries in units -- a ``size_frac`` has no
+    denominator against such an account and is refused.
 
     Risk limits on ``config`` are portfolio-wide: ``max_positions`` counts
     open positions across all symbols, and ``max_drawdown_pct`` trips on

@@ -464,7 +464,8 @@ impl EngineKernel {
     /// locks initial margin per position (instrument `margin_init`, else
     /// `1 / leverage`), marks equity with direction-aware unrealized PnL,
     /// and emits a `MarginCall` event that halts entries when equity falls
-    /// below the maintenance requirement.
+    /// below the maintenance requirement. An infinite `leverage` is the
+    /// venue that locks nothing at all; see [`AccountMode::Margin`].
     pub fn with_account_mode(mut self, account: AccountMode) -> Self {
         if let AccountMode::Margin { leverage } = account {
             debug_assert!(leverage > 0.0, "leverage must be positive");
@@ -473,7 +474,8 @@ impl EngineKernel {
         self
     }
 
-    /// Per-position initial margin rate; `None` in cash mode.
+    /// Per-position initial margin rate; `None` in cash mode, and zero
+    /// under an infinite leverage -- a venue that locks no margin.
     fn margin_rate(&self) -> Option<f64> {
         match self.account {
             AccountMode::Cash => None,
@@ -1577,6 +1579,21 @@ impl EngineKernel {
             None => contract_value * (1.0 + fee_rate),
             Some(rate) => contract_value * (rate + fee_rate),
         };
+        // A fraction of capital answers "how many units can this account
+        // afford", which an account that requires no capital to hold the
+        // position (an unfunded margin venue, `margin_init = 0`) cannot
+        // answer: it affords any size. Dividing anyway would size the
+        // position by the fee rate alone -- and by infinity where there is
+        // no fee either. An explicit size is unaffected: it says what to
+        // trade without asking the account.
+        let funds_nothing = margin_rate.is_some_and(|rate| !(rate > 0.0));
+        if explicit_units.is_none() && (funds_nothing || !(sizing_denominator > 0.0)) {
+            return Some(OpenResult {
+                event: EngineEvent::EntryRejected { idx, reason: RejectReason::UnfundedSizing },
+                requested: 0.0,
+                fees: 0.0,
+            });
+        }
         let raw_size = match explicit_units {
             Some(units) => units,
             None => match size_mult {

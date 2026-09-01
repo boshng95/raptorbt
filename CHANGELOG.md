@@ -34,6 +34,19 @@ at the open the market actually traded, exactly like the equity runners.**
   execution cores were previously outside the bit-exact gate entirely.
   Every pre-existing fixture is byte-identical.
 
+- **An unfunded margin venue: `leverage=float("inf")`** — locks no initial
+  margin, so no order is refused for want of capital and the balance moves
+  only with realized PnL and fees. That is what an instrument declaring
+  `margin_init = 0` trades like (every Nautilus equity does), and a cash
+  account is not a mirror of one: it refuses the orders such a venue filled.
+  Accepted by `run_strategy_backtest` and `run_portfolio_strategy` alike.
+- **`RejectReason::UnfundedSizing` (`unfunded_sizing`)** — a size given as a
+  fraction of capital is refused when the account funds nothing, because
+  the fraction names no size: there is no capital requirement to divide by.
+  Previously the division fell through to the fee rate alone (and to
+  infinity where there was no fee), sizing a position at hundreds of times
+  the balance. Explicit unit sizes are unaffected.
+
 - **`generate.py --replay`** — recomputes the golden baselines from the
   inputs already frozen in `fixtures.json`. A deliberate regeneration should
   move the engine's numbers without moving the market they were measured on,

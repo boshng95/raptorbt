@@ -238,6 +238,84 @@ class TestPortfolioMargin:
         assert default.halted is False
         assert default.halted_at is None
 
+    def test_infinite_leverage_funds_nothing_and_refuses_nothing(self):
+        """A venue that locks no margin fills a sized order out of any balance.
+
+        This is how an instrument declaring no initial margin trades, and
+        the only faithful mirror of one: a cash account would refuse the
+        very orders such a venue filled.
+        """
+        from raptorbt.strategy.orders import Limit
+
+        class S(Strategy):
+            def __init__(self):
+                super().__init__()
+                self.refusals = []
+                self.fills = []
+
+            def on_bar(self, ctx):
+                if ctx.idx == 0:
+                    self.submit_order(
+                        Limit(side="buy", units=100.0, price=105.0, tif="ioc"),
+                        symbol=ctx.symbol,
+                    )
+
+            def on_order_rejected(self, ctx, event):
+                self.refusals.append(event.reject_reason)
+
+            def on_order_filled(self, ctx, event):
+                self.fills.append((ctx.symbol, event.size))
+
+        # 10,000 of notional against 1,000 of capital.
+        data = {"AAA": _bars([100.0, 101.0, 102.0])}
+        config = _zero_fee_config(initial_capital=1_000.0)
+
+        funded = S()
+        run_portfolio_strategy(funded, data, config=config, account_type="cash")
+        assert funded.refusals == ["insufficient_capital"]
+        assert funded.fills == []
+
+        unfunded = S()
+        run_portfolio_strategy(
+            unfunded,
+            data,
+            config=config,
+            account_type="margin",
+            leverage=float("inf"),
+        )
+        assert unfunded.refusals == []
+        assert unfunded.fills == [("AAA", 100.0)]
+
+    def test_infinite_leverage_refuses_a_fraction_of_capital(self):
+        """A fraction of capital names no size when capital funds nothing."""
+
+        class S(Strategy):
+            def __init__(self):
+                super().__init__()
+                self.refusals = []
+
+            def on_bar(self, ctx):
+                if ctx.idx == 0:
+                    self.enter(size_frac=0.5)
+
+            def on_order_rejected(self, ctx, event):
+                self.refusals.append(event.reject_reason)
+
+        data = {"AAA": _bars([100.0, 101.0, 102.0])}
+        strategy = S()
+        result = run_portfolio_strategy(
+            strategy,
+            data,
+            config=_zero_fee_config(),
+            account_type="margin",
+            leverage=float("inf"),
+        )
+        # The signal path reports the reason by its variant name, as it
+        # does for every other refusal (see ``test_strategy.py``); the
+        # order path spells the same reason ``unfunded_sizing``.
+        assert strategy.refusals == ["UnfundedSizing"]
+        assert result.result.metrics.total_trades == 0
+
     def test_rejects_invalid_account_type(self):
         data = {"AAA": _bars([100.0, 101.0])}
         with pytest.raises(ValueError, match="account_type must be"):

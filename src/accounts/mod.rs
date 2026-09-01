@@ -22,6 +22,15 @@ pub enum AccountMode {
     ///
     /// The per-position margin rate is the instrument's `margin_init` when
     /// set, else `1 / leverage`.
+    ///
+    /// `leverage` may be [`f64::INFINITY`], which makes that rate zero: a
+    /// venue that locks no initial margin, so no order is ever refused for
+    /// want of capital and the balance moves only with realized PnL and
+    /// fees. That is a real venue configuration, not a degenerate one --
+    /// Nautilus equity instruments declare `margin_init = 0`, and its
+    /// margin accounts hold exactly this way. Sizing a position as a
+    /// fraction of capital has no meaning against such an account and is
+    /// refused; an explicit size always fills.
     Margin { leverage: f64 },
 }
 
