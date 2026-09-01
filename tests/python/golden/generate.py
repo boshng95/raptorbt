@@ -4,6 +4,11 @@ Run from the repo root AFTER building the extension::
 
     .venv/bin/python raptorbt/tests/python/golden/generate.py
 
+Pass ``--replay`` to recompute the baselines from the inputs already frozen
+in ``fixtures.json``, leaving the corpus itself untouched. That is the form a
+deliberate regeneration takes once the corpus exists: the engine's numbers
+are allowed to move, the market it was measured on is not.
+
 Fixtures pin bit-exact results (float hex) for a corpus of runs across the
 array and class paths. ``test_golden.py`` replays the corpus and asserts
 equality, gating any refactor of the execution core. Regenerating fixtures
@@ -23,6 +28,7 @@ the gate to the Rust core it exists to protect.
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -390,10 +396,74 @@ def generate():
                 run_multileg(multileg_inputs, kind, timing)
             )
 
+    write(fixtures)
+
+
+def replay():
+    """Recompute every baseline from the frozen corpus.
+
+    The same calls the gate makes, so what lands in ``fixtures.json`` is
+    exactly what ``test_golden.py`` will replay. Only the recorded results
+    move; the inputs are carried over verbatim, which keeps the gate a
+    measurement of the engine rather than of the NumPy that built the data.
+    """
+    frozen = json.loads((HERE / "fixtures.json").read_text())
+    inputs = frozen["inputs"]
+    fixtures = {"inputs": inputs}
+    ts, o, h, l, c, v, entries, exits = thaw_inputs(inputs["shared"])
+
+    for name, config, ic, direction in config_variants():
+        fixtures[f"single/{name}"] = result_digest(
+            raptorbt.run_single_backtest(
+                ts,
+                o,
+                h,
+                l,
+                c,
+                v,
+                entries,
+                exits,
+                direction=direction,
+                config=config,
+                instrument_config=ic,
+            )
+        )
+
+    fixtures["class/sma_cross"] = result_digest(
+        raptorbt.run_strategy_backtest(GoldenSma, ts, o, h, l, c, v)
+    )
+
+    instruments = []
+    for seed in (11, 12, 13):
+        symbol = f"SYM{seed}"
+        pts, po, ph, pl, pc, pv, pe, px = thaw_inputs(inputs[symbol])
+        instruments.append((pts, po, ph, pl, pc, pv, pe, px, 1, 1.0, symbol))
+    portfolio = raptorbt.run_portfolio_backtest(
+        instruments, config=BacktestConfig(), allocation="equal_weight"
+    )
+    fixtures["portfolio/shared_pool"] = {
+        "equity_curve": [float.hex(float(x)) for x in portfolio.result.equity_curve()],
+        "total_return_pct": float.hex(portfolio.metrics.total_return_pct),
+        "per_instrument": {
+            s.symbol: {"trades": s.trades, "pnl": float.hex(s.pnl)}
+            for s in portfolio.per_instrument
+        },
+    }
+
+    for kind in MULTILEG_KINDS:
+        for timing in MULTILEG_TIMINGS:
+            fixtures[f"{kind}/{timing}"] = result_digest(
+                run_multileg(inputs, kind, timing)
+            )
+
+    write(fixtures)
+
+
+def write(fixtures):
     out = HERE / "fixtures.json"
     out.write_text(json.dumps(fixtures, indent=1, sort_keys=True))
     print(f"wrote {out} ({len(fixtures)} fixtures)")
 
 
 if __name__ == "__main__":
-    generate()
+    replay() if "--replay" in sys.argv else generate()

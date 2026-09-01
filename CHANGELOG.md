@@ -34,6 +34,21 @@ at the open the market actually traded, exactly like the equity runners.**
   execution cores were previously outside the bit-exact gate entirely.
   Every pre-existing fixture is byte-identical.
 
+- **`generate.py --replay`** — recomputes the golden baselines from the
+  inputs already frozen in `fixtures.json`. A deliberate regeneration should
+  move the engine's numbers without moving the market they were measured on,
+  and re-running `make_data` moves both.
+
+### Changed
+
+- **Golden baselines regenerated for the Nautilus-parity fee arithmetic.**
+  Percentage fees are now one correctly-rounded `price * size * rate`
+  product (NAUTILUS_PARITY.md item 6) instead of a left-to-right
+  accumulation, so pinned fees moved by one ULP and `lots_and_cap`'s equity
+  curve and metrics moved with them -- at most 1.4e-14 relative, on a Sharpe
+  ratio. No trade count, fill price, size or exit reason changed in any
+  fixture, and the frozen inputs are byte-identical.
+
 ## [0.11.0] - 2026-08-31
 
 Open-mode execution no longer trades on information from the future.
