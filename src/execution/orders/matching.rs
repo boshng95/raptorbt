@@ -64,8 +64,22 @@ fn side_as_fill_args(side: OrderSide) -> (Direction, bool) {
 /// Owns all orders for one session and matches resting ones per bar.
 #[derive(Debug, Default)]
 pub struct OrderEngine {
+    /// Every order ever submitted, in submission order.
+    ///
+    /// An order's id *is* its index here: `submit` pushes and nothing ever
+    /// removes or reorders. That is why there is no id counter and no id
+    /// map -- both would be a second source of truth able to drift from
+    /// this one. Look an order up with [`OrderEngine::get`].
     orders: Vec<Order>,
-    next_id: u64,
+    /// Ids of the orders that may still be working, in submission order.
+    ///
+    /// A superset, pruned lazily: an id is added on submission and removed
+    /// on the next match pass after the order goes terminal, so every
+    /// reader still filters on status. Without it each bar would walk the
+    /// whole ledger to find the handful of live orders, which makes a run
+    /// quadratic in its own length -- the cost lands on long sweeps, where
+    /// it is least affordable.
+    working: Vec<u64>,
     /// Offset applied before deriving the trading date for DAY expiry.
     /// `0` is UTC, which is what `Default` yields.
     tz_offset_ns: i64,
@@ -106,11 +120,7 @@ impl OrderEngine {
 
     /// Working orders released by a schedule.
     pub fn algo_order_ids(&self, algo_id: u64) -> Vec<u64> {
-        self.orders
-            .iter()
-            .filter(|o| o.algo_id == Some(algo_id) && !o.status.is_terminal())
-            .map(|o| o.id)
-            .collect()
+        self.working().filter(|o| o.algo_id == Some(algo_id)).map(|o| o.id).collect()
     }
 
     /// Register a new order and return its engine id.
@@ -119,26 +129,32 @@ impl OrderEngine {
     /// accepted (resting kinds) or handled immediately (market kinds).
     #[allow(clippy::too_many_arguments)]
     pub fn submit(&mut self, mut order: Order) -> u64 {
-        let id = self.next_id;
-        self.next_id += 1;
+        let id = self.orders.len() as u64;
         order.id = id;
         self.orders.push(order);
+        self.working.push(id);
         id
     }
 
     /// Shared view of an order by id.
     pub fn get(&self, id: u64) -> Option<&Order> {
-        self.orders.iter().find(|o| o.id == id)
+        self.orders.get(id as usize)
     }
 
     /// Mutable view of an order by id.
     pub fn get_mut(&mut self, id: u64) -> Option<&mut Order> {
-        self.orders.iter_mut().find(|o| o.id == id)
+        self.orders.get_mut(id as usize)
     }
 
     /// All non-terminal orders, in submission order.
+    ///
+    /// Reads the live index rather than the ledger, and filters it: the
+    /// index is a superset until the next match pass prunes it.
     pub fn working(&self) -> impl Iterator<Item = &Order> {
-        self.orders.iter().filter(|o| !o.status.is_terminal())
+        self.working.iter().filter_map(|&id| {
+            let order = &self.orders[id as usize];
+            (!order.status.is_terminal()).then_some(order)
+        })
     }
 
     /// Every order ever submitted, in submission order.
@@ -156,8 +172,7 @@ impl OrderEngine {
 
     /// Cancel every working order, returning the ids canceled.
     pub fn cancel_all(&mut self) -> Vec<u64> {
-        let ids: Vec<u64> =
-            self.orders.iter().filter(|o| !o.status.is_terminal()).map(|o| o.id).collect();
+        let ids: Vec<u64> = self.working().map(|o| o.id).collect();
         for id in &ids {
             let _ = self.cancel(*id);
         }
@@ -313,13 +328,35 @@ impl OrderEngine {
         );
         let book = self.tape;
 
-        // Parent states for one-triggers-other gating, resolved up front so
-        // the mutable iteration below stays borrow-clean. Held children of a
-        // filled parent become matchable; children of a dead parent cancel.
-        let parent_state: std::collections::HashMap<u64, OrderStatus> =
-            self.orders.iter().map(|o| (o.id, o.status)).collect();
+        // Drop the orders that finished on an earlier step. This is the
+        // only place the live index is pruned, and it costs one pass over
+        // the live orders -- not over every order the run has placed.
+        let ledger = &self.orders;
+        self.working.retain(|&id| !ledger[id as usize].status.is_terminal());
 
-        for order in &mut self.orders {
+        // Parent states for one-triggers-other gating, snapshotted before
+        // the loop. The snapshot is load-bearing, not just borrow-clean: a
+        // parent precedes its child in submission order, so reading the
+        // status live would let a child see a parent this very pass had
+        // just killed, one bar earlier than it should. Only the parents
+        // actually referenced are read -- this was a map of every order
+        // ever submitted, rebuilt on every bar.
+        let parent_state: std::collections::HashMap<u64, OrderStatus> = self
+            .working
+            .iter()
+            .filter_map(|&id| self.orders[id as usize].parent_id)
+            .collect::<std::collections::BTreeSet<u64>>()
+            .into_iter()
+            .filter_map(|parent_id| {
+                self.orders.get(parent_id as usize).map(|parent| (parent_id, parent.status))
+            })
+            .collect();
+
+        let same_bar_close = self.same_bar_marketable_limit_on_close;
+        for slot in 0..self.working.len() {
+            let order = &mut self.orders[self.working[slot] as usize];
+            // The index is a superset between prunes, so status is checked
+            // here for the same reason `working()` checks it.
             if order.status.is_terminal() || order.submitted_idx > idx {
                 continue;
             }
@@ -327,14 +364,12 @@ impl OrderEngine {
             // An order that arrived ahead of its bar has already met a book
             // -- the one standing when it was sent -- so it matches here
             // whether or not same-bar matching is enabled generally.
-            if submitted_this_bar
-                && !(self.same_bar_marketable_limit_on_close || order.arrives_before_bar)
-            {
+            if submitted_this_bar && !(same_bar_close || order.arrives_before_bar) {
                 continue;
             }
 
             if let Some(parent_id) = order.parent_id {
-                match parent_state.get(&parent_id) {
+                match parent_state.get(&parent_id).copied() {
                     Some(OrderStatus::Filled) => {} // active: fall through
                     Some(status) if status.is_terminal() => {
                         let _ = order.transition(OrderStatus::Canceled);
@@ -626,6 +661,68 @@ mod tests {
         let _ = order.transition(OrderStatus::Accepted);
         let id = engine.submit(order);
         (engine, id)
+    }
+
+    /// A run's per-bar cost must not grow with the orders it has already
+    /// finished with. The ledger keeps every order forever -- it is the
+    /// record -- so the match pass reads a live index over it instead, and
+    /// these pin the two properties that makes correct.
+    #[test]
+    fn an_orders_id_is_its_slot_in_the_ledger() {
+        let mut engine = OrderEngine::new();
+        for n in 0..5 {
+            let mut order = Order::plain(
+                OrderSide::Buy,
+                QtySpec::Units(1.0),
+                OrderKind::Limit { price: 99.0 },
+                TimeInForce::Gtc,
+            );
+            order.client_id = format!("t-{n}");
+            let id = engine.submit(order);
+            assert_eq!(id, n, "ids are handed out in submission order");
+        }
+        for (slot, order) in engine.all().iter().enumerate() {
+            assert_eq!(order.id as usize, slot, "an id indexes the ledger");
+            assert_eq!(engine.get(order.id).map(|o| o.id), Some(order.id));
+        }
+        assert!(engine.get(99).is_none(), "an unknown id is absent, not a panic");
+    }
+
+    #[test]
+    fn a_finished_order_stops_costing_the_match_pass_anything() {
+        let fm = FillModel::default();
+        let mut engine = OrderEngine::new();
+        // Ten orders that die on their evaluation bar, and one that rests.
+        for n in 0..10 {
+            let mut order = Order::plain(
+                OrderSide::Buy,
+                QtySpec::Units(1.0),
+                OrderKind::Limit { price: 1.0 },
+                TimeInForce::Ioc,
+            );
+            order.client_id = format!("ioc-{n}");
+            let _ = order.transition(OrderStatus::Accepted);
+            engine.submit(order);
+        }
+        let mut resting = Order::plain(
+            OrderSide::Buy,
+            QtySpec::Units(1.0),
+            OrderKind::Limit { price: 1.0 },
+            TimeInForce::Gtc,
+        );
+        resting.client_id = "gtc".into();
+        let _ = resting.transition(OrderStatus::Accepted);
+        let survivor = engine.submit(resting);
+
+        // The pass that kills the ten still has to walk them once.
+        engine.match_bar(1, &bar(1, 100.0, 101.0, 99.5, 100.5), &fm);
+        assert_eq!(engine.all().len(), 11, "the ledger keeps every order");
+
+        // The next one must not: the index is pruned to what is still live.
+        engine.match_bar(2, &bar(2, 100.0, 101.0, 99.5, 100.5), &fm);
+        assert_eq!(engine.working, vec![survivor], "only the resting order is still indexed");
+        assert_eq!(engine.working().count(), 1);
+        assert_eq!(engine.all().len(), 11, "and the ledger is untouched by pruning");
     }
 
     #[test]
