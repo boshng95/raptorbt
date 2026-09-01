@@ -275,18 +275,19 @@ a bounded `RAYON_NUM_THREADS` on a many-core machine.
   included. Its baselines were regenerated once, for the fee arithmetic of
   item 6; see the changelog for what moved and by how much.
 - The algotrade-nautilus 81-case strategy matrix (27 strategies, three
-  parameter variants each) has no divergent case and no erroring case: 50
-  passes, two decision-only passes, and 29 cases whose strategies never
-  ordered in the tested window. Of the passes, 13 are full independent
-  ledgers, 16 replay Nautilus's decisions as entry/exit signals, four replay a
-  single name's typed order flow, and 17 replay a portfolio's order flow. The
-  42 portfolio cases were unsupported before this branch replayed order flow;
-  the two failures before that were a settlement row compared against
-  Nautilus's unrounded mark; and the four `SMAGoldenCross` cases that used to
-  error are the ones the signal lane cannot express -- a reduce-only order
-  against a position it has already closed whole -- which now route to typed
-  order replay instead. That fallback is what exposed the two lot-grid bugs
-  fixed above.
+  parameter variants each) passes 81 of 81, with no divergent case, no
+  erroring case, and no case whose strategy never ordered: 25,033 Nautilus
+  orders compared in total. All 15 strict independent cases pass a full
+  independent ledger; all 24 single-name oracle cases pass, 17 replaying
+  Nautilus's decisions as entry/exit signals and seven replaying a single
+  name's typed order flow; all 42 portfolio cases pass on portfolio order
+  replay. The 42 portfolio cases were unsupported before this branch replayed
+  order flow; the two failures before that were a settlement row compared
+  against Nautilus's unrounded mark; and the seven order-replay cases are the
+  ones the signal lane cannot express -- a reduce-only order against a
+  position it has already closed whole, or an order type the lane will not
+  place -- which route to typed order replay instead. That fallback is what
+  exposed the two lot-grid bugs fixed above.
 - The algotrade-nautilus strict BTC callback case matched 230 of 230 canonical
   data, indicator, decision, order, fill, fee, position, equity, and metric
   events over 2026-01-01 through 2026-02-01, twice per engine.
