@@ -121,6 +121,77 @@ fn declared_currency_precision_quantizes_cash_and_equity_to_cents() {
     assert_eq!(kernel.equity(150.123456), 10_117.76);
 }
 
+/// A kernel whose instrument settles in cents, as a listed equity does.
+fn cents_kernel() -> EngineKernel {
+    let config = BacktestConfig::default();
+    let fee_model = config.fee_model();
+    let instrument =
+        InstrumentConfig { currency_precision: Some(2), ..InstrumentConfig::default() };
+    EngineKernel::new(
+        config,
+        fee_model,
+        SlippageModel::None,
+        FillPrice::Close,
+        "KO".to_string(),
+        Direction::Long,
+        Some(&instrument),
+    )
+}
+
+/// The realized gross of the close that exposed the rule.
+///
+/// Thirty shares bought as 25 at 70.04 and 5 at 70.05 average to
+/// 70.041666..., so taking 27 of them back at 69.98 realizes
+/// `27 * -0.061666...` -- exactly minus one and sixty-six and a half cents.
+fn half_cent_gross() -> f64 {
+    let avg_entry = (25.0 * 70.04 + 5.0 * 70.05) / 30.0;
+    27.0 * (69.98 - avg_entry)
+}
+
+#[test]
+fn an_account_settles_each_amount_it_books_rather_than_their_sum() {
+    // Half a cent has to settle one way or the other, and a venue settles
+    // it as it books it -- Nautilus by making every item a `Money` before
+    // it reaches the account. Carrying the fraction into the balance and
+    // rounding the total instead keeps it alive, and on the balance below
+    // the two answers are a cent apart. That is how a run drifts a cent
+    // away from the venue's own statement without any trade differing.
+    let gross = half_cent_gross();
+    let mut kernel = cents_kernel();
+    kernel.set_cash(128.05);
+    kernel.book_cash(&[gross]);
+    assert_eq!(kernel.cash(), 126.38);
+
+    // Kept rather than described: this is what rounding only the sum says,
+    // so the difference the rule makes is visible in the test itself.
+    assert_eq!(quantize_money(128.05 + gross, Some(2)), 126.39);
+}
+
+#[test]
+fn every_amount_settles_including_the_fee_beside_it() {
+    // Two items, and each is money on its own: the fill's realized gross
+    // and the commission charged on it. Booking them as one sum would
+    // settle their total, which is not what either of them was.
+    let gross = half_cent_gross();
+    let mut kernel = cents_kernel();
+    kernel.set_cash(128.05);
+    kernel.book_cash(&[gross, -1.0]);
+    assert_eq!(kernel.cash(), 125.38);
+}
+
+#[test]
+fn an_instrument_with_no_currency_precision_books_cash_untouched() {
+    // No declared unit is no unit to settle in, so every amount passes
+    // through and the balance is the same additions in the same order
+    // stock Raptor has always made -- bit for bit, which is what the golden
+    // fixtures pin.
+    let gross = half_cent_gross();
+    let mut kernel = make_kernel();
+    kernel.set_cash(128.05);
+    kernel.book_cash(&[gross, -1.0]);
+    assert_eq!(kernel.cash(), 128.05 + gross - 1.0);
+}
+
 fn bar(idx: i64, price: Price) -> KernelBar {
     KernelBar {
         timestamp: idx,

@@ -608,6 +608,37 @@ impl EngineKernel {
         quantize_money(value, self.currency_precision)
     }
 
+    /// Move cash by a list of amounts, each quantized as it is booked.
+    ///
+    /// Every term reaching an account is already money: the proceeds of the
+    /// units sold, a fill's realized gross, the commission on it. Quantizing
+    /// each on its own is not the same as quantizing their sum, and the
+    /// difference is not theoretical. A position built by two fills at two
+    /// prices has an average entry that is a repeating decimal, so the share
+    /// of it a partial close takes back lands on half a unit of the
+    /// currency: rounding the sum carries that fraction on into the balance,
+    /// rounding the amount settles it there and then. Nautilus books every
+    /// item as `Money` and so settles it, which is why an account that
+    /// rounds only the sum drifts a unit away from the venue's own statement
+    /// over a run.
+    ///
+    /// The ledger's own realized total is deliberately not this: it takes
+    /// the raw increment into a running figure it rounds once, which is what
+    /// a position reports and what Nautilus reports for one. An account and
+    /// a position are answering different questions.
+    ///
+    /// An instrument that declares no currency precision has no unit to
+    /// settle in, and every term passes through untouched -- the sum is then
+    /// the same additions in the same order as before, bit for bit.
+    #[inline]
+    fn book_cash(&mut self, amounts: &[f64]) {
+        let mut cash = self.cash;
+        for &amount in amounts {
+            cash += self.quantize_money(amount);
+        }
+        self.cash = self.quantize_money(cash);
+    }
+
     /// Market value of open positions at the given price, or 0.0 when flat.
     #[inline]
     pub fn position_value(&self, close: Price) -> f64 {
@@ -687,7 +718,7 @@ impl EngineKernel {
         // understate equity by the cost basis for the whole run. No fee term
         // in either arm: an adoption is not a trade and charges nothing.
         match margin_rate {
-            None => self.cash = self.quantize_money(self.cash - price * size * self.multiplier()),
+            None => self.book_cash(&[-(price * size * self.multiplier())]),
             Some(rate) => self.margin.lock(id, price * size * self.multiplier() * rate),
         }
         Ok(id)
@@ -1558,13 +1589,12 @@ impl EngineKernel {
     ) {
         match self.account {
             AccountMode::Cash => {
-                self.cash = self
-                    .quantize_money(self.cash + exit_price * size * self.multiplier() - exit_fees);
+                self.book_cash(&[exit_price * size * self.multiplier(), -exit_fees]);
             }
             AccountMode::Margin { .. } => {
                 let fraction = if open_size > 0.0 { size / open_size } else { 1.0 };
                 self.margin.release_fraction(position_id, fraction);
-                self.cash = self.quantize_money(self.cash + gross_pnl - exit_fees);
+                self.book_cash(&[gross_pnl, -exit_fees]);
             }
         }
     }
@@ -1828,10 +1858,10 @@ impl EngineKernel {
             )?,
         };
         match margin_rate {
-            None => self.cash = self.quantize_money(self.cash - contract_value * size - entry_fees),
+            None => self.book_cash(&[-(contract_value * size), -entry_fees]),
             Some(rate) => {
                 self.margin.lock(position_id, contract_value * size * rate);
-                self.cash = self.quantize_money(self.cash - entry_fees);
+                self.book_cash(&[-entry_fees]);
             }
         }
 
