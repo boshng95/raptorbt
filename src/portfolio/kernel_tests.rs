@@ -2296,6 +2296,16 @@ fn a_bar_too_thin_to_pass_the_position_closes_without_reversing() {
     let bar = bar(1, 110.0);
 
     let order_id = submit_sized(&mut kernel, 1, OrderSide::Sell, 50.0);
+    // A venue acknowledges an order before it can match it, and every caller
+    // of `apply_match_outcome` reaches it through a step that has already
+    // done so. Bounding the depth is what forces this test to hand the
+    // kernel an outcome directly, so it has to acknowledge the order itself.
+    let accepted = kernel
+        .orders
+        .get_mut(order_id)
+        .expect("the order just submitted")
+        .transition(OrderStatus::Accepted);
+    assert!(accepted, "the venue takes the order before it matches it");
     let mut events = Vec::new();
     kernel.apply_match_outcome(
         1,
