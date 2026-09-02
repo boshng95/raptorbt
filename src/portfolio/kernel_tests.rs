@@ -2089,6 +2089,52 @@ fn sized_order(
     kernel.step(idx, &bar(idx as i64, price), StepInput::default())
 }
 
+/// The same, for an order that may only reduce exposure.
+fn reduce_only_order(
+    kernel: &mut EngineKernel,
+    idx: usize,
+    price: Price,
+    side: OrderSide,
+    units: f64,
+) -> Vec<EngineEvent> {
+    kernel.submit_order_full(
+        side,
+        QtySpec::Units(units),
+        OrderKind::Market,
+        TimeInForce::Gtc,
+        idx,
+        idx as i64,
+        format!("o{idx}"),
+        None,
+        None,
+        false,
+        true,
+        false,
+        None,
+    );
+    kernel.step(idx, &bar(idx as i64, price), StepInput::default())
+}
+
+/// Submit a market order without stepping, so a caller can hand the match
+/// a book of its own choosing.
+fn submit_sized(kernel: &mut EngineKernel, idx: usize, side: OrderSide, units: f64) -> u64 {
+    kernel.submit_order_full(
+        side,
+        QtySpec::Units(units),
+        OrderKind::Market,
+        TimeInForce::Gtc,
+        idx,
+        idx as i64,
+        format!("o{idx}"),
+        None,
+        None,
+        false,
+        false,
+        false,
+        None,
+    )
+}
+
 #[test]
 fn a_closing_order_reduces_by_the_size_it_asks_for() {
     // The bug this fixes: the close ignored the order's own size and sold
@@ -2116,22 +2162,93 @@ fn a_closing_order_reduces_by_the_size_it_asks_for() {
 }
 
 #[test]
-fn a_closing_order_larger_than_the_position_takes_what_is_there() {
+fn a_closing_order_larger_than_the_position_reverses_it() {
+    // A netting venue handed more than it holds does not stop at flat: it
+    // closes what it has and opens the remainder the other way. This is the
+    // only way a long/short book ever reverses a name -- one rebalance order
+    // that sells the long and establishes the short in a single fill -- and
+    // it is what Nautilus does, splitting one venue fill into a closing leg
+    // and an opening one.
     let mut kernel = make_kernel();
     sized_order(&mut kernel, 0, 100.0, OrderSide::Buy, 11.0);
 
     let events = sized_order(&mut kernel, 1, 110.0, OrderSide::Sell, 50.0);
 
+    let fills: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            EngineEvent::OrderFilled { size, leaves, price, .. } => Some((*size, *leaves, *price)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(fills.len(), 2, "one fill per leg: {events:?}");
+    assert_eq!(fills[0].0, 11.0, "the closing leg takes the whole position");
+    assert_eq!(fills[0].1, 39.0, "and leaves the remainder outstanding");
+    assert_eq!(fills[1].0, 39.0, "the opening leg takes the rest");
+    assert_eq!(fills[1].1, 0.0, "which finishes the order");
+    assert_eq!(fills[0].2, fills[1].2, "both legs are one fill, at one price");
+
+    assert!(
+        events.iter().any(|e| matches!(e, EngineEvent::Exited { .. })),
+        "the long is closed: {events:?}"
+    );
+    let opened = kernel.position_snapshot().expect("a reversed position");
+    assert_eq!(opened.size, 39.0);
+    assert_eq!(opened.direction, Direction::Short);
+}
+
+#[test]
+fn a_reduce_only_order_larger_than_the_position_stops_at_flat() {
+    // Reduce-only exists to say "never increase exposure". A protective leg
+    // left working after a stop already trimmed the position must close what
+    // is left and stop, not reverse into a fresh short.
+    let mut kernel = make_kernel();
+    sized_order(&mut kernel, 0, 100.0, OrderSide::Buy, 11.0);
+
+    let events = reduce_only_order(&mut kernel, 1, 110.0, OrderSide::Sell, 50.0);
+
     match events.iter().find(|e| matches!(e, EngineEvent::OrderFilled { .. })) {
         Some(EngineEvent::OrderFilled { size, leaves, .. }) => {
             assert_eq!(*size, 11.0);
-            // A reduction can never take more than is held, so nothing is
-            // left working to take the rest.
-            assert_eq!(*leaves, 0.0);
+            assert_eq!(*leaves, 0.0, "nothing is left working to reverse into");
         }
         _ => panic!("expected a fill, got {events:?}"),
     }
     assert!(!kernel.is_in_position());
+}
+
+#[test]
+fn a_bar_too_thin_to_pass_the_position_closes_without_reversing() {
+    // The bar bounds the whole fill, not each leg. A fill that could not
+    // reach past the position never had a remainder to flip into, so the
+    // order closes and keeps working for the rest -- which is a partial
+    // fill, not a reversal.
+    let mut kernel = make_kernel();
+    sized_order(&mut kernel, 0, 100.0, OrderSide::Buy, 11.0);
+    let bar = bar(1, 110.0);
+
+    let order_id = submit_sized(&mut kernel, 1, OrderSide::Sell, 50.0);
+    let mut events = Vec::new();
+    kernel.apply_match_outcome(
+        1,
+        &bar,
+        MatchOutcome::Fill {
+            order_id,
+            price: 110.0,
+            depth: FillDepth::single(11.0, Tail::Rests),
+            on_arrival: false,
+        },
+        &mut events,
+    );
+
+    assert!(!kernel.is_in_position(), "the long is closed: {events:?}");
+    match events.iter().find(|e| matches!(e, EngineEvent::OrderFilled { .. })) {
+        Some(EngineEvent::OrderFilled { size, leaves, .. }) => {
+            assert_eq!(*size, 11.0);
+            assert_eq!(*leaves, 39.0, "the rest is still outstanding");
+        }
+        _ => panic!("expected a fill, got {events:?}"),
+    }
 }
 
 #[test]
@@ -2449,7 +2566,7 @@ fn cash_after_unwinding_in(pieces: &[f64]) -> f64 {
     );
     assert!(matches!(entered, Some(OpenResult { event: EngineEvent::Entered { .. }, .. })));
     for cap in pieces {
-        kernel.reduce_at(1, &bar(1, 110.0), 0, 110.0, ExitReason::Signal, *cap, None);
+        kernel.reduce_at(1, &bar(1, 110.0), 0, 110.0, ExitReason::Signal, *cap, None, None);
     }
     assert_eq!(kernel.ledger.open_count(), 0, "the position must end flat");
     kernel.cash()
@@ -2488,8 +2605,8 @@ fn each_closing_fill_reports_only_the_pnl_it_realized() {
     );
     assert!(matches!(entered, Some(OpenResult { event: EngineEvent::Entered { .. }, .. })));
 
-    let first = kernel.reduce_at(1, &bar(1, 110.0), 0, 110.0, ExitReason::Signal, 4.0, None);
-    let second = kernel.reduce_at(1, &bar(1, 110.0), 0, 110.0, ExitReason::Signal, 6.0, None);
+    let first = kernel.reduce_at(1, &bar(1, 110.0), 0, 110.0, ExitReason::Signal, 4.0, None, None);
+    let second = kernel.reduce_at(1, &bar(1, 110.0), 0, 110.0, ExitReason::Signal, 6.0, None, None);
     let ReduceResult::Reduced { gross_realized: first_gross, fees: first_fees, .. } = &first else {
         panic!("expected a partial reduction, got {first:?}");
     };

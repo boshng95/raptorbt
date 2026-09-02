@@ -341,12 +341,22 @@ pub(crate) struct FillTerms {
     /// the bar it beat has not happened yet. `None` stamps the bar, which is
     /// when every other fill occurs.
     pub at: Option<Timestamp>,
+    /// Commission already settled for this leg, when it is one half of a
+    /// fill the venue billed once.
+    ///
+    /// A netting flip is a single fill split into a leg that closes and a
+    /// leg that opens. The venue charged it once, for the whole size, and a
+    /// brokerage schedule with a per-order floor or a notional cap is not
+    /// linear in size -- so pricing each leg on its own would bill an amount
+    /// the venue never took. `None` means the ordinary charge for this
+    /// fill's own size.
+    pub fee: Option<f64>,
 }
 
 impl FillTerms {
     /// Terms for a fill nothing constrains: a whole, fresh order.
     pub const WHOLE: Self =
-        Self { cap: f64::INFINITY, all_or_none: false, resuming: false, at: None };
+        Self { cap: f64::INFINITY, all_or_none: false, resuming: false, at: None, fee: None };
 }
 
 /// What one opening fill did.
@@ -1381,10 +1391,54 @@ impl EngineKernel {
         reason: ExitReason,
         at: Option<Timestamp>,
     ) -> Option<EngineEvent> {
-        match self.reduce_at(idx, bar, position_id, exit_price, reason, f64::INFINITY, at) {
+        match self.reduce_at(idx, bar, position_id, exit_price, reason, f64::INFINITY, at, None) {
             ReduceResult::Closed { event, .. } => Some(event),
             _ => None,
         }
+    }
+
+    /// Split one fill's commission between the two legs a netting flip makes.
+    ///
+    /// Nautilus fills a flipping order once -- one price, one commission --
+    /// and its execution engine then splits that fill into a leg that closes
+    /// the position and a leg that opens the remainder, prorating the
+    /// commission between them by size. A brokerage schedule with a
+    /// per-order floor or a notional cap is not linear in size, so charging
+    /// each leg for its own size would bill more (or less) than the venue
+    /// ever took: two floors instead of one.
+    ///
+    /// Returns the closing leg's share, the size the opening leg takes, and
+    /// the opening leg's share. A fill the bar could not absorb past the
+    /// position is not a flip -- it closes and leaves the rest working -- and
+    /// nothing is split.
+    ///
+    /// The whole fill is priced exactly as [`Self::reduce_at`] would price
+    /// the closing leg alone, on the position's own direction and the exit
+    /// convention, because the venue saw one order trading once. Only the
+    /// itemized Indian schedule reads direction or entry at all, and a flip
+    /// under it bills the fill as the single trade it was.
+    pub(crate) fn split_flip_fee(
+        &self,
+        bar: &KernelBar,
+        price: Price,
+        held: Direction,
+        open_size: f64,
+        taking: f64,
+    ) -> (Option<f64>, f64, f64) {
+        let flip = self.round_size((taking - open_size).max(0.0));
+        if !(flip > 0.0) {
+            return (None, 0.0, 0.0);
+        }
+        let filled = open_size + flip;
+        let exit_price = self.slippage_model.apply(price, held, false, Some(bar.volume));
+        let fee_price = exit_price * self.multiplier();
+        let total =
+            self.quantize_money(match self.fee_model.breakdown(fee_price, filled, held, false) {
+                Some(b) => b.total(),
+                None => self.fee_model.calculate(fee_price, filled, held),
+            });
+        let close = self.quantize_money(total * (open_size / filled));
+        (Some(close), flip, total - close)
     }
 
     /// Take up to `cap` units off a position at a determined price.
@@ -1397,6 +1451,7 @@ impl EngineKernel {
     /// Fees are charged on the size that actually came off, and the account
     /// is credited per fill, so a position unwound over several bars pays
     /// exactly what those fills cost.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn reduce_at(
         &mut self,
         idx: usize,
@@ -1406,6 +1461,7 @@ impl EngineKernel {
         reason: ExitReason,
         cap: f64,
         at: Option<Timestamp>,
+        fee: Option<f64>,
     ) -> ReduceResult {
         let Some(managed) = self.ledger.get(position_id) else { return ReduceResult::None };
         let direction = managed.position.direction;
@@ -1427,10 +1483,13 @@ impl EngineKernel {
         // per-contract schedules charge per contract, not per notional unit.
         let fee_price = exit_price * self.multiplier();
         let exit_breakdown = self.fee_model.breakdown(fee_price, size, direction, false);
-        let fees = self.quantize_money(match exit_breakdown {
-            Some(b) => b.total(),
-            None => self.fee_model.calculate(fee_price, size, direction),
-        });
+        let fees = match fee {
+            Some(settled) => settled,
+            None => self.quantize_money(match exit_breakdown {
+                Some(b) => b.total(),
+                None => self.fee_model.calculate(fee_price, size, direction),
+            }),
+        };
 
         // Only this fill's exit components. The ledger accumulates them
         // across closing fills and combines the result with the entry side
@@ -1699,10 +1758,13 @@ impl EngineKernel {
         // Same per-contract price convention as the exit path: notional
         // scaling rides on the price, contract count stays raw.
         let entry_breakdown = self.fee_model.breakdown(contract_value, size, direction, true);
-        let entry_fees = self.quantize_money(match entry_breakdown {
-            Some(b) => b.total(),
-            None => self.fee_model.calculate(contract_value, size, direction),
-        });
+        let entry_fees = match terms.fee {
+            Some(settled) => settled,
+            None => self.quantize_money(match entry_breakdown {
+                Some(b) => b.total(),
+                None => self.fee_model.calculate(contract_value, size, direction),
+            }),
+        };
 
         // Capital-fraction sizing fits by construction; explicit unit counts
         // (order API) can exceed the account and are refused instead of

@@ -5,7 +5,7 @@
 //! `impl EngineKernel`, not a separate type.
 
 use crate::core::lots::snap_to_lot_grid;
-use crate::core::types::{Direction, ExitReason, Price};
+use crate::core::types::{Direction, ExitReason, Price, Timestamp};
 use crate::execution::algos::{AlgoError, ExecAlgorithm};
 use crate::execution::fill::{FillDepth, NextPrint};
 use crate::execution::orders::{
@@ -608,8 +608,13 @@ impl EngineKernel {
                     return;
                 }
             };
-            let terms =
-                FillTerms { cap, all_or_none: tif == TimeInForce::Fok, resuming, at: arrived_at };
+            let terms = FillTerms {
+                cap,
+                all_or_none: tif == TimeInForce::Fok,
+                resuming,
+                at: arrived_at,
+                fee: None,
+            };
             match self.open_at(
                 idx,
                 bar,
@@ -700,29 +705,46 @@ impl EngineKernel {
             };
             // A closing order reduces by the size it asks for. A venue
             // does not read the position to decide how much of it to sell:
-            // a SELL 1 against a long 11 sells one and leaves ten. An order
-            // asking for more than is held closes what is there and is done
-            // -- there is no remainder a reduction could ever take.
+            // a SELL 1 against a long 11 sells one and leaves ten.
+            //
+            // An order asking for *more* than is held does not stop at flat.
+            // A netting venue closes what it has and opens the remainder in
+            // the order's own direction -- which is how one rebalance order
+            // turns a long into a short, and the only way a long/short book
+            // ever reverses a name. Nautilus fills such an order once, at
+            // one price, and splits that fill in two afterwards; both halves
+            // are made here.
             //
             // `QtySpec::FullPosition` is how an order asks for the whole
-            // position (the Python API's default when no size is named),
-            // and a capital fraction names units of an entry, not of a
-            // reduction; both leave the close bounded only by the position
-            // and the bar's liquidity.
+            // position (the Python API's default when no size is named), and
+            // a capital fraction names units of an entry, not of a
+            // reduction; neither names a size, so neither can leave a
+            // remainder to flip into. A reduce-only order must never
+            // increase exposure, so it stops at flat by definition.
             let open_size = first.position.size;
-            let asked = match (leaves, qty) {
-                (Some(left), _) => left.min(open_size),
-                (None, QtySpec::Units(units)) => units.min(open_size),
+            let requested = match (leaves, qty) {
+                (Some(left), _) => left,
+                (None, QtySpec::Units(units)) => units,
                 (None, QtySpec::CapitalFrac(_) | QtySpec::FullPosition) => open_size,
             };
+            let asked = match !reduce_only && requested > open_size {
+                true => requested,
+                false => requested.min(open_size),
+            };
+            // The bar bounds the whole fill, not each leg: only what it can
+            // absorb of the one fill is there to split between them.
+            let taking = cap.min(asked);
+            let (close_fee, flip_size, flip_fee) =
+                self.split_flip_fee(bar, raw_price, direction, open_size, taking);
             match self.reduce_at(
                 idx,
                 bar,
                 position_id,
                 raw_price,
                 ExitReason::Order,
-                cap.min(asked),
+                taking,
                 arrived_at,
+                close_fee,
             ) {
                 ReduceResult::Closed { size, price, fees, gross_realized, event } => {
                     executed = Some(price);
@@ -734,7 +756,7 @@ impl EngineKernel {
                     events.push(EngineEvent::OrderFilled {
                         idx,
                         order_id: id,
-                        client_id,
+                        client_id: client_id.clone(),
                         price,
                         size,
                         commission: fees,
@@ -742,7 +764,24 @@ impl EngineKernel {
                         gross_realized,
                     });
                     events.push(event);
-                    self.after_fill(idx, id, events);
+                    if flip_size > 0.0 {
+                        self.flip_into(
+                            idx,
+                            bar,
+                            id,
+                            &client_id,
+                            order_direction,
+                            raw_price,
+                            flip_size,
+                            flip_fee,
+                            asked,
+                            (stop_attach, target_attach),
+                            arrived_at,
+                            events,
+                        );
+                    } else {
+                        self.after_fill(idx, id, events);
+                    }
                 }
                 ReduceResult::Reduced { size, price, fees, gross_realized } => {
                     executed = Some(price);
@@ -783,6 +822,102 @@ impl EngineKernel {
 
         if let Some(price) = executed {
             self.take_next_level(idx, bar, id, price, depth, on_arrival, events);
+        }
+    }
+
+    /// Open the remainder of a fill that closed the position it opposed.
+    ///
+    /// The venue already admitted this order and already matched this size:
+    /// the opening leg is the tail of a fill in progress, not a new order,
+    /// so it does not face the entry gates a second time -- the same
+    /// reasoning that lets a resumed partial fill add to the position it
+    /// started. Nautilus does not consult a venue here at all; it splits a
+    /// fill its exchange already made.
+    ///
+    /// It is priced off the same untouched match price the closing leg was,
+    /// not off the price that leg traded at. Both legs are one market action
+    /// -- a sell closing a long is the same sell opening a short -- so a
+    /// slippage model that reads the trade rather than the position puts
+    /// them at one price on its own, which is what Nautilus's single fill
+    /// means.
+    #[allow(clippy::too_many_arguments)]
+    fn flip_into(
+        &mut self,
+        idx: usize,
+        bar: &KernelBar,
+        id: u64,
+        client_id: &str,
+        direction: Direction,
+        price: Price,
+        size: f64,
+        fee: f64,
+        asked: f64,
+        protective: (Option<Price>, Option<Price>),
+        arrived_at: Option<Timestamp>,
+        events: &mut Vec<EngineEvent>,
+    ) {
+        let (stop_attach, target_attach) = protective;
+        let opened = self.open_at(
+            idx,
+            bar,
+            direction,
+            price,
+            None,
+            Some(size),
+            // The most recent bar's ATR, so the reversed position carries
+            // the same protective levels a fresh entry would.
+            self.last_atr,
+            stop_attach,
+            target_attach,
+            FillTerms {
+                cap: size,
+                all_or_none: false,
+                resuming: true,
+                at: arrived_at,
+                fee: Some(fee),
+            },
+        );
+        match opened {
+            Some(OpenResult {
+                event: EngineEvent::Entered { price, size, direction, .. },
+                fees,
+                ..
+            }) => {
+                let filled = self.orders.get_mut(id).map(|order| order.record_fill(size, asked));
+                if let Some(status) = filled {
+                    if let Some(order) = self.orders.get_mut(id) {
+                        let _ = order.transition(status);
+                    }
+                }
+                events.push(EngineEvent::OrderFilled {
+                    idx,
+                    order_id: id,
+                    client_id: client_id.to_string(),
+                    price,
+                    size,
+                    commission: fees,
+                    leaves: self.leaves_after_fill(id),
+                    // An opening fill realizes nothing; its cost is the
+                    // commission, which the fill reports on its own.
+                    gross_realized: 0.0,
+                });
+                events.push(EngineEvent::Entered { idx, price, size, direction });
+                self.after_fill(idx, id, events);
+            }
+            // A venue that cannot carry the reversal has still sold what it
+            // held: the close stands and the order is finished, because
+            // every unit it asked for either closed the position or was
+            // refused. The refusal is published as `open_at` framed it --
+            // the order itself cannot be marked rejected, having filled.
+            other => {
+                if let Some(OpenResult { event: rejection, .. }) = other {
+                    events.push(rejection);
+                }
+                if let Some(order) = self.orders.get_mut(id) {
+                    let _ = order.transition(OrderStatus::Filled);
+                }
+                self.after_fill(idx, id, events);
+            }
         }
     }
 
