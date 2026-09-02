@@ -377,9 +377,17 @@ a bounded `RAYON_NUM_THREADS` on a many-core machine.
   seconds against Nautilus's 1,440.2.
 - Replay compares two ledgers over one order flow; the production route is
   the other question, where the strategy sizes against Raptor's own account
-  and any divergence compounds into what it can next afford. Both
-  certifications run it end to end and agree to every decimal place the
-  balance carries.
+  and any divergence compounds into what it can next afford. Every
+  certification below runs it end to end and agrees to every decimal place
+  the balance carries.
+
+  The 81-case matrix runs on the production lane too, and passes 81 of 81
+  there: every case at a gap of 0.000000%, 11,312 of 11,312 round trips
+  matched, all 81 trading on both sides, and both engines deterministic in
+  all 81. It takes Raptor 943.0 seconds against Nautilus's 1,452.9 -- by
+  median case on each of the three routes, 18.1x where Raptor runs the
+  decisions natively, 1.9x on the hosted single-name lane, and 1.49x on the
+  hosted portfolio lane.
 
   A 42-case portfolio certification over nine IB US equities and seven
   months, every portfolio strategy at three parameter variants, ends on
@@ -388,10 +396,22 @@ a bounded `RAYON_NUM_THREADS` on a many-core machine.
   The six long/short cases are among them, and they are the ones that
   needed items 13, 15, 16 and 17: they began between 0.14% and 0.99% away.
 
-  A 39-case single-name certification over Binance ends the same way, 39 of
-  39 at 0.0000% with 4,986 of 4,986 round trips matched: 15 cases whose
-  decisions Raptor runs natively, at up to 21.6x, and 24 routed through the
-  hosted lane at 1.5x to 2.5x.
+  Two 39-case single-name certifications end the same way, one per venue:
+  Binance over a month, 39 of 39 at 0.0000% with 4,986 of 4,986 round trips
+  matched, and AAPL on IB over the same seven months as the portfolio run,
+  39 of 39 at 0.0000% with 6,235 of 6,235. Each splits the same way -- 15
+  cases whose decisions Raptor runs natively, up to 21.6x on Binance and
+  15.9x on IB, and 24 routed through the hosted lane from 1.3x.
+- `Order::transition` refuses a move the state machine does not allow and
+  asserts on it, so an illegal one is a panic under `debug_assertions` and a
+  silently dropped transition without them -- and every certification above
+  runs on a release build, where they compile away. So they are also
+  exercised with the assertions left in: the CI profile
+  (`cargo test --no-default-features`) keeps them, the fork's 434 Python
+  tests pass against a debug-built extension, and the six long/short
+  production cases -- the ones the flip and the walk were written for --
+  pass six of six on one, over the same market data, without an assertion
+  firing anywhere in the engine.
 - The algotrade-nautilus strict BTC callback case matched 230 of 230 canonical
   data, indicator, decision, order, fill, fee, position, equity, and metric
   events over 2026-01-01 through 2026-02-01, twice per engine.
