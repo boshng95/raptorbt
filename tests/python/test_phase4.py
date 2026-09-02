@@ -214,6 +214,64 @@ class TestFlags:
         # The trim is not a round trip: the position is still open at the end.
         assert len(result.trades()) == 1
 
+    def test_a_closing_order_larger_than_the_position_reverses_it(self):
+        # A netting venue does not stop at flat. A fifteen-lot sell against
+        # ten held sells the ten it has and goes short the other five, which
+        # is the only way a long ever becomes a short in one order. The venue
+        # matched it once, so both legs trade at the one price.
+        class S(EventLog):
+            def __init__(self, config=None):
+                super().__init__(config)
+                self.held = []
+
+            def on_bar(self, ctx):
+                if ctx.idx == 0:
+                    self.submit_order(orders.Market(side="buy", units=10.0))
+                elif ctx.idx == 2:
+                    self.submit_order(orders.Market(side="sell", units=15.0))
+                self.held.append(
+                    (ctx.position.size, ctx.position.direction)
+                    if ctx.position
+                    else None
+                )
+
+        data = _bars([100.0, 101.0, 102.0, 103.0, 104.0])
+        strategy = S()
+        result = run_strategy_backtest(strategy, **data, config=_zero_fee_config())
+
+        assert strategy.held[-1] == (pytest.approx(5.0), -1)
+        # One order, two fills: the leg that closed and the leg that opened.
+        assert strategy.kinds().count("order_filled") == 3
+        closed, opened = result.trades()
+        assert (closed.direction, closed.size) == (1, pytest.approx(10.0))
+        assert (opened.direction, opened.size) == (-1, pytest.approx(5.0))
+        assert closed.exit_price == pytest.approx(opened.entry_price)
+
+    def test_a_reduce_only_order_larger_than_the_position_stops_at_flat(self):
+        # Reduce-only means exactly that: the same oversized sell closes the
+        # ten and does not open the five it could not reduce.
+        class S(EventLog):
+            def __init__(self, config=None):
+                super().__init__(config)
+                self.held = []
+
+            def on_bar(self, ctx):
+                if ctx.idx == 0:
+                    self.submit_order(orders.Market(side="buy", units=10.0))
+                elif ctx.idx == 2:
+                    self.submit_order(
+                        orders.Market(side="sell", units=15.0, reduce_only=True)
+                    )
+                self.held.append(ctx.position.size if ctx.position else 0.0)
+
+        data = _bars([100.0, 101.0, 102.0, 103.0, 104.0])
+        strategy = S()
+        result = run_strategy_backtest(strategy, **data, config=_zero_fee_config())
+
+        assert strategy.held[-1] == 0.0
+        assert strategy.kinds().count("order_filled") == 2
+        assert len(result.trades()) == 1
+
 
 class TestBrackets:
     def _bracket_strategy(self):
