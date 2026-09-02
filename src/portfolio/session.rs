@@ -713,9 +713,15 @@ impl EventSession {
     ///
     /// A venue walks every book it keeps each time it drains a batch of
     /// commands, so an order resting on one instrument meets the book again
-    /// whenever the strategy acts on another. The driver calls this for the
-    /// instruments that are not the one whose bar is in hand -- that one's
-    /// own batch is already settled by the step that consumed its bar.
+    /// whenever the strategy acts on another. The driver calls this for
+    /// every instrument it lists, once per batch it routes -- including the
+    /// one whose bar is in hand. That instrument's step settled the batch
+    /// standing when its bar arrived, but an order the strategy places in
+    /// answer to that bar's own fills reaches the venue afterwards and has
+    /// met no book at all; leaving it out would hold it to the next bar's
+    /// range while every other name's equivalent order crossed at once.
+    /// Re-walking an order that already had its chance costs nothing: one
+    /// that could cross the standing book would have crossed it then.
     ///
     /// The account is shared exactly as it is on the step path: the kernel
     /// is lent the portfolio's capital, walked, then drained back. Nothing
