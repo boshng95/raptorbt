@@ -1,6 +1,6 @@
 # Nautilus parity branch
 
-This branch is based on upstream `v0.11.0` and carries fourteen narrowly
+This branch is based on upstream `v0.11.0` and carries seventeen narrowly
 scoped compatibility corrections used by algotrade-nautilus backtest
 experiments, plus four fixes to pre-existing upstream bugs (see the end of
 this section).
@@ -225,6 +225,90 @@ where a stated one is simply a more accurate reading of the same arithmetic.
     a position at hundreds of times the balance. Explicit unit sizes are
     unaffected.
 
+15. The account settles each amount it books, not their sum. Item 11 made a
+    position's realized PnL a sum of whole-unit bookings; the cash balance
+    was still adding the raw product and rounding only the running total, so
+    the kernel kept two accountants who could disagree. Every term reaching
+    an account is already money -- the proceeds of the units sold, a fill's
+    realized gross, the commission on it -- and Nautilus books each as a
+    `Money`, quantized before it is added.
+
+    The difference needs a price that is not a round unit, and a netting
+    position supplies one. Thirty shares bought as 25 at 70.04 and five at
+    70.05 average to 70.041666..., so taking 27 of them back at 69.98
+    realizes exactly minus one and sixty-six and a half cents. Rounding the
+    sum carries that half cent on into the balance; rounding the amount
+    settles it there and then. A nine-instrument long/short run over seven
+    months ended two cents from Nautilus on nothing else at all: the same
+    299 orders, the same fills, the same notional and the same commissions
+    to the cent, and every closed position reporting the same realized PnL
+    on both engines. `InstrumentConfig.currency_precision` gates it as it
+    gates item 11 -- with no declared unit there is nothing to settle in,
+    and the balance is the same additions in the same order, bit for bit.
+
+16. A closing order larger than the position reverses it. A netting venue
+    does not stop at flat: it closes what it holds and opens the remainder
+    in the order's own direction, which is how one rebalance order turns a
+    long into a short and the only way a long/short book ever reverses a
+    name. Nautilus fills such an order once, at one price, and its execution
+    engine splits that fill afterwards into a leg that closes and a leg that
+    opens; both legs are now made here, and the round trip the close ends is
+    reported before the position the remainder opens.
+
+    The opening leg is the tail of a fill in progress, not a new order, so
+    it does not face the entry gates a second time -- the same reasoning
+    that lets a resumed partial fill add to the position it started -- and
+    it is priced off the same untouched match price the closing leg was.
+    One market action trades at one price: a sell closing a long is the same
+    sell opening a short. The commission the venue billed once is prorated
+    between the legs by size rather than charged to each, because a schedule
+    with a per-order floor or a notional cap is not linear in size and two
+    floors is not what the venue took.
+
+    Three things do not reverse. A reduce-only order must never increase
+    exposure, so it stops at flat by definition. An order that names no size
+    (`QtySpec::FullPosition`) or names a capital fraction has no remainder to
+    flip into -- neither states a size at all. And the bar bounds the whole
+    fill rather than each leg, so a bar too thin to absorb more than the
+    position closes it and leaves the rest working, as any partial fill
+    does. A venue that cannot carry the reversal for want of capital has
+    still sold what it held: the close stands, the refusal is published, and
+    the order is finished.
+
+17. `PortfolioSession.walk_book(instrument, ts_now)` settles one
+    instrument's resting orders against the market it last saw, without
+    consuming a bar.
+
+    A venue does not settle only the instrument whose bar just printed.
+    Every time it drains a batch of commands it walks all of the books it
+    keeps, so an order resting on one name meets the book again whenever the
+    strategy acts on another. A driver that steps only the instrument in
+    hand gives a large resting order one bite where the reference engine
+    gives it one per name trading that instant, and the two then disagree
+    about how much of it filled -- and, through the cash that buys, about
+    every order placed after it. The driver calls this for every instrument
+    once per batch it routes, and again while the fills it reports keep
+    producing commands. The instrument whose bar is in hand is included: its
+    step settled the batch standing before that bar, but an order the
+    strategy places in answer to the bar's own fills reaches the venue
+    afterwards and has met no book at all. Leaving it out held such an order
+    to the next bar's range while every other name's equivalent order
+    crossed at once -- a difference in when the strategy happened to be
+    told, not in what the market did. Re-walking an order that already had
+    its chance costs nothing: one that could cross the standing book would
+    have crossed it then.
+
+    A walk is the resting-order phase of a step and nothing else. No bar
+    arrived, so nothing is replayed onto the tape, no extreme moves, no exit
+    or entry is evaluated, nothing expires, no margin mark is taken and no
+    equity is sampled -- the reference engine adds no data point for a
+    settlement either. Each walk offers the same standing size once more,
+    because nothing traded in between to deplete it, and only a plain limit
+    can take it: a stop is armed by a print and there is none here, and a
+    market order was swept when it arrived. A fill it produces happened at
+    `ts_now`, not when the bar that left the book printed. An instrument
+    that has not seen a bar yet has no book, and yields nothing.
+
 ## Upstream fixes
 
 A closing order reduced by the whole position and ignored its own quantity,
@@ -270,14 +354,16 @@ a bounded `RAYON_NUM_THREADS` on a many-core machine.
 
 ## Evidence
 
-- All 585 Rust library tests pass, at any thread count.
-- All 432 of the fork's own Python tests pass, the bit-exact golden gate
+- All 597 Rust library tests pass, at any thread count, and 634 with the
+  integration suites.
+- All 434 of the fork's own Python tests pass, the bit-exact golden gate
   included. Its baselines were regenerated once, for the fee arithmetic of
   item 6; see the changelog for what moved and by how much.
 - The algotrade-nautilus 81-case strategy matrix (27 strategies, three
   parameter variants each) passes 81 of 81, with no divergent case, no
-  erroring case, and no case whose strategy never ordered: 25,033 Nautilus
-  orders compared in total. All 15 strict independent cases pass a full
+  erroring case, and no case whose strategy never ordered: 23,126 Nautilus
+  orders compared in total, and not one dropped, snapped to another bar, or
+  refused as unsupported. All 15 strict independent cases pass a full
   independent ledger; all 24 single-name oracle cases pass, 17 replaying
   Nautilus's decisions as entry/exit signals and seven replaying a single
   name's typed order flow; all 42 portfolio cases pass on portfolio order
@@ -287,7 +373,25 @@ a bounded `RAYON_NUM_THREADS` on a many-core machine.
   ones the signal lane cannot express -- a reduce-only order against a
   position it has already closed whole, or an order type the lane will not
   place -- which route to typed order replay instead. That fallback is what
-  exposed the two lot-grid bugs fixed above.
+  exposed the two lot-grid bugs fixed above. The matrix takes Raptor 104.6
+  seconds against Nautilus's 1,440.2.
+- Replay compares two ledgers over one order flow; the production route is
+  the other question, where the strategy sizes against Raptor's own account
+  and any divergence compounds into what it can next afford. Both
+  certifications run it end to end and agree to every decimal place the
+  balance carries.
+
+  A 42-case portfolio certification over nine IB US equities and seven
+  months, every portfolio strategy at three parameter variants, ends on
+  Nautilus's final balance in all 42 -- a gap of 0.0000% in each -- with
+  6,326 of 6,326 round trips matched, at 1.42x to 1.62x Nautilus's speed.
+  The six long/short cases are among them, and they are the ones that
+  needed items 13, 15, 16 and 17: they began between 0.14% and 0.99% away.
+
+  A 39-case single-name certification over Binance ends the same way, 39 of
+  39 at 0.0000% with 4,986 of 4,986 round trips matched: 15 cases whose
+  decisions Raptor runs natively, at up to 21.6x, and 24 routed through the
+  hosted lane at 1.5x to 2.5x.
 - The algotrade-nautilus strict BTC callback case matched 230 of 230 canonical
   data, indicator, decision, order, fill, fee, position, equity, and metric
   events over 2026-01-01 through 2026-02-01, twice per engine.

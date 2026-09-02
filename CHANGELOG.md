@@ -52,6 +52,17 @@ at the open the market actually traded, exactly like the equity runners.**
   move the engine's numbers without moving the market they were measured on,
   and re-running `make_data` moves both.
 
+- **`PortfolioSession.walk_book(instrument, ts_now)`** — settles one
+  instrument's resting orders against the market it last saw, without
+  consuming a bar. A venue walks every book it keeps each time it drains a
+  batch of commands, so an order resting on one name meets the book again
+  whenever the strategy acts on another; a driver that steps only the
+  instrument whose bar is in hand under-fills everything resting elsewhere.
+  This is the resting-order phase of a step and nothing else -- no bar
+  arrives, so nothing is replayed onto the tape, no exit or entry is
+  evaluated, nothing expires, and no equity point is sampled. A fill it
+  produces is dated to `ts_now`.
+
 ### Changed
 
 - **Golden baselines regenerated for the Nautilus-parity fee arithmetic.**
@@ -61,6 +72,18 @@ at the open the market actually traded, exactly like the equity runners.**
   curve and metrics moved with them -- at most 1.4e-14 relative, on a Sharpe
   ratio. No trade count, fill price, size or exit reason changed in any
   fixture, and the frozen inputs are byte-identical.
+
+- **A bar now costs what it does, not what the run has already done.**
+  `OrderEngine.orders` is the record of a run -- every order ever submitted,
+  kept forever -- and five call sites walked all of it to find the handful
+  still working, while every bar rebuilt a parent-status map of the whole
+  ledger. The cost of a bar was proportional to the run's history rather
+  than its activity, making a run quadratic in its own length and landing
+  hardest on long sweeps. An order's id is now its index in the ledger (ids
+  come from a counter and nothing is removed or reordered), and a `working`
+  list holds the ids that may still be live, pruned lazily on each match
+  pass. Stepping a 46k-bar session that placed ~3.2k orders: 3.050s ->
+  0.141s, with no behavioural change.
 
 ### Fixed
 
@@ -113,6 +136,36 @@ at the open the market actually traded, exactly like the equity runners.**
   in the book. The remainder is now read off the same grid the order's
   quantities sit on, both where a resumed order sizes itself and where a fill
   reports its leaves.
+
+- **An account settles each amount it books, not their sum.** A position's
+  realized PnL was already a sum of whole-unit bookings, but the cash
+  balance still added the raw product and rounded only the running total, so
+  the two accountants could disagree. Every term reaching an account is
+  already money -- the proceeds of the units sold, a fill's realized gross,
+  the commission on it -- and each is now quantized as it is booked. The
+  difference needs an average entry that is not a round unit, which a
+  position built by two fills at two prices supplies: thirty shares bought
+  as 25 at 70.04 and five at 70.05 average to 70.041666..., so taking 27 of
+  them back at 69.98 realizes exactly minus one and sixty-six and a half
+  cents, and rounding the sum carries that half cent on into the balance. A
+  nine-instrument long/short run over seven months ended two cents from the
+  reference engine on nothing else at all. Without an instrument declaring
+  a currency precision there is no unit to settle in, and the balance is the
+  same additions in the same order, bit for bit.
+
+- **A closing order larger than the position reverses it.** A netting venue
+  does not stop at flat: it closes what it holds and opens the remainder in
+  the order's own direction, which is how one rebalance order turns a long
+  into a short and the only way a long/short book reverses a name. The
+  engine stopped at flat and dropped the remainder, so such a book could
+  only ever be flattened. The fill is now split into a leg that closes and a
+  leg that opens, both at the same match price -- one market action trades at
+  one price -- with the commission the venue billed once prorated between
+  them by size rather than charged to each, since a schedule with a
+  per-order floor is not linear in size. A reduce-only order still stops at
+  flat, an order naming no size or a capital fraction has no remainder to
+  flip into, and a bar too thin to absorb more than the position closes it
+  and leaves the rest working.
 
 ## [0.11.0] - 2026-08-31
 
