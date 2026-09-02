@@ -281,7 +281,11 @@ impl Order {
     pub fn leaves_qty(&self) -> Option<f64> {
         self.resolved_qty.map(|total| {
             let leaves = total - self.filled_qty;
-            if leaves <= Self::residual_tolerance(total) { 0.0 } else { leaves }
+            if leaves <= Self::residual_tolerance(total) {
+                0.0
+            } else {
+                leaves
+            }
         })
     }
 

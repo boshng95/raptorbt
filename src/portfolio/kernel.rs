@@ -560,11 +560,8 @@ impl EngineKernel {
     /// fill model so the matcher -- which sees no instrument -- can size a
     /// print without asking the kernel.
     fn refresh_size_quantum(&mut self) {
-        let increment = self
-            .spec
-            .as_ref()
-            .map(|spec| spec.size_increment)
-            .filter(|increment| *increment > 0.0);
+        let increment =
+            self.spec.as_ref().map(|spec| spec.size_increment).filter(|increment| *increment > 0.0);
         self.fill_model.size_quantum =
             increment.or(self.lot_size).filter(|q| *q > 0.0).unwrap_or(0.0);
         self.ledger.set_size_grid(self.fill_model.size_quantum);
@@ -1166,7 +1163,9 @@ impl EngineKernel {
                 None => continue,
             };
             let price = self.fill_price_for(bar, direction, false);
-            if let Some(event) = self.close_at(idx, bar, position_id, price, ExitReason::Signal, None) {
+            if let Some(event) =
+                self.close_at(idx, bar, position_id, price, ExitReason::Signal, None)
+            {
                 events.push(event);
             }
         }
@@ -1300,8 +1299,10 @@ impl EngineKernel {
             // of it and sweeps whatever is left one increment worse. Unless
             // it is canceled the moment its first fill lands, which is
             // exactly what immediate-or-cancel means.
-            let immediate =
-                matches!(self.orders.get(id).map(|o| o.tif), Some(TimeInForce::Ioc | TimeInForce::Fok));
+            let immediate = matches!(
+                self.orders.get(id).map(|o| o.tif),
+                Some(TimeInForce::Ioc | TimeInForce::Fok)
+            );
             // Submitted while this bar was observed, so the only thing
             // still ahead of it is the book the bar left showing -- which
             // is the closing print's size, or, on a bar that never left the
@@ -1323,10 +1324,7 @@ impl EngineKernel {
                     // A market order sent before this bar reached the venue
                     // crossed the book standing when it arrived; one sent
                     // from this bar crossed the book the bar left showing.
-                    on_arrival: self
-                        .orders
-                        .get(id)
-                        .is_some_and(|order| order.arrives_before_bar),
+                    on_arrival: self.orders.get(id).is_some_and(|order| order.arrives_before_bar),
                 },
                 &mut events,
             );
@@ -1544,12 +1542,7 @@ impl EngineKernel {
             ReduceOutcome::None => ReduceResult::None,
             ReduceOutcome::Reduced { size, gross_pnl, .. } => {
                 self.credit_exit_fill(position_id, size, open_size, gross_pnl, fees, exit_price);
-                ReduceResult::Reduced {
-                    size,
-                    price: exit_price,
-                    fees,
-                    gross_realized: gross_pnl,
-                }
+                ReduceResult::Reduced { size, price: exit_price, fees, gross_realized: gross_pnl }
             }
             ReduceOutcome::Closed { size, trade, gross_pnl } => {
                 self.credit_exit_fill(position_id, size, open_size, gross_pnl, fees, exit_price);

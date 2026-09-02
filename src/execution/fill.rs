@@ -233,7 +233,11 @@ impl FillDepth {
     /// How much the next fill may take. Zero once the bar is spent.
     #[inline]
     pub fn cap(&self) -> f64 {
-        if self.prints == 0 { 0.0 } else { self.sizes[0] }
+        if self.prints == 0 {
+            0.0
+        } else {
+            self.sizes[0]
+        }
     }
 
     /// What follows the print [`cap`] describes, if anything.
@@ -812,7 +816,12 @@ mod tests {
 
     /// One bar's worth of tape, replayed onto a fresh (empty) book.
     fn replayed(prints: [Price; PRINTS_PER_BAR], volume: f64, quantum: f64) -> Tape {
-        BarTape::default().replay(&priced(prints, volume), BarLiquidity::NAUTILUS, quantum, StepKind::Bar)
+        BarTape::default().replay(
+            &priced(prints, volume),
+            BarLiquidity::NAUTILUS,
+            quantum,
+            StepKind::Bar,
+        )
     }
 
     fn priced(prints: [Price; PRINTS_PER_BAR], volume: f64) -> OhlcvBar {
@@ -943,11 +952,13 @@ mod tests {
         // size it was showing -- which is how a quiet bar fills an order
         // against liquidity that traded long before it.
         let mut tape = BarTape::default();
-        let opening = tape.replay(&priced([10.0; 4], 4_000.0), BarLiquidity::NAUTILUS, 0.01, StepKind::Bar);
+        let opening =
+            tape.replay(&priced([10.0; 4], 4_000.0), BarLiquidity::NAUTILUS, 0.01, StepKind::Bar);
         assert_eq!(schedule(opening.offered(10.0, true, false)), (vec![1_000.0], Tail::Rests));
         assert_eq!(tape.book(), Some((10.0, 1_000.0)));
 
-        let quiet = tape.replay(&priced([10.0; 4], 8.0), BarLiquidity::NAUTILUS, 0.01, StepKind::Bar);
+        let quiet =
+            tape.replay(&priced([10.0; 4], 8.0), BarLiquidity::NAUTILUS, 0.01, StepKind::Bar);
         assert_eq!(quiet.prints(), &[]);
         assert_eq!(quiet.offered(10.0, true, false), FillDepth::NONE);
         // The order arriving on the quiet bar still meets the old book.
@@ -1006,7 +1017,8 @@ mod tests {
         // when that is exactly where the tape already sits.
         let mut tape = BarTape::default();
         tape.replay(&priced([10.0; 4], 4_000.0), BarLiquidity::NAUTILUS, 0.01, StepKind::Bar);
-        let tick = tape.replay(&priced([10.0; 4], 8.0), BarLiquidity::NAUTILUS, 0.01, StepKind::Print);
+        let tick =
+            tape.replay(&priced([10.0; 4], 8.0), BarLiquidity::NAUTILUS, 0.01, StepKind::Print);
         assert_eq!(tick.prints(), &[(10.0, 2.0)]);
         assert_eq!(tape.book(), Some((10.0, 2.0)));
     }
@@ -1041,14 +1053,16 @@ mod tests {
         let nautilus = BarLiquidity::NAUTILUS;
         let last = nautilus.last_share(0.3847, 0.00001);
         let mut tape = BarTape::default();
-        tape.replay(&priced([87_900.0, 88_100.0, 87_800.0, 88_000.0], 0.3847), nautilus, 0.00001, StepKind::Bar);
+        tape.replay(
+            &priced([87_900.0, 88_100.0, 87_800.0, 88_000.0], 0.3847),
+            nautilus,
+            0.00001,
+            StepKind::Bar,
+        );
 
         // Priced at the book, the order joins the queue there: it takes
         // what the book shows, twice, and never crosses.
-        assert_eq!(
-            schedule(tape.offered(88_000.0, true, false)),
-            (vec![last, last], Tail::Rests)
-        );
+        assert_eq!(schedule(tape.offered(88_000.0, true, false)), (vec![last, last], Tail::Rests));
 
         // A limit through that close crosses: it empties the book beneath
         // it and sweeps one increment worse for the rest.

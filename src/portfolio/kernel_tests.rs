@@ -748,11 +748,8 @@ fn each_fill_reports_the_fees_it_paid_and_what_it_left_outstanding() {
     // A partial fill is only describable if the event says how much of the
     // order survived it and what that slice alone cost. Re-deriving either
     // from the position afterwards cannot separate the two fills.
-    let config = BacktestConfig {
-        bar_volume_slices: 4.0,
-        fees: 0.001,
-        ..BacktestConfig::default()
-    };
+    let config =
+        BacktestConfig { bar_volume_slices: 4.0, fees: 0.001, ..BacktestConfig::default() };
     let fee_model = config.fee_model();
     let mut kernel = EngineKernel::new(
         config,
@@ -2690,7 +2687,9 @@ fn each_closing_fill_reports_only_the_pnl_it_realized() {
     assert!((first_gross - 40.0).abs() < 1e-9, "first {first_gross}");
     assert!((second_gross - 60.0).abs() < 1e-9, "second {second_gross}");
 
-    let EngineEvent::Exited { trade, .. } = event else { panic!("expected an exit, got {event:?}") };
+    let EngineEvent::Exited { trade, .. } = event else {
+        panic!("expected an exit, got {event:?}")
+    };
     // Netting each fill against its own fee accounts for the whole round
     // trip and nothing more.
     let fills = (first_gross - first_fees) + (second_gross - second_fees);

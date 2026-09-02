@@ -944,11 +944,7 @@ impl EngineKernel {
         on_arrival: bool,
         events: &mut Vec<EngineEvent>,
     ) {
-        let outstanding = self
-            .orders
-            .get(id)
-            .filter(|order| !order.status.is_terminal())
-            .is_some()
+        let outstanding = self.orders.get(id).filter(|order| !order.status.is_terminal()).is_some()
             && self.leaves_on_grid(id).is_some_and(|leaves| leaves > 0.0);
         if !outstanding {
             return;
@@ -978,12 +974,7 @@ impl EngineKernel {
         self.apply_match_outcome(
             idx,
             bar,
-            MatchOutcome::Fill {
-                order_id: id,
-                price: next_price,
-                depth: next_depth,
-                on_arrival,
-            },
+            MatchOutcome::Fill { order_id: id, price: next_price, depth: next_depth, on_arrival },
             events,
         );
     }

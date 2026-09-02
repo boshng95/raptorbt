@@ -584,8 +584,9 @@ mod tests {
     #[test]
     fn a_position_unwound_in_pieces_reports_one_round_trip() {
         let mut ledger = PositionLedger::new("T".into(), PositionPolicy::Net);
-        let id =
-            ledger.open_position(0, 0, 100.0, 10.0, Direction::Long, None, None, 2.0, None).unwrap();
+        let id = ledger
+            .open_position(0, 0, 100.0, 10.0, Direction::Long, None, None, 2.0, None)
+            .unwrap();
 
         // Three units off at 110, the rest at 120. No trade until flat --
         // one position is one trade, however many fills it took.
@@ -680,9 +681,8 @@ mod tests {
         // The weighted mean must not touch a price that had nothing to be
         // averaged against: `price * size / size` is not always `price`.
         let mut ledger = PositionLedger::new("T".into(), PositionPolicy::Net);
-        let id = ledger
-            .open_position(0, 0, 0.1, 3.0, Direction::Long, None, None, 0.0, None)
-            .unwrap();
+        let id =
+            ledger.open_position(0, 0, 0.1, 3.0, Direction::Long, None, None, 0.0, None).unwrap();
         let trade = ledger.close_position(id, exit(1, 92_104.5)).unwrap();
         assert_eq!(trade.exit_price, 92_104.5);
         assert_eq!(trade.size, 3.0);

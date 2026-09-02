@@ -397,12 +397,8 @@ impl OrderEngine {
         // The book as it stood before this step, for an order that reached
         // the venue ahead of the bar it was submitted on.
         let prior_book = self.tape;
-        let tape = self.tape.replay(
-            bar,
-            fill_model.bar_liquidity,
-            fill_model.size_quantum,
-            step_kind,
-        );
+        let tape =
+            self.tape.replay(bar, fill_model.bar_liquidity, fill_model.size_quantum, step_kind);
         let book = self.tape;
 
         // Drop the orders that finished on an earlier step. This is the
@@ -564,7 +560,9 @@ impl OrderEngine {
                         let _ = order.transition(OrderStatus::Rejected);
                         Some(MatchOutcome::Reject { order_id: oid, reason: "post_only" })
                     } else {
-                        fill_model.get_limit_fill_price(price, bar, direction, is_entry).and_then(fill)
+                        fill_model
+                            .get_limit_fill_price(price, bar, direction, is_entry)
+                            .and_then(fill)
                     }
                 }
                 OrderKind::StopMarket { trigger } => {
@@ -573,13 +571,13 @@ impl OrderEngine {
                 // If-touched orders trigger on the *favorable* side — the
                 // limit-style touch — then fill like a market at the touch
                 // price (conservative: no better-than-trigger assumption).
-                OrderKind::MarketIfTouched { trigger } => {
-                    fill_model.get_limit_fill_price(trigger, bar, direction, is_entry).and_then(fill)
-                }
+                OrderKind::MarketIfTouched { trigger } => fill_model
+                    .get_limit_fill_price(trigger, bar, direction, is_entry)
+                    .and_then(fill),
                 OrderKind::StopLimit { trigger, price } => match order.triggered {
-                    true => {
-                        fill_model.get_limit_fill_price(price, bar, direction, is_entry).and_then(fill)
-                    }
+                    true => fill_model
+                        .get_limit_fill_price(price, bar, direction, is_entry)
+                        .and_then(fill),
                     false => {
                         if fill_model.would_trigger_stop(trigger, bar, direction, is_entry) {
                             let _ = order.transition(OrderStatus::Triggered);
@@ -590,9 +588,9 @@ impl OrderEngine {
                     }
                 },
                 OrderKind::LimitIfTouched { trigger, price } => match order.triggered {
-                    true => {
-                        fill_model.get_limit_fill_price(price, bar, direction, is_entry).and_then(fill)
-                    }
+                    true => fill_model
+                        .get_limit_fill_price(price, bar, direction, is_entry)
+                        .and_then(fill),
                     false => {
                         if fill_model.would_fill_limit(trigger, bar, direction, is_entry) {
                             let _ = order.transition(OrderStatus::Triggered);
@@ -622,7 +620,9 @@ impl OrderEngine {
                 OrderKind::TrailingStopLimit { offset, limit_offset } => match order.triggered {
                     true => {
                         let price = order.trail_limit.unwrap_or(bar.close);
-                        fill_model.get_limit_fill_price(price, bar, direction, is_entry).and_then(fill)
+                        fill_model
+                            .get_limit_fill_price(price, bar, direction, is_entry)
+                            .and_then(fill)
                     }
                     false => {
                         let favorable = match order.side {
@@ -937,11 +937,8 @@ mod tests {
     /// bar, which prints through its limit and fills it there.
     #[test]
     fn arriving_before_the_first_bar_meets_no_book_and_rests_into_it() {
-        let (mut engine, id) = engine_with(
-            OrderKind::Limit { price: 101.0 },
-            OrderSide::Buy,
-            TimeInForce::Gtc,
-        );
+        let (mut engine, id) =
+            engine_with(OrderKind::Limit { price: 101.0 }, OrderSide::Buy, TimeInForce::Gtc);
         engine.get_mut(id).unwrap().arrives_before_bar = true;
         let fm = FillModel::default();
 
@@ -957,11 +954,8 @@ mod tests {
     /// at its own limit, like any resting order the market comes to.
     #[test]
     fn order_arriving_before_its_bar_rests_into_the_bar_it_beat() {
-        let (mut engine, id) = engine_with(
-            OrderKind::Limit { price: 99.0 },
-            OrderSide::Buy,
-            TimeInForce::Gtc,
-        );
+        let (mut engine, id) =
+            engine_with(OrderKind::Limit { price: 99.0 }, OrderSide::Buy, TimeInForce::Gtc);
         engine.get_mut(id).unwrap().arrives_before_bar = true;
         let fm = FillModel::default();
 
@@ -981,11 +975,8 @@ mod tests {
     /// that sent it, and reading them would be look-ahead.
     #[test]
     fn order_submitted_from_its_bar_never_meets_that_bar_range() {
-        let (mut engine, id) = engine_with(
-            OrderKind::Limit { price: 99.0 },
-            OrderSide::Buy,
-            TimeInForce::Gtc,
-        );
+        let (mut engine, id) =
+            engine_with(OrderKind::Limit { price: 99.0 }, OrderSide::Buy, TimeInForce::Gtc);
         let fm = FillModel::default();
 
         engine.orders[0].submitted_idx = 1;
@@ -1002,11 +993,8 @@ mod tests {
     /// arrived at and killed -- it does not rest into the bar's prints.
     #[test]
     fn an_immediate_order_arriving_before_its_bar_does_not_rest_into_it() {
-        let (mut engine, id) = engine_with(
-            OrderKind::Limit { price: 99.0 },
-            OrderSide::Buy,
-            TimeInForce::Ioc,
-        );
+        let (mut engine, id) =
+            engine_with(OrderKind::Limit { price: 99.0 }, OrderSide::Buy, TimeInForce::Ioc);
         engine.get_mut(id).unwrap().arrives_before_bar = true;
         let fm = FillModel::default();
 
@@ -1168,10 +1156,7 @@ mod tests {
         let outcomes = engine.match_bar(1, &bar(60, 100.0, 100.5, 98.0, 99.5), &fm);
         assert_eq!(
             outcomes,
-            vec![
-                MatchOutcome::Expire { order_id: expire_id },
-                filled(fill_id, 99.0),
-            ]
+            vec![MatchOutcome::Expire { order_id: expire_id }, filled(fill_id, 99.0),]
         );
     }
 
