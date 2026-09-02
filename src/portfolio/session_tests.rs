@@ -183,6 +183,91 @@ fn max_positions_gates_the_order_path() {
     assert!(!session.kernel(1).is_in_position());
 }
 
+/// Two instruments under Nautilus's bar-liquidity model, where an order
+/// larger than one print takes the book a bite at a time.
+fn session_bounded_liquidity() -> EventSession {
+    let config = BacktestConfig { fees: 0.0, bar_volume_slices: 4.0, ..BacktestConfig::default() };
+    let mut session = EventSession::new(config);
+    let a = session.add_instrument("AAA".into(), Direction::Long, None, None, PositionPolicy::Net);
+    let b = session.add_instrument("BBB".into(), Direction::Long, None, None, PositionPolicy::Net);
+    session.set_bars(a, bars(0, &[100.0, 100.0, 100.0]));
+    session.set_bars(b, bars(5, &[50.0, 50.0, 50.0]));
+    session.seal();
+    session
+}
+
+fn filled_size(events: &[EngineEvent]) -> f64 {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            EngineEvent::OrderFilled { size, .. } => Some(*size),
+            _ => None,
+        })
+        .sum()
+}
+
+#[test]
+fn a_walk_settles_one_instrument_without_consuming_its_schedule() {
+    // A venue walks every book it keeps whenever it drains a batch of
+    // commands, so an order resting on one instrument meets the standing
+    // book again while another instrument's bar is in hand. Nothing about
+    // the schedule moves for it: no bar is consumed and no equity point is
+    // added, because no market event happened -- only the order flow
+    // settled.
+    use crate::execution::orders::{OrderKind, OrderSide, QtySpec, TimeInForce};
+
+    let mut session = session_bounded_liquidity();
+    // AAA's first bar leaves a book of 1000/4 showing at its close.
+    session.apply_current(StepInput::default());
+    session.kernel_mut(0).submit_order(
+        OrderSide::Buy,
+        QtySpec::Units(1_000.0),
+        OrderKind::Limit { price: 100.0 },
+        TimeInForce::Gtc,
+        1,
+        10,
+        "oversized".to_string(),
+        None,
+        None,
+    );
+
+    let remaining = session.remaining();
+    let equity_points = session.equity_curve.len();
+    let cash = session.cash();
+
+    let events = session.walk_book(0, 12);
+    assert_eq!(filled_size(&events), 250.0, "one bite of the book, not the order");
+    assert_eq!(session.remaining(), remaining, "no schedule entry was consumed");
+    assert_eq!(session.equity_curve.len(), equity_points, "no market event, no equity point");
+    assert!((cash - session.cash() - 25_000.0).abs() < 1e-6, "the shared pool paid for it");
+
+    // And again: the book does not deplete, so the next batch is worth
+    // another bite of exactly the same size.
+    assert_eq!(filled_size(&session.walk_book(0, 13)), 250.0);
+}
+
+#[test]
+fn a_walk_of_an_instrument_that_has_seen_no_bar_does_nothing() {
+    // There is no book for its orders to meet, and nothing to date a fill
+    // by. The order stays where it is.
+    use crate::execution::orders::{OrderKind, OrderSide, QtySpec, TimeInForce};
+
+    let mut session = session_bounded_liquidity();
+    session.kernel_mut(1).submit_order(
+        OrderSide::Buy,
+        QtySpec::Units(1.0),
+        OrderKind::Limit { price: 50.0 },
+        TimeInForce::Gtc,
+        0,
+        0,
+        "early".to_string(),
+        None,
+        None,
+    );
+    assert!(session.walk_book(1, 1).is_empty());
+    assert!(!session.kernel(1).is_in_position());
+}
+
 #[test]
 fn unset_max_positions_is_unconstrained() {
     let mut session = session_two_instruments_gated(None, None);

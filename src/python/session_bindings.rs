@@ -456,6 +456,22 @@ impl PyPortfolioSession {
         Ok(self.session_mut()?.apply_current(input).into_iter().map(PyEngineEvent::from).collect())
     }
 
+    /// Settle one instrument's resting orders at `ts_now`, off-schedule.
+    ///
+    /// A venue walks every book it keeps each time it drains a batch of
+    /// commands, so a driver that steps only the instrument whose bar is in
+    /// hand under-fills orders resting elsewhere. Call this for the other
+    /// instruments after routing a batch, and again while the fills it
+    /// reports keep producing commands.
+    fn walk_book(&mut self, instrument: usize, ts_now: i64) -> PyResult<Vec<PyEngineEvent>> {
+        Ok(self
+            .session_mut()?
+            .walk_book(instrument, ts_now)
+            .into_iter()
+            .map(PyEngineEvent::from)
+            .collect())
+    }
+
     /// Submit a typed order routed to one instrument's kernel.
     #[pyo3(signature = (
         instrument, side, kind, submitted_idx, submitted_ts, client_id,

@@ -927,6 +927,35 @@ impl EngineKernel {
         std::mem::take(&mut self.pending_events)
     }
 
+    /// Settle the venue once more against the market this instrument last
+    /// saw, without consuming a bar.
+    ///
+    /// A venue does not settle only the instrument whose bar just printed:
+    /// every time it drains a batch of commands it walks all of its books,
+    /// so an order resting on one name meets the book again whenever the
+    /// strategy acts on another. A driver that stepped only the instrument
+    /// in hand gives a large resting order one bite where the reference
+    /// engine gives it one per name trading that instant, and the two then
+    /// disagree about how much of it filled -- and, through the cash that
+    /// buys, about every order placed after it.
+    ///
+    /// This is the resting-order phase of [`EngineKernel::step_inner`] and
+    /// nothing else. Extremes, exits, entries, margin marks and equity
+    /// sampling all stay with the step that owns them: no bar arrived here.
+    /// `bar` is the last one this instrument stepped, dated to the instant
+    /// the walk happens, since that is when any fill it produces occurred.
+    pub fn walk_book(&mut self, idx: usize, bar: &KernelBar) -> Vec<EngineEvent> {
+        self.stepping_trade = false;
+        // Acknowledgments queued since the last step lead the list, exactly
+        // as they do on the step path: the venue accepts an order when it
+        // drains it, which is this pass.
+        let mut events = std::mem::take(&mut self.pending_events);
+        for outcome in self.orders.walk_book() {
+            self.apply_match_outcome(idx, bar, outcome, &mut events);
+        }
+        events
+    }
+
     /// Set the underlying price used to settle options at expiry.
     ///
     /// An option's own bars carry the option's price, so intrinsic value

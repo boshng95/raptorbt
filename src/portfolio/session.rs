@@ -708,6 +708,67 @@ impl EventSession {
         events
     }
 
+    /// Settle one instrument's resting orders against the market it last
+    /// saw, at `ts_now`, without consuming a schedule entry.
+    ///
+    /// A venue walks every book it keeps each time it drains a batch of
+    /// commands, so an order resting on one instrument meets the book again
+    /// whenever the strategy acts on another. The driver calls this for the
+    /// instruments that are not the one whose bar is in hand -- that one's
+    /// own batch is already settled by the step that consumed its bar.
+    ///
+    /// The account is shared exactly as it is on the step path: the kernel
+    /// is lent the portfolio's capital, walked, then drained back. Nothing
+    /// samples equity and the cursor does not move, because no market event
+    /// happened here -- the reference engine adds no data point for a
+    /// settlement either.
+    ///
+    /// An instrument that has not seen a bar yet has no book for its orders
+    /// to meet, and yields nothing.
+    pub fn walk_book(&mut self, instrument: usize, ts_now: i64) -> Vec<EngineEvent> {
+        let Some((idx, last)) = self.last_seen.get(instrument).copied().flatten() else {
+            return Vec::new();
+        };
+        // The same market, dated now: a fill this walk produces happened at
+        // this instant, not when the bar that left the book printed.
+        let bar = KernelBar { timestamp: ts_now, ..last };
+
+        let portfolio_open = self
+            .config
+            .max_positions
+            .map(|_| self.kernels.iter().map(|k| k.open_count()).sum::<usize>());
+
+        let kernel = &mut self.kernels[instrument];
+        let locked_before = kernel.locked_margin();
+        let injected = match self.account.mode() {
+            AccountMode::Cash => self.account.balance(),
+            AccountMode::Margin { .. } => {
+                self.account.balance() - (self.account.locked() - locked_before)
+            }
+        };
+        kernel.set_cash(injected);
+        kernel.set_external_open_count(portfolio_open);
+        let events = kernel.walk_book(idx, &bar);
+        let delta_cash = kernel.cash() - injected;
+        let delta_locked = kernel.locked_margin() - locked_before;
+        kernel.set_cash(0.0);
+        kernel.set_external_open_count(None);
+        self.account.reconcile(delta_cash, delta_locked);
+
+        if events.iter().any(|e| matches!(e, EngineEvent::MarginCall { .. })) {
+            self.halt_all(self.cursor, HaltCause::MarginCall);
+        }
+
+        for event in &events {
+            if let EngineEvent::Exited { trade, .. } = event {
+                self.streaming.update(trade.return_pct / 100.0);
+                self.trades.push(trade.clone());
+            }
+        }
+
+        events
+    }
+
     /// Latch a portfolio-wide halt on the shared account.
     ///
     /// The cause decides what else is needed. A margin call must trip every

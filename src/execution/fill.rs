@@ -532,13 +532,9 @@ impl BarTape {
     /// An immediate-or-cancel order never sees that second walk: it is
     /// killed the moment its first fill lands.
     pub fn offered(&self, price: Price, buying: bool, immediate: bool) -> FillDepth {
-        let Some((book_price, size)) = self.book else {
+        let Some((book_price, size)) = self.standing_for(price, buying) else {
             return FillDepth::NONE;
         };
-        let marketable = if buying { book_price <= price } else { book_price >= price };
-        if !marketable {
-            return FillDepth::NONE;
-        }
         if !size.is_finite() {
             return FillDepth::UNLIMITED;
         }
@@ -547,6 +543,38 @@ impl BarTape {
             (false, true) => FillDepth::repeated(size, 2, Tail::Rests),
             (false, false) => FillDepth::single(size, Tail::Sweep),
         }
+    }
+
+    /// What one further walk of this book offers an order already resting.
+    ///
+    /// [`BarTape::offered`] answers for an order *arriving*: it meets the
+    /// book and the venue settles once behind it, which is the two bites at
+    /// its own price. But a venue settles for every batch of commands it
+    /// drains, not only the batch that carried this order -- an order placed
+    /// on any instrument it lists is enough -- and it walks every book it
+    /// keeps on each of them. Those extra walks are what this answers: one
+    /// bite of the same standing size apiece, because nothing traded in
+    /// between.
+    ///
+    /// Immediacy does not enter. A single bite is all an immediate-or-cancel
+    /// order could take anyway, and one that took nothing was killed on
+    /// arrival rather than left resting for this.
+    pub fn offered_once(&self, price: Price, buying: bool) -> FillDepth {
+        let Some((book_price, size)) = self.standing_for(price, buying) else {
+            return FillDepth::NONE;
+        };
+        if !size.is_finite() {
+            return FillDepth::UNLIMITED;
+        }
+        FillDepth::single(size, if book_price == price { Tail::Rests } else { Tail::Sweep })
+    }
+
+    /// The book as it stands to an order priced at `price`, or `None` when
+    /// what is showing is not marketable against it.
+    fn standing_for(&self, price: Price, buying: bool) -> Option<Print> {
+        let (book_price, size) = self.book?;
+        let marketable = if buying { book_price <= price } else { book_price >= price };
+        marketable.then_some((book_price, size))
     }
 }
 
@@ -951,6 +979,25 @@ mod tests {
         // Priced through the book, it crosses instead, and the crossing
         // fills the whole remainder at once.
         assert_eq!(schedule(tape.offered(10.01, true, false)), (vec![1_000.0], Tail::Sweep));
+    }
+
+    #[test]
+    fn every_further_walk_of_the_book_is_worth_one_more_bite() {
+        // The two bites above are the order's own arrival: the venue settles
+        // it against the book and walks the book once more behind it. A
+        // venue that lists several instruments settles again for every batch
+        // of commands it drains, whichever name they were for, and each of
+        // those walks offers the same standing size once more -- nothing
+        // traded in between to change it.
+        let mut tape = BarTape::default();
+        tape.replay(&priced([10.0; 4], 4_000.0), BarLiquidity::NAUTILUS, 0.01, StepKind::Bar);
+
+        assert_eq!(schedule(tape.offered_once(10.0, true)), (vec![1_000.0], Tail::Rests));
+        // Priced through the book it crosses on a walk too, and the
+        // remainder pays one increment worse.
+        assert_eq!(schedule(tape.offered_once(10.01, true)), (vec![1_000.0], Tail::Sweep));
+        // A book on the wrong side of the order is not a fill at all.
+        assert_eq!(tape.offered_once(9.99, true), FillDepth::NONE);
     }
 
     #[test]

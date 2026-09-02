@@ -296,6 +296,83 @@ impl OrderEngine {
         self.match_events(idx, tick, fill_model, MatchMode::Trade)
     }
 
+    /// Walk the standing book once for every order resting on it.
+    ///
+    /// This is the venue settling, not a bar arriving: nothing is replayed
+    /// onto the tape, no bar phase is read and nothing expires -- the market
+    /// has not moved, only the order flow has. A venue walks every book it
+    /// keeps each time it drains a batch of commands, so an order resting
+    /// here meets the same book again whenever the strategy acts on *any*
+    /// instrument the venue lists. [`BarTape::offered`] already carries the
+    /// walk that belongs to the order's own batch; this is for the batches
+    /// that arrive with somebody else's bar, which is why a portfolio needs
+    /// it and a single instrument does not.
+    ///
+    /// Only a plain limit crosses a standing book: a stop is armed by a
+    /// print and there is none here, and a market order was swept when it
+    /// arrived. That is the division the arrival path makes too.
+    ///
+    /// The caller dates the walk by the bar it hands the kernel, so the
+    /// outcomes are never `on_arrival`: the fill happens now, not when the
+    /// order was sent.
+    pub fn walk_book(&mut self) -> Vec<MatchOutcome> {
+        let book = self.tape;
+        let Some((at, _)) = book.book() else { return Vec::new() };
+
+        // Same lazy prune as the bar pass: the live index is a superset
+        // between passes, and this is the other place it is narrowed.
+        let ledger = &self.orders;
+        self.working.retain(|&id| !ledger[id as usize].status.is_terminal());
+
+        let parent_state = self.parent_states();
+        let mut actions = Vec::new();
+        for slot in 0..self.working.len() {
+            let order = &self.orders[self.working[slot] as usize];
+            // A child whose parent has not filled is not at the venue yet.
+            // One whose parent died is dead with it, but the bar pass owns
+            // that transition; this pass only declines to match it.
+            if let Some(parent_id) = order.parent_id {
+                if parent_state.get(&parent_id).copied() != Some(OrderStatus::Filled) {
+                    continue;
+                }
+            }
+            let OrderKind::Limit { price } = order.kind else { continue };
+            let depth = book.offered_once(price, order.side == OrderSide::Buy);
+            if depth.is_empty() {
+                continue;
+            }
+            actions.push(MatchOutcome::Fill {
+                order_id: order.id,
+                // It crosses the book, so it pays the book's price rather
+                // than its own limit -- as it would have on arrival.
+                price: at,
+                depth,
+                on_arrival: false,
+            });
+        }
+        actions
+    }
+
+    /// Statuses of the parents referenced by working orders.
+    ///
+    /// Snapshotted before a matching pass, and load-bearing rather than
+    /// merely borrow-clean: a parent precedes its child in submission
+    /// order, so reading the status live would let a child see a parent
+    /// that very pass had just killed, one bar earlier than it should.
+    /// Only the parents actually referenced are read -- this was a map of
+    /// every order ever submitted, rebuilt on every bar.
+    fn parent_states(&self) -> std::collections::HashMap<u64, OrderStatus> {
+        self.working
+            .iter()
+            .filter_map(|&id| self.orders[id as usize].parent_id)
+            .collect::<std::collections::BTreeSet<u64>>()
+            .into_iter()
+            .filter_map(|parent_id| {
+                self.orders.get(parent_id as usize).map(|parent| (parent_id, parent.status))
+            })
+            .collect()
+    }
+
     fn match_events(
         &mut self,
         idx: usize,
@@ -334,23 +411,7 @@ impl OrderEngine {
         let ledger = &self.orders;
         self.working.retain(|&id| !ledger[id as usize].status.is_terminal());
 
-        // Parent states for one-triggers-other gating, snapshotted before
-        // the loop. The snapshot is load-bearing, not just borrow-clean: a
-        // parent precedes its child in submission order, so reading the
-        // status live would let a child see a parent this very pass had
-        // just killed, one bar earlier than it should. Only the parents
-        // actually referenced are read -- this was a map of every order
-        // ever submitted, rebuilt on every bar.
-        let parent_state: std::collections::HashMap<u64, OrderStatus> = self
-            .working
-            .iter()
-            .filter_map(|&id| self.orders[id as usize].parent_id)
-            .collect::<std::collections::BTreeSet<u64>>()
-            .into_iter()
-            .filter_map(|parent_id| {
-                self.orders.get(parent_id as usize).map(|parent| (parent_id, parent.status))
-            })
-            .collect();
+        let parent_state = self.parent_states();
 
         let same_bar_close = self.same_bar_marketable_limit_on_close;
         for slot in 0..self.working.len() {
@@ -648,6 +709,7 @@ mod tests {
     }
 
     use super::*;
+    use crate::execution::fill::{BarLiquidity, Tail};
     use crate::execution::orders::QtySpec;
 
     fn bar(ts: i64, open: f64, high: f64, low: f64, close: f64) -> OhlcvBar {
@@ -723,6 +785,50 @@ mod tests {
         assert_eq!(engine.working, vec![survivor], "only the resting order is still indexed");
         assert_eq!(engine.working().count(), 1);
         assert_eq!(engine.all().len(), 11, "and the ledger is untouched by pruning");
+    }
+
+    /// A bar all of whose prices are the same: it establishes a book of
+    /// `volume / 4` at that price and prints nothing after the first one.
+    fn quiet(ts: i64, price: f64, volume: f64) -> OhlcvBar {
+        OhlcvBar { timestamp: ts, open: price, high: price, low: price, close: price, volume }
+    }
+
+    #[test]
+    fn a_walk_of_the_book_offers_a_resting_order_one_more_bite() {
+        // The venue settles when it drains commands, not only when a bar
+        // arrives, so an order resting here meets the standing book again
+        // for every batch -- including batches placed on other instruments.
+        // Nothing trades in between and the book does not deplete, so every
+        // walk is worth exactly the same size.
+        let fm = FillModel::default().with_bar_liquidity(BarLiquidity::NAUTILUS);
+        let (mut engine, id) =
+            engine_with(OrderKind::Limit { price: 10.0 }, OrderSide::Buy, TimeInForce::Gtc);
+        engine.match_bar(1, &quiet(1, 10.0, 4_000.0), &fm);
+
+        let bite = MatchOutcome::Fill {
+            order_id: id,
+            price: 10.0,
+            depth: FillDepth::single(1_000.0, Tail::Rests),
+            on_arrival: false,
+        };
+        assert_eq!(engine.walk_book(), vec![bite.clone()]);
+        assert_eq!(engine.walk_book(), vec![bite], "the book does not deplete");
+    }
+
+    #[test]
+    fn a_walk_of_the_book_reaches_only_what_a_standing_book_can_reach() {
+        // Away from the book there is nothing to cross, and a stop is armed
+        // by a print -- a walk puts up none. Both keep resting.
+        let fm = FillModel::default().with_bar_liquidity(BarLiquidity::NAUTILUS);
+        let (mut engine, _) =
+            engine_with(OrderKind::Limit { price: 9.0 }, OrderSide::Buy, TimeInForce::Gtc);
+        engine.match_bar(1, &quiet(1, 10.0, 4_000.0), &fm);
+        assert_eq!(engine.walk_book(), vec![]);
+
+        let (mut engine, _) =
+            engine_with(OrderKind::StopMarket { trigger: 10.0 }, OrderSide::Buy, TimeInForce::Gtc);
+        engine.match_bar(1, &quiet(1, 10.0, 4_000.0), &fm);
+        assert_eq!(engine.walk_book(), vec![]);
     }
 
     #[test]
