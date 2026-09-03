@@ -287,9 +287,22 @@ the engine:
   rejects entries outside the activation/expiration window.
 
 Without a spec, behavior is unchanged — existing results reproduce
-bit-for-bit. `margin_init`/`margin_maint`/`maker_fee`/`taker_fee` are
-carried on the spec for the account layer that consumes them in a later
-0.5.x release.
+bit-for-bit. `margin_init`/`margin_maint` feed the margin account layer
+(see *Margin accounts* below); `maker_fee`/`taker_fee` are carried for fee
+models that distinguish liquidity roles.
+
+Since 0.12.0 an option spec can also model the deposit an exchange blocks
+against a **sold** option: `InstrumentSpec.option(..., span_pct=0.0975,
+exposure_pct=0.02)` reserves `(span_pct + exposure_pct) × strike ×
+multiplier` per contract instead of the premium, so a book too small to
+carry the deposit books no trade and reports `InsufficientMargin`. Both
+default to `0.0` (premium-funded, as before); bought options always stay
+funded at their premium. Since 0.12.1, sold legs that share an `underlying`
+and expiry are re-priced as one position group once they are open together
+— a straddle pays its scenario deposit once, a vertical or condor pays
+exposure plus its width — so a hedged book keeps the capital a real account
+would. A new sold leg still sizes on its naked deposit; the group benefit
+lands after the leg is on.
 
 ### Choosing a side
 
@@ -700,7 +713,8 @@ a committed golden-fixture suite enforces this):
   `self.close_position(position_id)`. The default `"netting"` keeps the
   one-position-at-a-time behavior.
 - **Margin accounts** — `account_type="margin", leverage=N`: entries lock
-  initial margin (the instrument's `margin_init`, else `1/leverage`)
+  initial margin (a sold option's `span_pct`/`exposure_pct` deposit when
+  modelled, else the instrument's `margin_init`, else `1/leverage`)
   instead of full notional, equity marks balance plus direction-aware
   unrealized PnL (shorts price correctly), and an equity breach of the
   maintenance requirement (`margin_maint`, else half initial) fires

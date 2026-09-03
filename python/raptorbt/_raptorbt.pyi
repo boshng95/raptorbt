@@ -604,6 +604,8 @@ class InstrumentSpec:
     multiplier: float
     margin_init: float
     margin_maint: float
+    span_pct: float
+    exposure_pct: float
     maker_fee: float
     taker_fee: float
     activation_ns: int | None
@@ -666,6 +668,8 @@ class InstrumentSpec:
         margin_maint: float = ...,
         maker_fee: float = ...,
         taker_fee: float = ...,
+        span_pct: float = ...,
+        exposure_pct: float = ...,
     ) -> InstrumentSpec: ...
     @staticmethod
     def currency_pair(

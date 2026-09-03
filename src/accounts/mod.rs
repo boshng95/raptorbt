@@ -58,6 +58,25 @@ impl MarginBook {
         *self.locked.entry(position_id).or_insert(0.0) += amount;
     }
 
+    /// Margin locked for one open position; 0.0 for an unknown id.
+    pub fn locked_for(&self, position_id: u64) -> f64 {
+        self.locked.get(&position_id).copied().unwrap_or(0.0)
+    }
+
+    /// Overwrite one open position's locked margin, returning the change.
+    /// A no-op (0.0) for an id the book does not hold, so a regrouping pass
+    /// can never invent a lock for a position that has already closed.
+    pub fn set_locked(&mut self, position_id: u64, amount: f64) -> f64 {
+        match self.locked.get_mut(&position_id) {
+            Some(current) => {
+                let delta = amount - *current;
+                *current = amount;
+                delta
+            }
+            None => 0.0,
+        }
+    }
+
     /// Release a closed position's margin, returning the amount.
     pub fn release(&mut self, position_id: u64) -> f64 {
         self.locked.remove(&position_id).unwrap_or(0.0)

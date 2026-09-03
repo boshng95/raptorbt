@@ -25,10 +25,22 @@ use crate::execution::orders::{MatchOutcome, OrderEngine, OrderKind, OrderStatus
 use crate::execution::orders::{OrderSide, QtySpec};
 use crate::execution::queue::QueueTracker;
 use crate::execution::{BarLiquidity, FeeModel, FillModel, FillPrice, SlippageModel};
-use crate::instruments::InstrumentSpec;
+use crate::instruments::{InstrumentKind, InstrumentSpec};
 use crate::portfolio::ledger::{PositionLedger, PositionPolicy, ReduceOutcome};
+use crate::portfolio::option_groups::OptionLeg;
 use crate::portfolio::position::ExitDetails;
 use crate::portfolio::risk::{RejectReason, RiskGate};
+
+/// How an entry is funded under the margin account.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum EntryFunding {
+    /// The account's rate on notional — `contract_value × size × rate`,
+    /// evaluated in that order so existing runs reproduce bit-for-bit.
+    /// `modelled` marks a rate the instrument spec set (`margin_init`).
+    Rate { rate: f64, modelled: bool },
+    /// A sold option's SPAN-style deposit per contract, from the spec.
+    Deposit { per_contract: f64 },
+}
 
 /// A single bar handed to the kernel.
 ///
@@ -526,6 +538,41 @@ impl EngineKernel {
         Some(init * 0.5)
     }
 
+    /// How an entry in `direction` is funded under the margin account, or
+    /// `None` in cash mode.
+    ///
+    /// `Rate(rate, modelled)` keeps the account's arithmetic exactly as it
+    /// was — `contract_value × size × rate`, evaluated in that order, so
+    /// every existing margin run reproduces bit-for-bit. `modelled` says
+    /// an instrument-level `margin_init` set the rate (a future), the
+    /// distinction between "the lot was unaffordable" and "the lot was
+    /// affordable but its margin was not" when sizing lands on zero.
+    ///
+    /// `Deposit(per_contract)` is a SOLD option under the spec's
+    /// `span_pct`/`exposure_pct` model: `(span_pct + exposure_pct) × strike
+    /// × multiplier` per contract, with the premium it collects left in the
+    /// balance rather than the requirement. A BOUGHT option can lose only
+    /// its premium and keeps the rate path (at leverage 1.0, the premium).
+    fn entry_funding(&self, direction: Direction) -> Option<EntryFunding> {
+        let rate = self.margin_rate()?;
+        let Some(spec) = &self.spec else {
+            return Some(EntryFunding::Rate { rate, modelled: false });
+        };
+        if direction == Direction::Short {
+            if let Some(deposit) = spec.short_option_margin_per_contract() {
+                return Some(EntryFunding::Deposit { per_contract: deposit });
+            }
+        }
+        Some(EntryFunding::Rate { rate, modelled: spec.margin_init > 0.0 })
+    }
+
+    /// Whether a SHORT option position in this kernel is margined by the
+    /// spec's SPAN-style model rather than by the account's leverage rate.
+    fn short_option_margin_modelled(&self) -> bool {
+        self.margin_rate().is_some()
+            && self.spec.as_ref().is_some_and(|s| s.short_option_margin_per_contract().is_some())
+    }
+
     /// Symbol this kernel simulates.
     pub fn symbol(&self) -> &str {
         // The ledger owns the symbol string; expose it for policy swaps and
@@ -872,10 +919,76 @@ impl EngineKernel {
     /// which a single blended rate would get wrong.
     #[inline]
     pub fn maintenance_requirement(&self, close: Price) -> f64 {
-        match self.maint_rate() {
-            Some(rate) => self.ledger.notional_total(close) * rate,
-            None => 0.0,
+        let rate = self.maint_rate();
+        let modelled_shorts = self.short_option_margin_modelled();
+        if rate.is_none() && !modelled_shorts {
+            return 0.0;
         }
+        let multiplier = self.multiplier();
+        self.ledger
+            .positions()
+            .iter()
+            .map(|managed| {
+                // A sold option's SPAN-style deposit stays blocked for the
+                // life of the position; the broker maintains the deposit,
+                // not a fraction of the premium's notional.
+                if modelled_shorts && managed.position.direction == Direction::Short {
+                    return self.margin.locked_for(managed.id);
+                }
+                match rate {
+                    Some(rate) => close * managed.position.size * multiplier * rate,
+                    None => 0.0,
+                }
+            })
+            .sum()
+    }
+
+    /// This kernel's open option positions as position-group legs, when the
+    /// instrument is an option whose sold side is deposit-modelled. Empty
+    /// otherwise, so a share or a plain future never joins a group.
+    pub fn open_option_legs(&self, kernel_index: usize) -> Vec<OptionLeg> {
+        let Some(spec) = &self.spec else { return Vec::new() };
+        let InstrumentKind::Option { strike, right, .. } = &spec.kind else {
+            return Vec::new();
+        };
+        if spec.short_option_margin_per_contract().is_none() {
+            return Vec::new();
+        }
+        self.ledger
+            .positions()
+            .iter()
+            .map(|managed| OptionLeg {
+                position_id: managed.id,
+                kernel: kernel_index,
+                strike: *strike,
+                right: *right,
+                direction: managed.position.direction,
+                size: managed.position.size,
+                entry_price: managed.position.entry_price,
+                multiplier: self.multiplier(),
+                span_pct: spec.span_pct,
+                exposure_pct: spec.exposure_pct,
+            })
+            .collect()
+    }
+
+    /// The key that says which legs hedge each other: the underlying (or
+    /// the symbol itself when none is declared) and the expiry.
+    pub fn option_group_key(&self) -> Option<(String, Option<Timestamp>)> {
+        let spec = self.spec.as_ref()?;
+        let InstrumentKind::Option { underlying, .. } = &spec.kind else { return None };
+        Some((underlying.clone().unwrap_or_else(|| spec.symbol.clone()), spec.expiration_ns))
+    }
+
+    /// Total open size across this kernel's positions (0.0 when flat).
+    pub fn open_size(&self) -> f64 {
+        self.ledger.positions().iter().map(|p| p.position.size).sum()
+    }
+
+    /// Rewrite one open position's locked margin (the group share the
+    /// session computed), returning the change for the shared account.
+    pub fn set_locked_margin(&mut self, position_id: u64, amount: f64) -> f64 {
+        self.margin.set_locked(position_id, amount)
     }
 
     /// Trip this kernel's margin-call kill-switch, blocking further entries.
@@ -1708,21 +1821,28 @@ impl EngineKernel {
         // Cash mode: size = capital / (price * multiplier * (1 + fee_rate))
         // so notional value + entry fee fits. Margin mode: only the initial
         // margin plus the fee must fit.
-        let margin_rate = self.margin_rate();
         let contract_value = adjusted_price * self.multiplier();
         let fee_rate = self.config.fees;
-        let sizing_denominator = match margin_rate {
+        let funding = self.entry_funding(direction);
+        let sizing_denominator = match funding {
             None => contract_value * (1.0 + fee_rate),
-            Some(rate) => contract_value * (rate + fee_rate),
+            Some(EntryFunding::Rate { rate, .. }) => contract_value * (rate + fee_rate),
+            Some(EntryFunding::Deposit { per_contract }) => {
+                per_contract + contract_value * fee_rate
+            }
         };
         // A fraction of capital answers "how many units can this account
         // afford", which an account that requires no capital to hold the
-        // position (an unfunded margin venue, `margin_init = 0`) cannot
+        // position (a zero margin rate, or a zero per-contract deposit) cannot
         // answer: it affords any size. Dividing anyway would size the
         // position by the fee rate alone -- and by infinity where there is
         // no fee either. An explicit size is unaffected: it says what to
         // trade without asking the account.
-        let funds_nothing = margin_rate.is_some_and(|rate| !(rate > 0.0));
+        let funds_nothing = match funding {
+            None => false,
+            Some(EntryFunding::Rate { rate, .. }) => !(rate > 0.0),
+            Some(EntryFunding::Deposit { per_contract }) => !(per_contract > 0.0),
+        };
         if explicit_units.is_none() && (funds_nothing || !(sizing_denominator > 0.0)) {
             return Some(OpenResult {
                 event: EngineEvent::EntryRejected { idx, reason: RejectReason::UnfundedSizing },
@@ -1770,9 +1890,18 @@ impl EngineKernel {
             // produced zero units, e.g. a size fraction too small for the
             // instrument's lot size. Deliberately does not touch the risk
             // gate's rejection counter: that metric describes constraint
-            // refusals, not sizing arithmetic.
+            // refusals, not sizing arithmetic. When an instrument-level
+            // margin model set the requirement, say so: the lot's notional
+            // may well have fit, and "loosen the entry" is the wrong advice.
+            let reason = match funding {
+                Some(EntryFunding::Deposit { .. })
+                | Some(EntryFunding::Rate { modelled: true, .. }) => {
+                    RejectReason::InsufficientMargin
+                }
+                _ => RejectReason::ZeroSize,
+            };
             return Some(OpenResult {
-                event: EngineEvent::EntryRejected { idx, reason: RejectReason::ZeroSize },
+                event: EngineEvent::EntryRejected { idx, reason },
                 requested,
                 fees: 0.0,
             });
@@ -1792,9 +1921,10 @@ impl EngineKernel {
         // Capital-fraction sizing fits by construction; explicit unit counts
         // (order API) can exceed the account and are refused instead of
         // silently driving cash negative.
-        let funding_cost = match margin_rate {
+        let funding_cost = match funding {
             None => contract_value * size,
-            Some(rate) => contract_value * size * rate,
+            Some(EntryFunding::Rate { rate, .. }) => contract_value * size * rate,
+            Some(EntryFunding::Deposit { per_contract }) => per_contract * size,
         };
         if explicit_units.is_some() && funding_cost + entry_fees > available {
             return Some(OpenResult {
@@ -1850,10 +1980,15 @@ impl EngineKernel {
                 entry_breakdown,
             )?,
         };
-        match margin_rate {
-            None => self.book_cash(&[-(contract_value * size), -entry_fees]),
-            Some(rate) => {
-                self.margin.lock(position_id, contract_value * size * rate);
+        // `funding_cost` above already priced this entry under whichever
+        // funding mode applies, in the evaluation order each mode requires.
+        // Booking is the same act either way -- cash mode pays the notional
+        // out of the balance, a margin mode blocks it -- so it reads the one
+        // figure rather than re-deriving it per mode and risking drift.
+        match funding {
+            None => self.book_cash(&[-funding_cost, -entry_fees]),
+            Some(_) => {
+                self.margin.lock(position_id, funding_cost);
                 self.book_cash(&[-entry_fees]);
             }
         }

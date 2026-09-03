@@ -29,6 +29,11 @@ pub enum RejectReason {
     /// venue, `margin_init = 0`). There is no denominator to divide by, so
     /// the fraction names no size.
     UnfundedSizing,
+    /// Capital-fraction sizing produced zero units because the instrument's
+    /// margin requirement (a short option's SPAN-style deposit, a future's
+    /// initial margin) exceeds the available capital — the lot itself was
+    /// affordable on notional, the margin was not.
+    InsufficientMargin,
     /// The margin-call kill-switch has tripped; no further entries.
     MarginCall,
 }
@@ -45,6 +50,7 @@ impl RejectReason {
             RejectReason::Inactive => "inactive",
             RejectReason::InsufficientCapital => "insufficient_capital",
             RejectReason::UnfundedSizing => "unfunded_sizing",
+            RejectReason::InsufficientMargin => "insufficient_margin",
             RejectReason::MarginCall => "margin_call",
         }
     }
