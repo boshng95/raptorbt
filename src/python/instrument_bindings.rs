@@ -165,7 +165,8 @@ impl PyInstrumentSpec {
         })
     }
 
-    /// A vanilla or binary option contract.    ///
+    /// A vanilla or binary option contract.
+    ///
     /// `span_pct` and `exposure_pct` model the deposit an exchange blocks
     /// against a SOLD option, each as a fraction of the underlying notional
     /// at the strike. Both default to `0.0`, which leaves a short option

@@ -39,6 +39,79 @@ the wrong instant made the wrong decision.**
 - `run_tick_strategy` (the batch replay) still drops such rows in the Rust
   merge, so it cannot fire on them. The stream's docstring and the README say
   so; feed the batch runner rows that carry a price.
+## [Unreleased]
+
+Where the 0.12.1 option-margin work met the Nautilus-parity work on this
+branch.
+
+### Fixed
+
+- **A fill produced by a book walk re-prices the option groups.**
+  `PortfolioSession::walk_book` lends the kernel the pool's capital,
+  matches, and reconciles the result back exactly as the step path does, so
+  a leg it opens or closes changes what the groups hold. It now regroups on
+  the same terms. Before this, buying a wing off the standing book left the
+  sold leg it covers locked at its full naked deposit.
+- **A sold option's entry fee is quantized as it is booked.** The deposit
+  path subtracted it from cash directly, outside the settlement rule every
+  other term on this branch goes through, so a currency with a declared
+  precision carried a sub-cent residue on the entry.
+
+### Changed
+
+- **The unfunded-sizing guard asks the funding mode, not the leverage
+  rate.** A per-contract deposit cannot answer "what rate funds this",
+  which is what the guard used to ask. It now asks each mode in its own
+  terms: a zero rate funds nothing, and so would a zero deposit. No
+  reachable deposit is zero today -- one is built only from a positive
+  rate, strike and multiplier -- so nothing changes in behaviour; the guard
+  simply keeps answering the question the entry path now poses.
+- **The entry booking site reads the funding cost computed above it**
+  rather than re-deriving it once per funding mode, so the two cannot
+  drift. The arithmetic is unchanged, term for term and in the same order.
+
+### Merged
+
+- **Upstream 0.13.0/0.13.1 (tick-path realism) merged into this branch.**
+  Taken as-is: everything that auto-merged -- print size, L1 sizes and open
+  interest on the tick path, the queue-fill model, the cross-instrument
+  market-order fix, and `order_latency_ns` (default 0, so no existing run
+  moves).
+
+  Upstream's *partial-fill engine* was deliberately not taken. This branch
+  already had one, developed independently, and ours is a superset
+  everywhere the two meet:
+  - `Order::triggered` is kept as a fact separate from
+    `OrderStatus::Triggered`, so a partly filled stop-limit cannot arm
+    twice. Upstream matches `Triggered | PartiallyFilled` only because it
+    has no such field.
+  - `resolved_qty` pins a capital-fraction order's size at its first fill,
+    so it cannot grow or shrink between slices. Upstream has no equivalent.
+  - Reversal is kept: an exit larger than the position closes what is held
+    and opens the remainder the other way, which is how a long/short book
+    flips a name, and what Nautilus does (one fill, split in two).
+    Upstream caps the exit at the held size and never reverses.
+  - Per-fill currency settlement is kept, and one `Trade` is reported per
+    round trip however many fills it took -- again what Nautilus reports.
+    Upstream books a `Trade` per closing slice and drops per-fill
+    settlement.
+  - The legal-transition table already listed both pairs upstream adds.
+
+- **`BacktestConfig.partial_fills` is gone**, with the tick-path partial
+  fills it switched on and their tests. It cannot be honoured here: it
+  assumes a marketable order *rests* as `PartiallyFilled` when a print is
+  too small, whereas this branch's book model sweeps such an order and
+  fills the remainder one increment worse. The two models disagree about
+  what a market order does, so the flag could only ever have been wired to
+  something it does not mean. `bar_volume_slices` remains the way to bound
+  a fill by traded volume, and reproduces Nautilus at `slices = 4`.
+
+  Deferred, each to land on its own with its own tests: print-bounded
+  resting fills on the tick path (the honest version of the above), true
+  fill-or-kill (a print too small for the whole order fills none of it --
+  `Fok` still behaves as `Ioc` here), and `shift_protective` (moving a
+  derived stop or target by the change in average entry). All three change
+  outcomes and none belongs inside a merge.
 
 ## [0.13.3] - 2026-09-10
 
@@ -348,7 +421,6 @@ below — none of them alters a result.
   the largest thing any event variant holds, and an unboxed one made every
   event in every queue pay its width. Rust callers that match on the variant
   and pass the trade by value need `*trade`; field access is unchanged.
-
 ## [0.13.1] - 2026-09-04
 
 **In plain words: 0.13.0 could report a typed order's fill twice when a
