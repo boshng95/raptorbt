@@ -5,6 +5,37 @@ All notable changes to raptorbt are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+Where the 0.12.1 option-margin work met the Nautilus-parity work on this
+branch.
+
+### Fixed
+
+- **A fill produced by a book walk re-prices the option groups.**
+  `PortfolioSession::walk_book` lends the kernel the pool's capital,
+  matches, and reconciles the result back exactly as the step path does, so
+  a leg it opens or closes changes what the groups hold. It now regroups on
+  the same terms. Before this, buying a wing off the standing book left the
+  sold leg it covers locked at its full naked deposit.
+- **A sold option's entry fee is quantized as it is booked.** The deposit
+  path subtracted it from cash directly, outside the settlement rule every
+  other term on this branch goes through, so a currency with a declared
+  precision carried a sub-cent residue on the entry.
+
+### Changed
+
+- **The unfunded-sizing guard asks the funding mode, not the leverage
+  rate.** A per-contract deposit cannot answer "what rate funds this",
+  which is what the guard used to ask. It now asks each mode in its own
+  terms: a zero rate funds nothing, and so would a zero deposit. No
+  reachable deposit is zero today -- one is built only from a positive
+  rate, strike and multiplier -- so nothing changes in behaviour; the guard
+  simply keeps answering the question the entry path now poses.
+- **The entry booking site reads the funding cost computed above it**
+  rather than re-deriving it once per funding mode, so the two cannot
+  drift. The arithmetic is unchanged, term for term and in the same order.
+
 ## [0.12.1] - 2026-09-02
 
 Sold options that hedge each other are margined as one group, and the

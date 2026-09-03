@@ -1185,3 +1185,50 @@ fn a_hedged_pair_is_not_margin_called_on_a_move_two_naked_deposits_would_be() {
     assert_eq!(calls, 0, "a hedged pair must be maintained at its group figure");
     assert!(!session.is_halted());
 }
+
+#[test]
+fn a_wing_bought_by_a_book_walk_regroups_the_sold_leg_it_covers() {
+    // A walk settles order flow the same way a bar does: it lends the
+    // kernel the pool's capital, matches, and reconciles the result back.
+    // A leg it opens therefore changes what the option groups hold, so the
+    // group requirement has to be re-priced on the same terms. Leaving the
+    // walk out of the regrouping left the sold leg locked at its naked
+    // deposit with its wing already bought and paid for.
+    use crate::execution::orders::{OrderKind, OrderSide, QtySpec, TimeInForce};
+
+    let mut session = option_session(
+        400_000.0,
+        &[
+            ("SHORT_PUT", 23_850.0, OptionRight::Put, Direction::Short, &[120.0, 120.0]),
+            ("LONG_PUT", 23_800.0, OptionRight::Put, Direction::Long, &[102.05, 102.05]),
+        ],
+    );
+    // Sell one lot of the 23,850 put, then let the wing's bar pass without
+    // entering on it: the kernel now has a book for an order to meet.
+    enter_all(&mut session, &[0.25]);
+    session.apply_current(StepInput::default());
+    assert_eq!(session.kernel(0).open_size(), 30.0);
+    let uncovered = session.kernel(0).locked_margin();
+
+    // Five lots of the wing, bought off the standing book rather than off a
+    // bar of its own.
+    session.kernel_mut(1).submit_order(
+        OrderSide::Buy,
+        QtySpec::Units(150.0),
+        OrderKind::Limit { price: 102.05 },
+        TimeInForce::Gtc,
+        0,
+        0,
+        "wing".to_string(),
+        None,
+        None,
+    );
+    let events = session.walk_book(1, 5);
+    assert_eq!(filled_size(&events), 150.0, "the wing fills off the book: {events:?}");
+
+    let covered = session.kernel(0).locked_margin();
+    assert!(covered < uncovered, "sold leg still locks {covered}, was {uncovered} uncovered");
+    let per_kernel: f64 = (0..2).map(|i| session.kernel(i).locked_margin()).sum();
+    let locked = 400_000.0 - session.free_capital();
+    assert!((per_kernel - locked).abs() < 1e-6, "kernels {per_kernel} vs account {locked}");
+}
