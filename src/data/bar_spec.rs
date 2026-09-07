@@ -95,6 +95,50 @@ impl BarSpec {
     }
 }
 
+/// Where a source record's timestamp sits in the period it describes.
+///
+/// Raw provider feeds (IB, Binance, yfinance) stamp a bar at its **open**: a
+/// 1-minute bar stamped 09:30 covers `[09:30, 09:31)`. Nautilus, and any
+/// catalog built to its contract, stamps the same minute at its **close**,
+/// 09:31 — "information as of this instant".
+///
+/// The distinction is invisible everywhere except a window boundary, and
+/// there it moves a whole source bar. Aggregating close-labelled minutes
+/// into hours under [`SourceLabel::Open`] puts the minute stamped 10:00 —
+/// which is the last minute of the hour that just ended — into the hour
+/// beginning at 10:00, so every hourly bar is one minute short and closes
+/// on the wrong price. That is a silent error: the bars still look
+/// well-formed, and only a comparison against a correctly labelled
+/// aggregation reveals it.
+///
+/// Meaningless for count-, volume- and Renko-driven units, which have no
+/// time boundary to fall on; those builders ignore it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SourceLabel {
+    /// The timestamp opens the period. Raw provider convention, and the
+    /// default so existing callers keep the behaviour they were built on.
+    #[default]
+    Open,
+    /// The timestamp closes the period. Nautilus convention.
+    Close,
+}
+
+impl SourceLabel {
+    /// Nanoseconds to shift a timestamp by before bucketing it.
+    ///
+    /// One nanosecond, and only for [`SourceLabel::Close`]: it moves the
+    /// boundary instant itself into the window that ends there and leaves
+    /// every other instant where it was. Expressing it as a bias rather
+    /// than a branch keeps one bucketing rule for both conventions.
+    #[inline]
+    pub const fn boundary_bias_ns(self) -> i64 {
+        match self {
+            Self::Open => 0,
+            Self::Close => 1,
+        }
+    }
+}
+
 /// Numeric parameters some units need that `step: u32` cannot express.
 ///
 /// Kept beside [`BarSpec`] rather than inside it: `BarSpec` derives `Eq` and
@@ -104,6 +148,8 @@ pub struct BuilderParams {
     /// Renko brick height in price units. `0.0` means "derive from `step`",
     /// which then reads as whole price units.
     pub brick_size: f64,
+    /// Which end of its period a source record's timestamp names.
+    pub label: SourceLabel,
 }
 
 impl BuilderParams {
@@ -146,14 +192,14 @@ mod tests {
     fn brick_size_falls_back_to_step() {
         let spec = BarSpec::new(5, AggregationUnit::Renko).unwrap();
         assert_eq!(BuilderParams::default().resolved_brick(spec), Ok(5.0));
-        let params = BuilderParams { brick_size: 0.05 };
+        let params = BuilderParams { brick_size: 0.05, ..Default::default() };
         assert_eq!(params.resolved_brick(spec), Ok(0.05));
     }
 
     #[test]
     fn nonfinite_brick_size_refused() {
         let spec = BarSpec::new(1, AggregationUnit::Renko).unwrap();
-        let params = BuilderParams { brick_size: f64::INFINITY };
+        let params = BuilderParams { brick_size: f64::INFINITY, ..Default::default() };
         assert!(matches!(params.resolved_brick(spec), Err(SpecError::InvalidParam(_))));
     }
 

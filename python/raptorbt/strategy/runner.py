@@ -13,6 +13,7 @@ from raptorbt._raptorbt import (
     atr as _atr,
     resolve_atr_period,
 )
+from raptorbt.strategy.limits import ExecutionLimits
 from raptorbt.strategy.base import Strategy
 from raptorbt.strategy.context import StrategyContext
 from raptorbt.strategy.orders import ClosePosition, MarketOrder, Twap
@@ -84,6 +85,7 @@ def run_strategy_backtest(
     oms_type: str = "netting",
     account_type: str = "cash",
     leverage: float = 1.0,
+    limits: ExecutionLimits = ExecutionLimits(),
 ) -> BacktestResult:
     """Run a class-based strategy over OHLCV arrays.
 
@@ -188,9 +190,18 @@ def run_strategy_backtest(
 
     # client order id -> engine order id, for cancel/modify routing.
     id_map: dict[str, int] = {}
+    budget = limits.budget()
 
-    def apply_commands(i: int) -> None:
-        for command in strategy.drain_commands():
+    def apply_commands(i: int) -> bool:
+        """Route one batch of queued commands into the engine.
+
+        Returns whether the batch had anything in it, which is what the
+        settlement loop below counts: a venue walks its book once per batch
+        it drains, and not at all when the strategy stays quiet.
+        """
+        commands = strategy.drain_commands()
+        budget.consume(int(timestamps[i]), len(commands))
+        for command in commands:
             if command[0] == "submit":
                 _, client_id, order, parent, _symbol = command
                 if isinstance(order, Twap):
@@ -256,12 +267,31 @@ def run_strategy_backtest(
                 engine_id = id_map.get(command[1])
                 if engine_id is not None:
                     session.modify_order(engine_id, **command[2])
+        return bool(commands)
+
+    def settle(i: int) -> None:
+        """Offer the bar just applied to orders its own fills provoked.
+
+        A venue matches its book every time it drains a batch of commands,
+        so an order the strategy placed on *hearing* a fill still meets the
+        bar that produced that fill. Stepping once per bar would hold such an
+        order back to the next one instead, filling it a bar late at a price
+        the strategy never saw -- which is exactly how a reversal's second
+        leg parts company with the reference engine.
+
+        The loop ends when the strategy falls quiet. Exceeding the run
+        resource budget raises instead of returning a truncated ledger.
+        """
+        ts_now = int(timestamps[i])
+        while apply_commands(i):
+            dispatch_events(strategy, ctx, session.walk_book(ts_now))
 
     for i in range(n):
         ctx.idx = i
 
         # Clock first: scheduled times precede the bar revealing them.
         for time_event in strategy.clock._advance(int(timestamps[i])):
+            budget.consume(int(timestamps[i]))
             strategy.on_time_event(ctx, time_event)
 
         streams.push(
@@ -324,6 +354,7 @@ def run_strategy_backtest(
         )
 
         dispatch_events(strategy, ctx, events)
+        settle(i)
 
     strategy.on_stop(ctx)
 

@@ -24,7 +24,7 @@
 //! balance, so the strategy owns sizing via `size_frac`. The array runner's
 //! `EqualWeight` budget has no counterpart here yet.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use crate::accounts::{AccountMode, SharedAccount};
 use crate::core::types::OhlcvBar;
@@ -143,7 +143,11 @@ pub struct EventSession {
     depth: Vec<DepthTick>,
     /// Pending per-instrument depth, merged at seal.
     depth_input: Vec<Vec<DepthTick>>,
-    schedule: Vec<ScheduleEntry>,
+    feed: EventFeed,
+    head: Option<ScheduleEntry>,
+    pending: VecDeque<ScheduleEntry>,
+    batch_local_idx: Vec<usize>,
+    scheduled: usize,
     /// Next per-instrument event ordinal, shared by the batch merge and the
     /// streaming pushes so `local_idx` stays monotone across both.
     local_idx_next: Vec<usize>,
@@ -180,7 +184,11 @@ impl EventSession {
             ticks: Vec::new(),
             depth: Vec::new(),
             depth_input: Vec::new(),
-            schedule: Vec::new(),
+            feed: EventFeed::new(),
+            head: None,
+            pending: VecDeque::new(),
+            batch_local_idx: Vec::new(),
+            scheduled: 0,
             local_idx_next: Vec::new(),
             cursor: 0,
             account: SharedAccount::new(mode, pool),
@@ -230,6 +238,7 @@ impl EventSession {
         self.ticks.push(None);
         self.depth_input.push(Vec::new());
         self.local_idx_next.push(0);
+        self.batch_local_idx.push(0);
         self.last_close.push(None);
         self.last_seen.push(None);
         self.kernels.len() - 1
@@ -273,32 +282,31 @@ impl EventSession {
         // hand them out from one counter rather than reusing the instrument
         // index (a tick instrument needs three).
         let mut next_stream = 0u32;
-        for (i, bars) in self.bars.iter().enumerate() {
+        for (i, bars) in self.bars.iter_mut().enumerate() {
             let stream = next_stream;
             next_stream += 1;
-            let events: Vec<MarketEvent> = bars
-                .iter()
-                .map(|b| MarketEvent {
-                    instrument: i as u32,
-                    stream,
-                    payload: EventPayload::Bar(OhlcvBar {
-                        timestamp: b.timestamp,
-                        open: b.open,
-                        high: b.high,
-                        low: b.low,
-                        close: b.close,
-                        volume: b.volume,
-                    }),
-                })
-                .collect();
-            feed.add_stream(events);
+            let bars = std::mem::take(bars);
+            self.local_idx_next[i] += bars.len();
+            let events = bars.into_iter().map(move |b| MarketEvent {
+                instrument: i as u32,
+                stream,
+                payload: EventPayload::Bar(OhlcvBar {
+                    timestamp: b.timestamp,
+                    open: b.open,
+                    high: b.high,
+                    low: b.low,
+                    close: b.close,
+                    volume: b.volume,
+                }),
+            });
+            feed.add_iter(events);
         }
-        for (i, ticks) in self.ticks.iter().enumerate() {
-            let Some(ticks) = ticks else { continue };
+        for (i, ticks) in self.ticks.iter_mut().enumerate() {
+            let Some(ticks) = ticks.take() else { continue };
             let trade_stream = next_stream;
             let quote_stream = next_stream + 1;
             next_stream += 2;
-            let events = tick_data_to_events(ticks, i as u32, trade_stream, quote_stream);
+            let events = tick_data_to_events(&ticks, i as u32, trade_stream, quote_stream);
             // One conversion emits both kinds interleaved; the feed needs
             // each stream monotone, so split them back apart.
             let trades: Vec<MarketEvent> = events
@@ -311,6 +319,7 @@ impl EventSession {
                 .filter(|e| matches!(e.payload, EventPayload::Quote(_)))
                 .copied()
                 .collect();
+            self.local_idx_next[i] += trades.len() + quotes.len();
             feed.add_stream(trades);
             feed.add_stream(quotes);
         }
@@ -321,6 +330,7 @@ impl EventSession {
             let stream = next_stream;
             next_stream += 1;
             let snapshots = std::mem::take(&mut self.depth_input[i]);
+            self.local_idx_next[i] += snapshots.len();
             let events: Vec<MarketEvent> = snapshots
                 .into_iter()
                 .map(|snapshot| {
@@ -336,7 +346,14 @@ impl EventSession {
                 .collect();
             feed.add_stream(events);
         }
-        for event in feed {
+        self.scheduled = feed.len();
+        self.feed = feed;
+        self.head = self.next_entry();
+        self.sealed = true;
+    }
+
+    fn next_entry(&mut self) -> Option<ScheduleEntry> {
+        if let Some(event) = self.feed.next() {
             let instrument = event.instrument as usize;
             let data = match event.payload {
                 EventPayload::Bar(bar) => ScheduleData::Bar(KernelBar {
@@ -351,11 +368,17 @@ impl EventSession {
                 EventPayload::Quote(q) => ScheduleData::Quote(q),
                 EventPayload::Depth(d) => ScheduleData::Depth(d),
             };
-            let local_idx = self.local_idx_next[instrument];
-            self.local_idx_next[instrument] += 1;
-            self.schedule.push(ScheduleEntry { instrument, local_idx, data });
+            let local_idx = self.batch_local_idx[instrument];
+            self.batch_local_idx[instrument] += 1;
+            Some(ScheduleEntry { instrument, local_idx, data })
+        } else {
+            self.pending.pop_front()
         }
-        self.sealed = true;
+    }
+
+    fn advance(&mut self) {
+        self.cursor += 1;
+        self.head = self.next_entry();
     }
 
     /// Append one entry to the schedule tail with the next local ordinal.
@@ -368,7 +391,13 @@ impl EventSession {
         self.seal();
         let local_idx = self.local_idx_next[instrument];
         self.local_idx_next[instrument] += 1;
-        self.schedule.push(ScheduleEntry { instrument, local_idx, data });
+        self.scheduled += 1;
+        let entry = ScheduleEntry { instrument, local_idx, data };
+        if self.head.is_none() {
+            self.head = Some(entry);
+        } else {
+            self.pending.push_back(entry);
+        }
     }
 
     /// Append a live feed row: a trade print when `ltp > 0`, then a quote
@@ -418,21 +447,21 @@ impl EventSession {
 
     /// Events pushed or merged but not yet applied.
     pub fn remaining(&self) -> usize {
-        self.schedule.len() - self.cursor
+        self.scheduled - self.cursor
     }
 
     /// Total scheduled events.
     pub fn len(&self) -> usize {
-        self.schedule.len()
+        self.scheduled
     }
 
     pub fn is_empty(&self) -> bool {
-        self.schedule.is_empty()
+        self.scheduled == 0
     }
 
     /// The entry the cursor points at, if any.
     pub fn current(&self) -> Option<ScheduleEntry> {
-        self.schedule.get(self.cursor).copied()
+        self.head
     }
 
     /// Kernel of an instrument, for order routing and queries.
@@ -666,7 +695,7 @@ impl EventSession {
         // zero return per quote, inflating the period count and distorting
         // annualized metrics purely from how chatty the feed is.
         if matches!(entry.data, ScheduleData::Quote(_) | ScheduleData::Depth(_)) {
-            self.cursor += 1;
+            self.advance();
             return events;
         }
 
@@ -742,7 +771,7 @@ impl EventSession {
             self.halt_all(self.cursor, HaltCause::Drawdown);
         }
 
-        self.cursor += 1;
+        self.advance();
         events
     }
 
@@ -887,6 +916,12 @@ impl EventSession {
         let rejected_entries: usize = self.kernels.iter().map(|k| k.rejected_entries()).sum();
         let halted = self.account.is_halted() || self.kernels.iter().any(|k| k.risk_halted());
         let halted_at = self.account.halted_at();
+
+        if !self.config.retain_curves {
+            self.equity_curve = Vec::new();
+            self.drawdown_curve = Vec::new();
+            self.returns = Vec::new();
+        }
 
         let result = BacktestResult::new(
             metrics,

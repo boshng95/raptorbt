@@ -28,6 +28,11 @@ pub fn numpy_to_vec_bool(arr: PyReadonlyArray1<bool>) -> Vec<bool> {
     arr.as_slice().unwrap().to_vec()
 }
 
+/// Convert numpy int8 array to Vec<i8>.
+pub fn numpy_to_vec_i8(arr: PyReadonlyArray1<i8>) -> Vec<i8> {
+    arr.as_slice().unwrap().to_vec()
+}
+
 /// Convert Vec<f64> to numpy array.
 pub fn vec_to_numpy_f64<'py>(py: Python<'py>, vec: Vec<f64>) -> &'py PyArray1<f64> {
     PyArray1::from_vec(py, vec)

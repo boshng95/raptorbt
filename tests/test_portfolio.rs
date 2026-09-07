@@ -46,6 +46,7 @@ fn simple_signals(n: usize) -> CompiledSignals {
         exits,
         position_sizes: None,
         direction: Direction::Long,
+        entry_directions: None,
         weight: 1.0,
     }
 }
@@ -91,6 +92,7 @@ fn test_multiple_trades() {
         position_sizes: None,
         direction: Direction::Long,
         weight: 1.0,
+        entry_directions: None,
     };
 
     let config = BacktestConfig::default();
@@ -141,6 +143,7 @@ fn test_fixed_stop_loss() {
         position_sizes: None,
         direction: Direction::Long,
         weight: 1.0,
+        entry_directions: None,
     };
 
     let config = BacktestConfig {
@@ -171,6 +174,7 @@ fn test_fixed_take_profit() {
         position_sizes: None,
         direction: Direction::Long,
         weight: 1.0,
+        entry_directions: None,
     };
 
     let config = BacktestConfig {
@@ -197,6 +201,7 @@ fn test_no_trades() {
         position_sizes: None,
         direction: Direction::Long,
         weight: 1.0,
+        entry_directions: None,
     };
 
     let config = BacktestConfig::default();
@@ -257,6 +262,7 @@ fn test_short_direction() {
         position_sizes: None,
         direction: Direction::Short, // Short direction
         weight: 1.0,
+        entry_directions: None,
     };
 
     let config = BacktestConfig::default();
@@ -287,6 +293,7 @@ fn test_metrics_consistency() {
         position_sizes: None,
         direction: Direction::Long,
         weight: 1.0,
+        entry_directions: None,
     };
 
     let config = BacktestConfig::default();

@@ -9,7 +9,9 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
 use crate::core::types::{OhlcvBar, TickData};
-use crate::data::{builder_for_with, AggregationUnit, BarBuilder, BarSpec, SourceRecord};
+use crate::data::{
+    builder_for_with, AggregationUnit, BarBuilder, BarSpec, SourceLabel, SourceRecord,
+};
 
 use super::numpy_bridge::{numpy_to_vec_f64, numpy_to_vec_i64, vec_to_numpy_f64, vec_to_numpy_i64};
 
@@ -18,13 +20,29 @@ fn parse_spec(step: u32, unit: &str) -> PyResult<BarSpec> {
     BarSpec::new(step, unit).map_err(|e| PyValueError::new_err(e.to_string()))
 }
 
+/// Which end of its period a source timestamp names.
+///
+/// Spelled rather than a bool so the call site says which convention it
+/// means: `label="close"` reads as the fact it asserts about the data,
+/// where `close_labelled=True` reads as a mode being switched on.
+fn parse_label(label: &str) -> PyResult<SourceLabel> {
+    match label {
+        "open" => Ok(SourceLabel::Open),
+        "close" => Ok(SourceLabel::Close),
+        other => Err(PyValueError::new_err(format!(
+            "unknown bar label {other:?}: expected \"open\" or \"close\""
+        ))),
+    }
+}
+
 fn make_builder_with(
     step: u32,
     unit: &str,
     tz_offset_ns: i64,
     brick_size: f64,
+    label: &str,
 ) -> PyResult<Box<dyn BarBuilder + Send>> {
-    let params = crate::data::BuilderParams { brick_size };
+    let params = crate::data::BuilderParams { brick_size, label: parse_label(label)? };
     builder_for_with(parse_spec(step, unit)?, tz_offset_ns, params)
         .map_err(|e| PyValueError::new_err(e.to_string()))
 }
@@ -34,7 +52,14 @@ fn make_builder_with(
 /// Push source records (finer bars or trades) in ascending time order; a
 /// completed bar is returned as `(timestamp, open, high, low, close,
 /// volume)` when its boundary is crossed. Time bars are stamped with their
-/// window-end timestamp, so a bar labeled `t` contains only data before `t`.
+/// window-end timestamp.
+///
+/// `label` says which end of its period a *source* record's timestamp
+/// names: `"open"` (default, the raw-provider convention) puts a record
+/// landing exactly on a boundary in the window that opens there, `"close"`
+/// (the Nautilus convention) in the window that ends there. Getting it
+/// wrong shifts every boundary record by one window and is silent — the
+/// bars still look well-formed.
 #[pyclass(name = "BarAggregator")]
 pub struct PyBarAggregator {
     builder: Box<dyn BarBuilder + Send>,
@@ -53,10 +78,16 @@ fn to_tuple(bar: OhlcvBar) -> BarTuple {
 #[pymethods]
 impl PyBarAggregator {
     #[new]
-    #[pyo3(signature = (step, unit, tz_offset_ns=0, brick_size=0.0))]
-    fn new(step: u32, unit: &str, tz_offset_ns: i64, brick_size: f64) -> PyResult<Self> {
+    #[pyo3(signature = (step, unit, tz_offset_ns=0, brick_size=0.0, label="open"))]
+    fn new(
+        step: u32,
+        unit: &str,
+        tz_offset_ns: i64,
+        brick_size: f64,
+        label: &str,
+    ) -> PyResult<Self> {
         Ok(Self {
-            builder: make_builder_with(step, unit, tz_offset_ns, brick_size)?,
+            builder: make_builder_with(step, unit, tz_offset_ns, brick_size, label)?,
             step,
             unit: unit.to_string(),
         })
@@ -153,7 +184,7 @@ fn bars_to_arrays(py: Python<'_>, bars: Vec<OhlcvBar>) -> BarArrays<'_> {
 /// units: time (`"ms"`/`"s"`/`"m"`/`"h"`/`"d"`/`"w"`), `"tick"`,
 /// `"volume"`, `"value"`.
 #[pyfunction]
-#[pyo3(signature = (timestamps, open, high, low, close, volume, step, unit, tz_offset_ns=0, brick_size=0.0))]
+#[pyo3(signature = (timestamps, open, high, low, close, volume, step, unit, tz_offset_ns=0, brick_size=0.0, label="open"))]
 #[allow(clippy::too_many_arguments)]
 pub fn aggregate_bars<'py>(
     py: Python<'py>,
@@ -167,6 +198,7 @@ pub fn aggregate_bars<'py>(
     unit: &str,
     tz_offset_ns: i64,
     brick_size: f64,
+    label: &str,
 ) -> PyResult<BarArrays<'py>> {
     let ts = numpy_to_vec_i64(timestamps);
     let o = numpy_to_vec_f64(open);
@@ -179,7 +211,7 @@ pub fn aggregate_bars<'py>(
         return Err(PyValueError::new_err("all input arrays must share one length"));
     }
 
-    let mut builder = make_builder_with(step, unit, tz_offset_ns, brick_size)?;
+    let mut builder = make_builder_with(step, unit, tz_offset_ns, brick_size, label)?;
     let mut out = Vec::new();
     for i in 0..n {
         let rec = SourceRecord {
@@ -245,7 +277,10 @@ pub fn bars_from_ticks<'py>(
     };
     let events = crate::data::tick_data_to_events(&ticks, 0, 0, 1);
 
-    let mut builder = make_builder_with(step, unit, tz_offset_ns, brick_size)?;
+    // Always "open": a tick is an instant, not a period, so it has no
+    // second end for a label to name and cannot land on a boundary as
+    // anything but the first record of the window it starts.
+    let mut builder = make_builder_with(step, unit, tz_offset_ns, brick_size, "open")?;
     let mut out = Vec::new();
     for event in events {
         if let crate::data::EventPayload::Trade(trade) = event.payload {

@@ -1,8 +1,8 @@
 //! Event-driven portfolio simulation engine.
 
 use crate::core::types::{
-    BacktestConfig, BacktestMetrics, BacktestResult, CompiledSignals, ExitReason, InstrumentConfig,
-    OhlcvData, StopConfig, TargetConfig, Trade,
+    BacktestConfig, BacktestMetrics, BacktestResult, CompiledSignals, Direction, ExitReason,
+    InstrumentConfig, OhlcvData, StopConfig, TargetConfig, Trade,
 };
 use crate::execution::{FeeModel, FillPrice, SlippageModel};
 use crate::indicators::volatility::atr;
@@ -106,9 +106,25 @@ impl PortfolioEngine {
         let n = ohlcv.len();
         assert_eq!(n, signals.len(), "OHLCV and signals must have same length");
 
-        // Clean signals
-        let (entries, exits) =
-            self.signal_processor.clean_signals(&signals.entries, &signals.exits);
+        // Clean signals. A two-sided run names a direction per entry, and its
+        // cleaner is the one that reads a reversal as a reversal rather than
+        // as a duplicate entry to drop.
+        let (entries, exits, entry_directions) = match signals.entry_directions.as_ref() {
+            Some(directions) => {
+                let (entries, exits, cleaned) = self.signal_processor.clean_signals_signed(
+                    &signals.entries,
+                    &signals.exits,
+                    directions,
+                    signals.direction,
+                );
+                (entries, exits, Some(cleaned))
+            }
+            None => {
+                let (entries, exits) =
+                    self.signal_processor.clean_signals(&signals.entries, &signals.exits);
+                (entries, exits, None)
+            }
+        };
 
         // Initialize state
         let mut runner = SingleRunner::new(
@@ -161,6 +177,9 @@ impl PortfolioEngine {
                 exit: exits[i],
                 atr: atr_values.get(i).copied().unwrap_or(0.0),
                 size_mult: signals.position_sizes.as_ref().map(|sizes| sizes[i]),
+                entry_direction: entry_directions
+                    .as_ref()
+                    .and_then(|directions| Direction::from_int(i32::from(directions[i]))),
                 ..StepInput::default()
             };
 
@@ -716,7 +735,6 @@ pub fn compute_backtest_metrics_with_config(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::types::Direction;
 
     fn sample_ohlcv() -> OhlcvData {
         OhlcvData {
@@ -754,8 +772,94 @@ mod tests {
             ],
             position_sizes: None,
             direction: Direction::Long,
+            entry_directions: None,
             weight: 1.0,
         }
+    }
+
+    /// A run that reverses: long on bar 1, flip to short on bar 5, cover on
+    /// bar 15. The kernel's step order already lets an exit and a re-entry
+    /// share a bar; what `entry_directions` adds is the ability to say that
+    /// the re-entry belongs on the other side.
+    fn reversing_signals() -> CompiledSignals {
+        let mut entries = vec![false; 20];
+        let mut exits = vec![false; 20];
+        let mut directions = vec![0i8; 20];
+        entries[1] = true;
+        directions[1] = 1;
+        entries[5] = true;
+        directions[5] = -1;
+        exits[15] = true;
+        CompiledSignals {
+            symbol: "TEST".to_string(),
+            entries,
+            exits,
+            position_sizes: None,
+            direction: Direction::Long,
+            entry_directions: Some(directions),
+            weight: 1.0,
+        }
+    }
+
+    fn reversal_config() -> BacktestConfig {
+        BacktestConfig {
+            initial_capital: 100_000.0,
+            fees: 0.0,
+            slippage: 0.0,
+            stop: StopConfig::None,
+            target: TargetConfig::None,
+            upon_bar_close: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_two_sided_run_reverses_into_the_other_side() {
+        let engine = PortfolioEngine::new(reversal_config());
+        let result = engine.run_single(&sample_ohlcv(), &reversing_signals());
+
+        assert_eq!(result.trades.len(), 2, "one long, then one short");
+        assert_eq!(result.trades[0].direction, Direction::Long);
+        assert_eq!(result.trades[1].direction, Direction::Short);
+        // The reversal closes and opens on the same bar and at the same
+        // price, which is what makes it a reversal rather than an exit
+        // followed by an unrelated entry.
+        assert_eq!(result.trades[0].exit_idx, 5);
+        assert_eq!(result.trades[1].entry_idx, 5);
+        assert_eq!(result.trades[0].exit_price, result.trades[1].entry_price);
+        assert_eq!(result.trades[1].exit_idx, 15);
+    }
+
+    #[test]
+    fn the_short_leg_of_a_reversal_earns_on_a_falling_market() {
+        let engine = PortfolioEngine::new(reversal_config());
+        let result = engine.run_single(&sample_ohlcv(), &reversing_signals());
+
+        let short = &result.trades[1];
+        // Entered at bar 5's close (105.0), covered at bar 15's (105.5): a
+        // short into a market that ended higher loses, and its sign is the
+        // proof the direction reached the P&L rather than only the label.
+        assert!(short.pnl < 0.0, "short pnl was {}", short.pnl);
+        assert!(result.trades[0].pnl > 0.0, "the long leg rose");
+    }
+
+    #[test]
+    fn a_zeroed_direction_array_runs_exactly_as_a_single_sided_run() {
+        let engine = PortfolioEngine::new(reversal_config());
+        let plain = engine.run_single(&sample_ohlcv(), &sample_signals());
+
+        let mut signals = sample_signals();
+        signals.entry_directions = Some(vec![0i8; 20]);
+        let signed = engine.run_single(&sample_ohlcv(), &signals);
+
+        assert_eq!(plain.trades.len(), signed.trades.len());
+        for (left, right) in plain.trades.iter().zip(signed.trades.iter()) {
+            assert_eq!(left.direction, right.direction);
+            assert_eq!(left.entry_idx, right.entry_idx);
+            assert_eq!(left.exit_idx, right.exit_idx);
+            assert_eq!(left.pnl, right.pnl);
+        }
+        assert_eq!(plain.equity_curve, signed.equity_curve);
     }
 
     #[test]

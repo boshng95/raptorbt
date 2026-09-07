@@ -13,6 +13,7 @@ import numpy.typing as npt
 _F64 = npt.NDArray[np.float64]
 _I64 = npt.NDArray[np.int64]
 _Bool = npt.NDArray[np.bool_]
+_I8 = npt.NDArray[np.int8]
 
 # Trading minutes per session, for BacktestConfig(session_minutes=...).
 SESSION_NSE: float
@@ -26,6 +27,7 @@ IST_OFFSET_NS: int
 _Instrument = tuple[_I64, _F64, _F64, _F64, _F64, _F64, _Bool, _Bool, int, float, str]
 
 class BacktestConfig:
+    retain_curves: bool
     initial_capital: float
     fees: float
     fee_per_share: float
@@ -266,6 +268,7 @@ def run_single_backtest(
     config: BacktestConfig | None = ...,
     position_sizes: _F64 | None = ...,
     instrument_config: InstrumentConfig | None = ...,
+    entry_directions: _I8 | None = ...,
 ) -> BacktestResult: ...
 def run_basket_backtest(
     instruments: Sequence[_Instrument],
@@ -731,6 +734,7 @@ class BarAggregator:
         unit: str,
         tz_offset_ns: int = ...,
         brick_size: float = ...,
+        label: str = ...,
     ) -> None: ...
     def push_bar(
         self,
@@ -763,6 +767,7 @@ def aggregate_bars(
     unit: str,
     tz_offset_ns: int = ...,
     brick_size: float = ...,
+    label: str = ...,
 ) -> _BarArrays: ...
 def bars_from_ticks(
     timestamps: _I64,
@@ -970,6 +975,7 @@ class KernelSession:
         stop_price: float | None = ...,
         target_price: float | None = ...,
     ) -> list[EngineEvent]: ...
+    def walk_book(self, ts_now: int) -> list[EngineEvent]: ...
     def submit_order(
         self,
         side: str,

@@ -72,6 +72,8 @@ use super::numpy_bridge::*;
 #[derive(Debug, Clone)]
 pub struct PyBacktestConfig {
     #[pyo3(get, set)]
+    pub retain_curves: bool,
+    #[pyo3(get, set)]
     pub initial_capital: f64,
     #[pyo3(get, set)]
     pub fees: f64,
@@ -200,6 +202,7 @@ impl PyBacktestConfig {
         fee_per_share=0.0,
         fee_minimum=0.0,
         fee_max_pct=0.0,
+        retain_curves=true,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -230,10 +233,12 @@ impl PyBacktestConfig {
         fee_per_share: f64,
         fee_minimum: f64,
         fee_max_pct: f64,
+        retain_curves: bool,
     ) -> PyResult<Self> {
         let squareoff_time_minutes = parse_squareoff_time(squareoff_time.as_deref())?;
         let fill_timing = parse_fill_timing(fill_timing.as_deref())?;
         Ok(Self {
+            retain_curves,
             initial_capital,
             fees,
             fee_per_share,
@@ -367,6 +372,7 @@ fn parse_squareoff_time(value: Option<&str>) -> PyResult<Option<u32>> {
 impl From<&PyBacktestConfig> for BacktestConfig {
     fn from(py_config: &PyBacktestConfig) -> Self {
         BacktestConfig {
+            retain_curves: py_config.retain_curves,
             initial_capital: py_config.initial_capital,
             fees: py_config.fees,
             fee_per_share: py_config.fee_per_share,
@@ -882,7 +888,7 @@ impl PyBacktestResult {
 /// shares the same execution core and result types. Array runners remain
 /// supported and will only be deprecated in a future major release.
 #[pyfunction]
-#[pyo3(signature = (timestamps, open, high, low, close, volume, entries, exits, direction=1, weight=1.0, symbol="UNKNOWN", config=None, position_sizes=None, instrument_config=None))]
+#[pyo3(signature = (timestamps, open, high, low, close, volume, entries, exits, direction=1, weight=1.0, symbol="UNKNOWN", config=None, position_sizes=None, instrument_config=None, entry_directions=None))]
 pub fn run_single_backtest<'py>(
     _py: Python<'py>,
     timestamps: PyReadonlyArray1<i64>,
@@ -899,6 +905,7 @@ pub fn run_single_backtest<'py>(
     config: Option<&PyBacktestConfig>,
     position_sizes: Option<PyReadonlyArray1<f64>>,
     instrument_config: Option<&PyInstrumentConfig>,
+    entry_directions: Option<PyReadonlyArray1<i8>>,
 ) -> PyResult<PyBacktestResult> {
     let ohlcv = OhlcvData {
         timestamps: numpy_to_vec_i64(timestamps),
@@ -917,6 +924,9 @@ pub fn run_single_backtest<'py>(
         exits: numpy_to_vec_bool(exits),
         position_sizes: position_sizes.map(numpy_to_vec_f64),
         direction: dir,
+        // Present only for a two-sided run; `direction` still names the side
+        // that every entry not naming its own opens in.
+        entry_directions: entry_directions.map(numpy_to_vec_i8),
         weight,
     };
 
@@ -957,6 +967,7 @@ pub fn run_basket_backtest<'py>(
                 position_sizes: None,
                 direction: parse_direction(dir)?,
                 weight,
+                entry_directions: None,
             };
             Ok((ohlcv, signals))
         })
@@ -1100,6 +1111,7 @@ pub fn run_portfolio_backtest<'py>(
                 position_sizes: None,
                 direction: parse_direction(dir)?,
                 weight,
+                entry_directions: None,
             };
             Ok((ohlcv, signals))
         })
@@ -1215,6 +1227,7 @@ pub fn run_options_backtest<'py>(
         position_sizes: None,
         direction: dir,
         weight: 1.0,
+        entry_directions: None,
     };
 
     // These three parsed with a catch-all `_` arm through 0.6.4, so any string
@@ -1328,6 +1341,7 @@ pub fn run_pairs_backtest<'py>(
         position_sizes: None,
         direction: dir,
         weight: 1.0,
+        entry_directions: None,
     };
 
     let pairs_config = PairsConfig {
@@ -1658,6 +1672,7 @@ pub fn run_multi_backtest<'py>(
                 position_sizes: None,
                 direction: parse_direction(dir)?,
                 weight,
+                entry_directions: None,
             })
         })
         .collect::<PyResult<_>>()?;

@@ -251,3 +251,110 @@ class TestOrderFlow:
         r2 = run_strategy_backtest(Sma, **data)
         assert np.array_equal(r1.equity_curve(), r2.equity_curve())
         assert len(r1.trades()) == 1
+
+
+class TestFillDrivenSubmission:
+    """An order placed on hearing a fill still meets the bar that caused it.
+
+    A venue walks its book every time it drains a batch of commands, so a
+    strategy that answers a fill report with another order has that order
+    matched at the same instant -- not held over to the next bar, at a price
+    it never saw. The runner reproduces that with a settlement pass after the
+    bar's own step: drain, walk, dispatch, and again while the strategy keeps
+    talking.
+
+    Such an order is reachable by nothing else. The step that owns the bar
+    swept and matched what it could see, and it ran before the fill was
+    reported; the next step reaches only orders older than itself. So a
+    settlement that skipped a kind of order would not fill it a bar late --
+    it would never fill it at all.
+    """
+
+    @staticmethod
+    def _run(second):
+        fills = []
+
+        class Reverse(Strategy):
+            def on_bar(self, ctx):
+                if ctx.idx == 3 and ctx.position is None:
+                    self.submit_order(orders.Market(side="buy", units=10.0))
+
+            def on_order_filled(self, ctx, event):
+                fills.append(event.idx)
+                if len(fills) == 1:
+                    self.submit_order(second())
+
+        bars = _bars([100.0, 101.0, 102.0, 103.0, 104.0, 105.0, 106.0])
+        result = run_strategy_backtest(
+            Reverse(),
+            bars["timestamps"],
+            bars["open"],
+            bars["high"],
+            bars["low"],
+            bars["close"],
+            bars["volume"],
+            symbol="TEST",
+            config=_zero_fee_config(),
+        )
+        return fills, result
+
+    def test_a_limit_placed_from_a_fill_meets_the_same_bar(self):
+        # Priced through the book the bar left showing, so the walk the
+        # settlement makes crosses it at the book's price.
+        fills, result = self._run(
+            lambda: orders.Limit(
+                side="sell", units=10.0, price=90.0, tif="ioc", reduce_only=True
+            )
+        )
+
+        assert fills == [3, 3]
+        assert result.trades()[0].exit_price == pytest.approx(103.0)
+
+    def test_a_market_placed_from_a_fill_meets_the_same_bar(self):
+        # A plain market order is swept by the kernel rather than matched
+        # against the book, so the settlement has to sweep it too: the bar's
+        # own step swept before this order existed, and the next step's
+        # sweep only reaches orders older than itself.
+        fills, result = self._run(
+            lambda: orders.Market(side="sell", units=10.0, reduce_only=True)
+        )
+
+        assert fills == [3, 3]
+        assert result.trades()[0].exit_price == pytest.approx(103.0)
+
+    def test_a_quiet_bar_settles_nothing(self):
+        """No batch, no walk. Otherwise a resting order gets a free bite.
+
+        The strategy below never submits from a fill, so every bar's
+        settlement drains an empty batch and stops -- and the run must match
+        one driven entirely from `on_bar`.
+        """
+        walks = []
+
+        class Plain(Strategy):
+            def on_bar(self, ctx):
+                if ctx.idx == 2 and ctx.position is None:
+                    self.submit_order(orders.Market(side="buy", units=5.0))
+                elif ctx.idx == 6 and ctx.position is not None:
+                    self.submit_order(
+                        orders.Market(side="sell", units=5.0, reduce_only=True)
+                    )
+
+            def on_order_filled(self, ctx, event):
+                walks.append(event.idx)
+
+        bars = _bars([100.0, 101.0, 102.0, 103.0, 104.0, 105.0, 106.0, 107.0])
+        res = run_strategy_backtest(
+            Plain(),
+            bars["timestamps"],
+            bars["open"],
+            bars["high"],
+            bars["low"],
+            bars["close"],
+            bars["volume"],
+            symbol="TEST",
+            config=_zero_fee_config(),
+        )
+
+        assert walks == [2, 6]
+        assert res.metrics.total_trades == 1

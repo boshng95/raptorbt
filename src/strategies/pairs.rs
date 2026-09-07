@@ -487,6 +487,7 @@ mod tests {
             position_sizes: None,
             direction: Direction::Long, // Long leg1, short leg2
             weight: 1.0,
+            entry_directions: None,
         };
 
         (leg1, leg2, signals)

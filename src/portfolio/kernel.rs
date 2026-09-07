@@ -151,6 +151,14 @@ pub struct StepInput {
     /// Takes precedence over the configured target model. Ignored when no
     /// entry opens on this bar.
     pub target_price_override: Option<Price>,
+    /// The direction this bar's signal entry opens in.
+    ///
+    /// `None` -- the default, and every single-sided run -- takes the
+    /// kernel's own [`EngineKernel::direction`]. A two-sided run names the
+    /// side per bar, which is what lets one kernel hold a long, reverse, and
+    /// hold a short off the signal path. The order path is unaffected: an
+    /// order's own side has always decided the direction it opens in.
+    pub entry_direction: Option<Direction>,
 }
 
 /// Signal intents carried from one bar to the next under
@@ -181,6 +189,8 @@ struct DeferredEntry {
     atr: f64,
     stop_price_override: Option<Price>,
     target_price_override: Option<Price>,
+    /// The side the decision bar asked for; see [`StepInput::entry_direction`].
+    direction: Option<Direction>,
 }
 
 /// Which market event is driving a step.
@@ -854,12 +864,21 @@ impl EngineKernel {
     /// Cash mode marks positions at full value (historical model); margin
     /// mode marks balance plus direction-aware unrealized PnL, which prices
     /// shorts correctly.
+    ///
+    /// The cash term is already settled to the currency's precision, having
+    /// been quantized as each amount was booked. The mark is not, and must
+    /// not be: a position is worth its size times a price, which is not a
+    /// whole number of cents, and no money moved to make it one. Rounding
+    /// the sum instead put the whole balance half a cent off the reference
+    /// account for as long as anything was open -- the portfolio session's
+    /// `equity` has always added its mark unrounded, and this is the same
+    /// account viewed one instrument at a time.
     #[inline]
     pub fn equity(&self, close: Price) -> f64 {
-        self.quantize_money(match self.account {
+        match self.account {
             AccountMode::Cash => self.cash + self.position_value(close),
             AccountMode::Margin { .. } => self.cash + self.ledger.unrealized_total(close),
-        })
+        }
     }
 
     /// Cash not locked as initial margin (margin mode); all cash otherwise.
@@ -1104,6 +1123,17 @@ impl EngineKernel {
         for outcome in self.orders.walk_book() {
             self.apply_match_outcome(idx, bar, outcome, &mut events);
         }
+        // A market order arriving here crosses the same book, and it has to
+        // cross it here: the step that owns this bar swept the market orders
+        // it could see, and the next step reaches only orders older than
+        // itself, so one submitted after the step -- which is what an order
+        // placed on hearing a fill is -- is reachable by nothing else. Under
+        // `NextBarOpen` that is not true and not wanted: the next step does
+        // reach it, and deferral is the rule that says it fills there.
+        if self.fill_timing != FillTiming::NextBarOpen {
+            let arrivals = self.plain_market_ids(|o| o.submitted_idx == idx);
+            self.sweep_plain_markets(idx, bar, arrivals, &mut events);
+        }
         events
     }
 
@@ -1219,6 +1249,7 @@ impl EngineKernel {
                                         size_mult: entry.size_mult,
                                         stop_price_override: entry.stop_price_override,
                                         target_price_override: entry.target_price_override,
+                                        entry_direction: entry.direction,
                                         ..StepInput::default()
                                     };
                                     if let Some(event) = self.try_enter(idx, bar, entry_input) {
@@ -1320,6 +1351,7 @@ impl EngineKernel {
                 atr: input.atr,
                 stop_price_override: input.stop_price_override,
                 target_price_override: input.target_price_override,
+                direction: input.entry_direction,
             });
         } else if !self.ledger.is_in_position() && input.entry {
             // Not-yet-active instruments refuse entries the same way expired
@@ -1368,21 +1400,10 @@ impl EngineKernel {
         // NextBarOpen sweeps the PREVIOUS bar's — a bar-i submission is
         // unreachable by bar i's sweep and fills at bar i+1's open, exactly
         // like a deferred signal.
-        let is_plain_market = |o: &&crate::execution::orders::Order| {
-            matches!(o.kind, OrderKind::Market)
-                && o.parent_id.is_none()
-                && !matches!(o.tif, TimeInForce::AtOpen | TimeInForce::AtClose)
-        };
         if defer_signals {
             // Acknowledge this bar's new market orders now; their fill
             // arrives on the next bar step.
-            let ack_ids: Vec<u64> = self
-                .orders
-                .working()
-                .filter(is_plain_market)
-                .filter(|o| o.submitted_idx == idx)
-                .map(|o| o.id)
-                .collect();
+            let ack_ids = self.plain_market_ids(|o| o.submitted_idx == idx);
             for id in ack_ids {
                 if let Some(order) = self.orders.get_mut(id) {
                     let _ = order.transition(OrderStatus::Accepted);
@@ -1391,17 +1412,52 @@ impl EngineKernel {
                 }
             }
         }
-        let market_ids: Vec<u64> = self
-            .orders
+        let market_ids = self.plain_market_ids(|o| match defer_signals {
+            true => o.submitted_idx < idx,
+            false => o.submitted_idx == idx,
+        });
+        // Under deferral the order was already acknowledged (and moved to
+        // Accepted) on its submission bar.
+        self.sweep_plain_markets(idx, bar, market_ids, &mut events);
+
+        events
+    }
+
+    /// Ids of the working plain market orders a predicate selects.
+    ///
+    /// "Plain" is the market order the venue sweeps itself: not one queued
+    /// to a bar phase, and not a one-triggers-other child, both of which
+    /// reach the matcher instead.
+    fn plain_market_ids(
+        &self,
+        select: impl Fn(&&crate::execution::orders::Order) -> bool,
+    ) -> Vec<u64> {
+        self.orders
             .working()
-            .filter(is_plain_market)
-            .filter(|o| if defer_signals { o.submitted_idx < idx } else { o.submitted_idx == idx })
+            .filter(|o: &&crate::execution::orders::Order| {
+                matches!(o.kind, OrderKind::Market)
+                    && o.parent_id.is_none()
+                    && !matches!(o.tif, TimeInForce::AtOpen | TimeInForce::AtClose)
+            })
+            .filter(select)
             .map(|o| o.id)
-            .collect();
-        for id in market_ids {
-            // Under deferral the order was already acknowledged (and moved
-            // to Accepted) on its submission bar.
-            if !defer_signals {
+            .collect()
+    }
+
+    /// Cross the standing book with each of these market orders.
+    ///
+    /// A late callback can submit after the bar's acknowledgement phase.
+    /// Accept any still-submitted order before filling it, regardless of
+    /// timing policy; an already accepted deferred order is not re-acked.
+    fn sweep_plain_markets(
+        &mut self,
+        idx: usize,
+        bar: &KernelBar,
+        ids: Vec<u64>,
+        events: &mut Vec<EngineEvent>,
+    ) {
+        for id in ids {
+            if self.orders.get(id).is_some_and(|order| order.status == OrderStatus::Submitted) {
                 if let Some(order) = self.orders.get_mut(id) {
                     let _ = order.transition(OrderStatus::Accepted);
                     let client_id = order.client_id.clone();
@@ -1439,11 +1495,9 @@ impl EngineKernel {
                     // from this bar crossed the book the bar left showing.
                     on_arrival: self.orders.get(id).is_some_and(|order| order.arrives_before_bar),
                 },
-                &mut events,
+                events,
             );
         }
-
-        events
     }
 
     /// Exit path for one position: stop-loss, then take-profit, then signal.
@@ -1773,11 +1827,12 @@ impl EngineKernel {
         bar: &KernelBar,
         input: StepInput,
     ) -> Option<EngineEvent> {
-        let entry_price = self.fill_price_for(bar, self.direction, true);
+        let direction = input.entry_direction.unwrap_or(self.direction);
+        let entry_price = self.fill_price_for(bar, direction, true);
         self.open_at(
             idx,
             bar,
-            self.direction,
+            direction,
             entry_price,
             input.size_mult,
             None,

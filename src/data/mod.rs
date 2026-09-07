@@ -10,7 +10,7 @@ pub mod flow_bars;
 pub mod renko;
 
 pub use aggregate::{builder_for, builder_for_with, BarBuilder, SourceRecord, IST_OFFSET_NS};
-pub use bar_spec::{AggregationUnit, BarSpec, BuilderParams, SpecError};
+pub use bar_spec::{AggregationUnit, BarSpec, BuilderParams, SourceLabel, SpecError};
 pub use book::{BookLevel, BookSide, DepthTick, OrderBook, BOOK_DEPTH};
 pub use events::{tick_data_to_events, DepthRef, EventPayload, MarketEvent, QuoteTick, TradeTick};
 pub use feed::EventFeed;

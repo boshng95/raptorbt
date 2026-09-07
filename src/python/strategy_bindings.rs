@@ -377,9 +377,22 @@ impl PyKernelSession {
             size_mult,
             stop_price_override: stop_price,
             target_price_override: target_price,
+            // The class-strategy contract opens through the order API, whose
+            // own side names the direction; the signal field stays unused.
+            entry_direction: None,
         };
 
         Ok(runner.step(idx, &bar, input).into_iter().map(PyEngineEvent::from).collect())
+    }
+
+    /// Settle resting orders off-schedule, at `ts_now`.
+    ///
+    /// A venue walks its book every time it drains a batch of commands, so a
+    /// driver that steps once per bar under-fills an order the strategy
+    /// placed on hearing that bar's own fills. Call this after routing such a
+    /// batch, and again while the fills it reports keep producing commands.
+    fn walk_book(&mut self, ts_now: i64) -> PyResult<Vec<PyEngineEvent>> {
+        Ok(self.runner_mut()?.walk_book(ts_now).into_iter().map(PyEngineEvent::from).collect())
     }
 
     /// Submit an order.
