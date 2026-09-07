@@ -31,8 +31,8 @@ class Strategy:
         # ("link_oco", ids).
         self._pending_commands: list[tuple] = []
         self._order_seq = 0
-        # (step, unit) bar subscriptions declared in on_start.
-        self._bar_subscriptions: list[tuple[int, str]] = []
+        # Bar subscriptions declared in on_start: (step, unit, brick_size, label).
+        self._bar_subscriptions: list[tuple[int, str, float, str]] = []
         #: Bar-driven clock: ``set_time_alert`` / ``set_timer``; fresh per run.
         self.clock = Clock()
         #: Event-sourced order/trade cache; fresh per run.
@@ -314,7 +314,14 @@ class Strategy:
         """
         return all(ind.initialized for ind, _, _ in self._indicators)
 
-    def subscribe_bars(self, step: int, unit: str, *, brick_size: float = 0.0) -> int:
+    def subscribe_bars(
+        self,
+        step: int,
+        unit: str,
+        *,
+        brick_size: float = 0.0,
+        label: str = "open",
+    ) -> int:
         """Subscribe to bars aggregated from the primary stream.
 
         Call from ``on_start``. Completed bars arrive via
@@ -322,13 +329,21 @@ class Strategy:
         bar's ``stream_id``. Units: time (``"ms"``/``"s"``/``"m"``/``"h"``/
         ``"d"``/``"w"``), ``"tick"``, ``"volume"``, ``"value"``.
 
+        ``label`` states which end of its period a *primary* bar's timestamp
+        names — ``"open"`` (raw-provider convention, the default) or
+        ``"close"`` (the Nautilus convention). It decides only where a
+        primary bar landing exactly on a window boundary goes, but that is a
+        whole bar: feeding close-labelled minutes to the default leaves every
+        composite bar one minute short and closing on the wrong price, with
+        nothing malformed to notice.
+
         In a portfolio run one subscription yields one aggregated stream
         *per symbol*, each built only from that symbol's bars. The symbol
         that completed a bar arrives as ``bar.symbol`` (and ``ctx.symbol``).
         """
         if step < 1:
             raise ValueError("step must be >= 1")
-        self._bar_subscriptions.append((step, unit, brick_size))
+        self._bar_subscriptions.append((step, unit, brick_size, label))
         return len(self._bar_subscriptions) - 1
 
     def link_oco(self, *client_ids: str) -> None:

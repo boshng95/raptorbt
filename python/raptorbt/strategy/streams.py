@@ -20,15 +20,17 @@ from raptorbt.strategy.context import CompositeBar
 
 
 def enumerate_subscriptions(subscriptions):
-    """Yield ``(stream_id, (step, unit, brick_size))`` for each subscription.
+    """Yield ``(stream_id, (step, unit, brick_size, label))`` per subscription.
 
-    Subscriptions are stored as 2- or 3-tuples depending on whether a brick
-    size was given.
+    Subscriptions are stored as 2- to 4-tuples depending on which optional
+    arguments were given, so each missing tail element takes the default
+    :meth:`Strategy.subscribe_bars` would have applied.
     """
     for stream_id, sub in enumerate(subscriptions):
         step, unit = sub[0], sub[1]
         brick = sub[2] if len(sub) > 2 else 0.0
-        yield stream_id, (step, unit, brick)
+        label = sub[3] if len(sub) > 3 else "open"
+        yield stream_id, (step, unit, brick, label)
 
 
 class StreamState:
@@ -49,8 +51,13 @@ class StreamState:
             str | None, list[tuple[int, int, str, BarAggregator]]
         ] = {
             key: [
-                (stream_id, step, unit, BarAggregator(step, unit, brick_size=brick))
-                for stream_id, (step, unit, brick) in enumerate_subscriptions(
+                (
+                    stream_id,
+                    step,
+                    unit,
+                    BarAggregator(step, unit, brick_size=brick, label=label),
+                )
+                for stream_id, (step, unit, brick, label) in enumerate_subscriptions(
                     subscriptions
                 )
             ]
@@ -112,8 +119,11 @@ class StreamState:
     ) -> None:
         """Dispatch a completed bar and everything queued behind it.
 
-        Renko completes several bricks from one record; ``push`` returns
-        only the first, so the rest must be drained or they are lost.
+        One record can complete more than one bar: Renko prints several
+        bricks from a single large move, and a close-labelled record on a
+        window boundary closes both the window a data gap left open and its
+        own. ``push`` returns only the first, so the rest must be drained
+        or they are lost.
         """
         while completed is not None:
             bar = CompositeBar(stream_id, step, unit, *completed, symbol=symbol)

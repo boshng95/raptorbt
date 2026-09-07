@@ -61,6 +61,7 @@ fn generate_sample_signals(
         exits,
         position_sizes: None,
         direction: Direction::Long,
+        entry_directions: None,
         weight: 1.0,
     }
 }

@@ -432,6 +432,7 @@ mod tests {
             exits,
             position_sizes: None,
             direction: Direction::Long,
+            entry_directions: None,
             weight: 1.0,
         }
     }

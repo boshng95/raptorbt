@@ -103,6 +103,73 @@ impl SignalProcessor {
         (clean_entries, clean_exits)
     }
 
+    /// Clean entry/exit signals whose entries name their own direction.
+    ///
+    /// This is [`Self::clean_signals`] for a two-sided run. It keeps that
+    /// method's alternation rules and adds the one case a single-sided run
+    /// cannot express: an entry arriving against the open position's
+    /// direction is a **reversal**, and closes the position and opens the
+    /// other side on the same bar rather than being ignored as a duplicate
+    /// entry. That is what a stop-and-reverse strategy does, and what the
+    /// kernel's own step order already allows -- an exit and a re-entry may
+    /// both land on one bar.
+    ///
+    /// `directions` carries `1`/`-1` per bar and is read only where `entries`
+    /// is set; a bar whose direction names neither side takes `fallback`, so
+    /// a caller that leaves the array zeroed gets `clean_signals` back.
+    ///
+    /// Returns the cleaned entries, the cleaned exits, and the direction each
+    /// surviving entry opens in.
+    pub fn clean_signals_signed(
+        &self,
+        entries: &[bool],
+        exits: &[bool],
+        directions: &[i8],
+        fallback: Direction,
+    ) -> (Vec<bool>, Vec<bool>, Vec<i8>) {
+        let n = entries.len();
+        assert_eq!(n, exits.len(), "Entry and exit arrays must have same length");
+        assert_eq!(n, directions.len(), "Entry and direction arrays must have same length");
+
+        let mut clean_entries = vec![false; n];
+        let mut clean_exits = vec![false; n];
+        let mut clean_directions = vec![0i8; n];
+
+        let mut held: Option<Direction> = None;
+
+        for i in 0..n {
+            let wanted = Direction::from_int(i32::from(directions[i])).unwrap_or(fallback);
+            match held {
+                None => {
+                    // Flat: an entry opens, and an exit has nothing to close.
+                    if entries[i] {
+                        clean_entries[i] = true;
+                        clean_directions[i] = wanted as i8;
+                        held = Some(wanted);
+                    }
+                }
+                Some(open) if entries[i] && wanted != open => {
+                    // Reversal: close this side and open the other, on one bar.
+                    clean_exits[i] = true;
+                    clean_entries[i] = true;
+                    clean_directions[i] = wanted as i8;
+                    held = Some(wanted);
+                }
+                Some(_) => {
+                    // Same-side entry keeps the position, exactly as
+                    // `clean_signals` does -- including when an exit shares
+                    // the bar, where the entry still takes priority.
+                    if exits[i] && !entries[i] {
+                        clean_exits[i] = true;
+                        held = None;
+                    }
+                }
+            }
+        }
+
+        (clean_entries, clean_exits, clean_directions)
+    }
+
     /// Clean signals with direction awareness (for strategies that can go long/short).
     ///
     /// # Arguments
@@ -426,5 +493,99 @@ mod tests {
         assert!(combined[1]); // true || false
         assert!(combined[2]); // false || true
         assert!(!combined[3]); // false || false
+    }
+
+    // ------------------------------------------------------------------
+    // Two-sided signal cleaning
+    //
+    // The rule these pin down: an entry against the open position is a
+    // reversal and lands on one bar, while everything else behaves exactly
+    // as the single-sided cleaner does.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn signed_cleaning_opens_in_the_direction_the_bar_names() {
+        let processor = SignalProcessor::new();
+        let (entries, exits, directions) = processor.clean_signals_signed(
+            &[true, false, false],
+            &[false, false, true],
+            &[-1, 0, 0],
+            Direction::Long,
+        );
+        assert_eq!(entries, vec![true, false, false]);
+        assert_eq!(exits, vec![false, false, true]);
+        assert_eq!(directions, vec![-1, 0, 0]);
+    }
+
+    #[test]
+    fn signed_cleaning_reverses_on_one_bar() {
+        let processor = SignalProcessor::new();
+        let (entries, exits, directions) = processor.clean_signals_signed(
+            &[true, true, false],
+            &[false, false, true],
+            &[1, -1, 0],
+            Direction::Long,
+        );
+        // Bar 1 both closes the long and opens the short.
+        assert_eq!(entries, vec![true, true, false]);
+        assert_eq!(exits, vec![false, true, true]);
+        assert_eq!(directions, vec![1, -1, 0]);
+    }
+
+    #[test]
+    fn signed_cleaning_ignores_a_same_side_entry() {
+        let processor = SignalProcessor::new();
+        let (entries, exits, _) = processor.clean_signals_signed(
+            &[true, true, false],
+            &[false, false, true],
+            &[-1, -1, 0],
+            Direction::Long,
+        );
+        assert_eq!(entries, vec![true, false, false]);
+        assert_eq!(exits, vec![false, false, true]);
+    }
+
+    #[test]
+    fn signed_cleaning_lets_a_same_side_entry_outrank_its_bar_s_exit() {
+        let processor = SignalProcessor::new();
+        let (entries, exits, _) = processor.clean_signals_signed(
+            &[true, true, false],
+            &[false, true, true],
+            &[1, 1, 0],
+            Direction::Long,
+        );
+        // Exactly `clean_signals`: the bar-1 exit is dropped, not taken.
+        assert_eq!(entries, vec![true, false, false]);
+        assert_eq!(exits, vec![false, false, true]);
+    }
+
+    #[test]
+    fn signed_cleaning_falls_back_to_the_run_direction() {
+        let processor = SignalProcessor::new();
+        let (entries, exits, directions) = processor.clean_signals_signed(
+            &[true, false, false],
+            &[false, false, true],
+            &[0, 0, 0],
+            Direction::Short,
+        );
+        assert_eq!(directions, vec![-1, 0, 0]);
+        // And the alternation is the single-sided cleaner's, unchanged.
+        let (plain_entries, plain_exits) =
+            processor.clean_signals(&[true, false, false], &[false, false, true]);
+        assert_eq!(entries, plain_entries);
+        assert_eq!(exits, plain_exits);
+    }
+
+    #[test]
+    fn signed_cleaning_ignores_an_exit_taken_while_flat() {
+        let processor = SignalProcessor::new();
+        let (entries, exits, _) = processor.clean_signals_signed(
+            &[false, true],
+            &[true, false],
+            &[0, -1],
+            Direction::Long,
+        );
+        assert_eq!(entries, vec![false, true]);
+        assert_eq!(exits, vec![false, false]);
     }
 }

@@ -197,6 +197,7 @@ impl MultiStrategyBacktest {
             position_sizes: None,
             direction,
             weight: 1.0,
+            entry_directions: None,
         };
 
         // Run single backtest with combined signals
@@ -343,6 +344,7 @@ mod tests {
             position_sizes: None,
             direction: Direction::Long,
             weight: 1.0,
+            entry_directions: None,
         };
 
         let signals2 = CompiledSignals {
@@ -352,6 +354,7 @@ mod tests {
             position_sizes: None,
             direction: Direction::Long,
             weight: 1.0,
+            entry_directions: None,
         };
 
         (ohlcv, vec![signals1, signals2])

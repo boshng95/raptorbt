@@ -211,6 +211,16 @@ pub struct CompiledSignals {
     pub position_sizes: Option<Vec<f64>>,
     /// Trading direction.
     pub direction: Direction,
+    /// Per-bar direction for signal entries, when the run is two-sided.
+    ///
+    /// `direction` alone can only say which side *every* position in a run
+    /// takes, which is enough for a strategy that is long-only or short-only
+    /// and not enough for one that reverses. `Some(v)` opens bar `i`'s entry
+    /// in `v[i]`'s direction (`1` long, `-1` short); anything else on a bar --
+    /// a zero, a value past the end, or no entry at all -- leaves the
+    /// run-level `direction` in force, so a run that never sets this behaves
+    /// exactly as it did before.
+    pub entry_directions: Option<Vec<i8>>,
     /// Weight for portfolio allocation.
     pub weight: f64,
 }
@@ -224,13 +234,46 @@ impl CompiledSignals {
         direction: Direction,
         weight: f64,
     ) -> Self {
-        Self { symbol, entries, exits, position_sizes: None, direction, weight }
+        Self {
+            symbol,
+            entries,
+            exits,
+            position_sizes: None,
+            direction,
+            entry_directions: None,
+            weight,
+        }
     }
 
     /// Set position sizes.
     pub fn with_position_sizes(mut self, sizes: Vec<f64>) -> Self {
         self.position_sizes = Some(sizes);
         self
+    }
+
+    /// Set the per-bar entry directions that make the run two-sided.
+    pub fn with_entry_directions(mut self, directions: Vec<i8>) -> Self {
+        self.entry_directions = Some(directions);
+        self
+    }
+
+    /// The direction bar `idx`'s entry opens in.
+    ///
+    /// Falls back to the run-level [`Self::direction`] whenever the per-bar
+    /// array is absent, short, or carries a value that names no direction.
+    #[inline]
+    pub fn entry_direction(&self, idx: usize) -> Direction {
+        self.entry_directions
+            .as_ref()
+            .and_then(|directions| directions.get(idx).copied())
+            .and_then(|value| Direction::from_int(i32::from(value)))
+            .unwrap_or(self.direction)
+    }
+
+    /// Whether this run can hold positions on both sides.
+    #[inline]
+    pub fn is_two_sided(&self) -> bool {
+        self.entry_directions.is_some()
     }
 
     /// Get the number of bars.
@@ -398,6 +441,8 @@ pub enum FillTiming {
 /// Backtest configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BacktestConfig {
+    /// Retain full curves in the completed result after exact metric computation.
+    pub retain_curves: bool,
     /// Initial capital.
     pub initial_capital: f64,
     /// Transaction fees as fraction (0.001 = 0.1%).
@@ -607,6 +652,7 @@ fn default_one() -> f64 {
 impl Default for BacktestConfig {
     fn default() -> Self {
         Self {
+            retain_curves: true,
             initial_capital: 100_000.0,
             fees: 0.001,
             fee_per_share: 0.0,

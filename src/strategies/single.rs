@@ -99,6 +99,7 @@ impl SingleBacktest {
             position_sizes: None,
             direction: dir,
             weight: 1.0,
+            entry_directions: None,
         };
 
         self.run(&ohlcv, &signals)
@@ -169,6 +170,7 @@ mod tests {
             position_sizes: None,
             direction: Direction::Long,
             weight: 1.0,
+            entry_directions: None,
         };
 
         (ohlcv, signals)

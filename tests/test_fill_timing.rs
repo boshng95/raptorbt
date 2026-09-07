@@ -49,6 +49,7 @@ fn signals(n: usize, entry_at: usize, exit_at: Option<usize>) -> CompiledSignals
         exits,
         position_sizes: None,
         direction: Direction::Long,
+        entry_directions: None,
         weight: 1.0,
     }
 }

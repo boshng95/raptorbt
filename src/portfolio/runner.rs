@@ -172,6 +172,34 @@ impl SingleRunner {
         events
     }
 
+    /// Settle resting orders off-schedule, at `ts_now`.
+    ///
+    /// A venue walks its books every time it drains a batch of commands, not
+    /// only when a bar arrives. A driver that steps once per bar therefore
+    /// under-fills an order the strategy placed on hearing that bar's own
+    /// fills: it would sit until the next bar and fill against a range the
+    /// strategy never saw. This is the single-instrument counterpart of
+    /// [`PortfolioSession::walk_book`], and the same phase of the step: only
+    /// resting orders are matched, against the last bar this runner stepped,
+    /// dated to the instant of the walk.
+    ///
+    /// No equity point is sampled, because no bar arrived. The next `step`
+    /// marks the position these fills opened or closed.
+    pub fn walk_book(&mut self, ts_now: i64) -> Vec<EngineEvent> {
+        let Some((idx, last)) = self.last_bar else { return Vec::new() };
+        let bar = KernelBar { timestamp: ts_now, ..last };
+        let events = self.kernel.walk_book(idx, &bar);
+
+        for event in &events {
+            if let EngineEvent::Exited { trade, .. } = event {
+                self.streaming.update(trade.return_pct / 100.0);
+                self.trades.push(trade.clone());
+            }
+        }
+
+        events
+    }
+
     /// Force-close any open position and compute final metrics.
     /// Fold one fill slice onto the order's record.
     ///
@@ -256,6 +284,12 @@ impl SingleRunner {
             &self.timestamps,
             &self.config,
         );
+
+        if !self.config.retain_curves {
+            self.equity_curve = Vec::new();
+            self.drawdown_curve = Vec::new();
+            self.returns = Vec::new();
+        }
 
         BacktestResult::new(
             metrics,

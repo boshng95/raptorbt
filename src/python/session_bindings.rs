@@ -122,12 +122,16 @@ impl PyPortfolioSession {
         close: PyReadonlyArray1<f64>,
         volume: PyReadonlyArray1<f64>,
     ) -> PyResult<()> {
-        let ts = numpy_to_vec_i64(timestamps);
-        let o = numpy_to_vec_f64(open);
-        let h = numpy_to_vec_f64(high);
-        let l = numpy_to_vec_f64(low);
-        let c = numpy_to_vec_f64(close);
-        let v = numpy_to_vec_f64(volume);
+        // Borrow NumPy while building the one owned native representation.
+        let ts = timestamps
+            .as_slice()
+            .map_err(|_| PyValueError::new_err("timestamps must be contiguous"))?;
+        let o = open.as_slice().map_err(|_| PyValueError::new_err("open must be contiguous"))?;
+        let h = high.as_slice().map_err(|_| PyValueError::new_err("high must be contiguous"))?;
+        let l = low.as_slice().map_err(|_| PyValueError::new_err("low must be contiguous"))?;
+        let c = close.as_slice().map_err(|_| PyValueError::new_err("close must be contiguous"))?;
+        let v =
+            volume.as_slice().map_err(|_| PyValueError::new_err("volume must be contiguous"))?;
         let n = ts.len();
         if [o.len(), h.len(), l.len(), c.len(), v.len()].iter().any(|&len| len != n) {
             return Err(PyValueError::new_err("all bar arrays must share one length"));
@@ -469,6 +473,9 @@ impl PyPortfolioSession {
             size_mult,
             stop_price_override: stop_price,
             target_price_override: target_price,
+            // The class-strategy contract opens through the order API, whose
+            // own side names the direction; the signal field stays unused.
+            entry_direction: None,
         };
         Ok(self.session_mut()?.apply_current(input).into_iter().map(PyEngineEvent::from).collect())
     }

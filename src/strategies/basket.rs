@@ -522,6 +522,7 @@ mod tests {
             position_sizes: None,
             direction: Direction::Long,
             weight: 1.0,
+            entry_directions: None,
         };
 
         let signals2 = CompiledSignals {
@@ -531,6 +532,7 @@ mod tests {
             position_sizes: None,
             direction: Direction::Long,
             weight: 1.0,
+            entry_directions: None,
         };
 
         vec![(ohlcv1, signals1), (ohlcv2, signals2)]

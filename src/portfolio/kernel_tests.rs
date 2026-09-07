@@ -98,8 +98,14 @@ fn declared_currency_precision_quantizes_crypto_fees_and_pnl() {
     }
 }
 
+/// Cash settles to the currency's precision; a mark does not.
+///
+/// Every amount reaching the account is money and is quantized as it is
+/// booked, so a flat account's equity is already on the grid. What must
+/// not be rounded is the mark on an open position: it is a valuation, not
+/// a payment, and the reference account reports it whole.
 #[test]
-fn declared_currency_precision_quantizes_cash_and_equity_to_cents() {
+fn declared_currency_precision_settles_cash_to_cents_and_leaves_a_mark_whole() {
     let config = BacktestConfig { fees: 0.00088, fee_minimum: 6.60, ..BacktestConfig::default() };
     let fee_model = config.fee_model();
     let instrument = InstrumentConfig {
@@ -119,6 +125,26 @@ fn declared_currency_precision_quantizes_cash_and_equity_to_cents() {
     kernel.set_cash(10_117.7602928);
     assert_eq!(kernel.cash(), 10_117.76);
     assert_eq!(kernel.equity(150.123456), 10_117.76);
+
+    // With something open, the mark rides on top of that settled cash at
+    // full precision: 7 units at 150.123456 against a 150.00 entry is
+    // 0.864192 of unrealized, and rounding it to 0.86 would leave the
+    // balance a third of a cent short of the account it is compared with.
+    kernel.open_at(
+        0,
+        &bar(0, 150.0),
+        Direction::Long,
+        150.0,
+        None,
+        Some(7.0),
+        0.0,
+        None,
+        None,
+        FillTerms::WHOLE,
+    );
+    let expected = kernel.cash() + 7.0 * 150.123456;
+    assert_eq!(kernel.equity(150.123456), expected);
+    assert_ne!(expected, (expected * 100.0).round() / 100.0);
 }
 
 /// A kernel whose instrument settles in cents, as a listed equity does.
@@ -2763,6 +2789,99 @@ fn next_bar_open_market_order_fills_at_the_next_bars_open() {
         assert!(filled, "tif {tif:?}: expected a fill at 104.0 on bar 1, got {events:?}");
         assert!(kernel.is_in_position());
     }
+}
+
+/// A market order that arrives after its bar's step is swept by the walk.
+///
+/// Nothing else can reach it. The step that owns the bar swept the market
+/// orders it could see and it ran before this one existed; every later step
+/// sweeps only orders stamped with its own index. A walk that matched
+/// resting limits alone therefore did not fill such an order late -- it
+/// never filled it at all, and the position it was meant to close stayed
+/// open for the rest of the run.
+#[test]
+fn a_market_order_arriving_after_the_step_is_swept_by_the_walk() {
+    let mut kernel = make_kernel();
+    kernel.set_cash(10_000.0);
+    kernel.step(0, &bar(0, 100.0), StepInput::default());
+
+    // Placed on hearing bar 0's fills, so it carries bar 0's index but
+    // reaches the venue after bar 0's sweep.
+    kernel.submit_order(
+        OrderSide::Buy,
+        QtySpec::Units(10.0),
+        OrderKind::Market,
+        TimeInForce::Gtc,
+        0,
+        0,
+        "after-the-step".to_string(),
+        None,
+        None,
+    );
+
+    let events = kernel.walk_book(0, &bar(0, 100.0));
+
+    assert!(
+        events.iter().any(|e| matches!(e, EngineEvent::OrderAccepted { .. })),
+        "the sweep acknowledges it, since submission did not: {events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, EngineEvent::OrderFilled { price, .. } if *price == 100.0)),
+        "it crosses the book bar 0 left showing: {events:?}"
+    );
+    assert!(kernel.is_in_position());
+}
+
+/// Under NextBarOpen the next step does reach it, and deferral is the rule
+/// that says it fills there -- so the walk must leave it alone.
+#[test]
+fn a_deferred_market_order_is_not_swept_by_the_walk() {
+    let config = BacktestConfig {
+        fill_timing: Some(FillTiming::NextBarOpen),
+        fees: 0.0,
+        ..BacktestConfig::default()
+    };
+    let fee_model = config.fee_model();
+    let mut kernel = EngineKernel::new(
+        config,
+        fee_model,
+        SlippageModel::None,
+        FillPrice::Open,
+        "TEST".to_string(),
+        Direction::Long,
+        None,
+    );
+    kernel.set_cash(10_000.0);
+    kernel.step(0, &bar(0, 100.0), StepInput::default());
+    kernel.submit_order(
+        OrderSide::Buy,
+        QtySpec::Units(10.0),
+        OrderKind::Market,
+        TimeInForce::Gtc,
+        0,
+        0,
+        "deferred".to_string(),
+        None,
+        None,
+    );
+
+    assert!(kernel
+        .walk_book(0, &bar(0, 100.0))
+        .iter()
+        .all(|e| !matches!(e, EngineEvent::OrderFilled { .. })));
+    assert!(!kernel.is_in_position());
+
+    let mut fill_bar = bar(1, 110.0);
+    fill_bar.open = 104.0;
+    let events = kernel.step(1, &fill_bar, StepInput::default());
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, EngineEvent::OrderFilled { price, .. } if *price == 104.0)),
+        "it still fills at the next bar's open: {events:?}"
+    );
 }
 
 /// Settle one round trip, taking the exit off in the given pieces, and

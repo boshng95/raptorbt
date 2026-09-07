@@ -45,7 +45,8 @@ impl Ord for Entry {
 /// K-way merge over owned, individually time-sorted event streams.
 #[derive(Default)]
 pub struct EventFeed {
-    streams: Vec<std::vec::IntoIter<MarketEvent>>,
+    streams: Vec<Box<dyn Iterator<Item = MarketEvent> + Send>>,
+    remaining: usize,
     heap: BinaryHeap<Entry>,
     cursors: Vec<usize>,
     primed: bool,
@@ -65,10 +66,27 @@ impl EventFeed {
             events.windows(2).all(|w| w[0].timestamp() <= w[1].timestamp()),
             "stream must be time-sorted"
         );
+        self.add_iter(events.into_iter())
+    }
+
+    /// Own the source iterator and materialize only the heap's current heads.
+    pub fn add_iter(
+        &mut self,
+        events: impl ExactSizeIterator<Item = MarketEvent> + Send + 'static,
+    ) -> usize {
+        self.remaining += events.len();
         let slot = self.streams.len();
-        self.streams.push(events.into_iter());
+        self.streams.push(Box::new(events));
         self.cursors.push(0);
         slot
+    }
+
+    pub fn len(&self) -> usize {
+        self.remaining
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.remaining == 0
     }
 
     fn prime(&mut self) {
@@ -95,6 +113,7 @@ impl Iterator for EventFeed {
             self.prime();
         }
         let entry = self.heap.pop()?;
+        self.remaining -= 1;
         self.advance(entry.stream_slot);
         Some(entry.event)
     }
