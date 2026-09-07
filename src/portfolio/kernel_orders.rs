@@ -1018,7 +1018,6 @@ impl EngineKernel {
         });
     }
 
-
     /// Contingency consequences of a fill: activate held one-triggers-other
     /// children, then cancel one-cancels-other siblings.
     fn after_fill(&mut self, idx: usize, filled_id: u64, events: &mut Vec<EngineEvent>) {

@@ -1448,8 +1448,7 @@ impl EngineKernel {
             // invisible to prints before it reaches the venue.
             (false, StepMode::Trade) => {
                 o.submitted_idx <= idx
-                    && bar.timestamp
-                        >= o.submitted_ts.saturating_add(self.config.order_latency_ns)
+                    && bar.timestamp >= o.submitted_ts.saturating_add(self.config.order_latency_ns)
             }
             (false, StepMode::Bar) => o.submitted_idx == idx,
         });
@@ -2102,7 +2101,6 @@ impl EngineKernel {
             None => size,
         }
     }
-
 
     /// Force-close every position on a margin call.
     ///

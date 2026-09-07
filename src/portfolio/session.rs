@@ -869,6 +869,10 @@ impl EventSession {
         kernel.set_cash(0.0);
         kernel.set_external_open_count(None);
         self.account.reconcile(delta_cash, delta_locked);
+        // A walk is a fill path like any other: a leg opened or closed here
+        // changes what the option groups hold, so the group requirement is
+        // re-priced on the same terms as the step path.
+        self.regroup_option_margin();
 
         if events.iter().any(|e| matches!(e, EngineEvent::MarginCall { .. })) {
             self.halt_all(self.cursor, HaltCause::MarginCall);
