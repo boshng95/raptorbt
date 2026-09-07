@@ -28,6 +28,8 @@ _Instrument = tuple[_I64, _F64, _F64, _F64, _F64, _F64, _Bool, _Bool, int, float
 
 class BacktestConfig:
     retain_curves: bool
+    retain_daily_performance: bool
+    performance_tz_transitions: list[tuple[int, int]]
     initial_capital: float
     fees: float
     fee_per_share: float
@@ -97,6 +99,9 @@ class BacktestConfig:
         fee_per_share: float = ...,
         fee_minimum: float = ...,
         fee_max_pct: float = ...,
+        retain_curves: bool = ...,
+        retain_daily_performance: bool = ...,
+        performance_tz_transitions: Sequence[tuple[int, int]] = ...,
     ) -> None: ...
     def set_fixed_stop(self, percent: float) -> None: ...
     def set_atr_stop(self, multiplier: float, period: int) -> None: ...
@@ -321,6 +326,8 @@ class BacktestResult:
     # filled. Empty for a run that placed no typed orders.
     def orders(self) -> list[Order]: ...
     def returns(self) -> npt.NDArray[np.float64]: ...
+    def daily_performance_timestamps(self) -> _I64: ...
+    def daily_performance_equity(self) -> _F64: ...
 
 class InstrumentSummary:
     symbol: str

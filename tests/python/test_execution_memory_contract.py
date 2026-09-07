@@ -58,3 +58,23 @@ def test_discarding_output_curves_preserves_trades_and_metrics_exactly():
     for field in ('total_return_pct', 'sharpe_ratio', 'sortino_ratio', 'max_drawdown_pct',
                   'win_rate_pct', 'total_trades', 'total_fees_paid', 'expectancy', 'exposure_pct'):
         np.testing.assert_equal(getattr(a.metrics, field), getattr(b.metrics, field))
+
+
+def test_daily_performance_is_opt_in_and_retains_one_settled_mark_per_day():
+    day = 86_400_000_000_000
+    data = _bars([100.0, 110.0, 105.0, 106.0])
+    data["timestamps"] = np.array([0, 1, day, day + 1], dtype=np.int64)
+    default = BacktestConfig(retain_curves=False)
+    compact = BacktestConfig(
+        retain_curves=False,
+        retain_daily_performance=True,
+        performance_tz_transitions=[(-1, 0)],
+    )
+    absent = run_strategy_backtest(RoundTrip(), **data, config=default)
+    retained = run_strategy_backtest(RoundTrip(), **data, config=compact)
+    assert absent.daily_performance_timestamps().size == 0
+    np.testing.assert_array_equal(
+        retained.daily_performance_timestamps(), np.array([1, day + 1])
+    )
+    assert retained.daily_performance_equity().size == 2
+    assert retained.daily_performance_equity()[-1] == retained.metrics.end_value

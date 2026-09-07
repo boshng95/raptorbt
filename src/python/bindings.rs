@@ -74,6 +74,12 @@ use super::numpy_bridge::*;
 pub struct PyBacktestConfig {
     #[pyo3(get, set)]
     pub retain_curves: bool,
+    /// Retain one exchange-local end-of-day net-liquidation point.
+    #[pyo3(get, set)]
+    pub retain_daily_performance: bool,
+    /// `(effective_utc_ns, offset_ns)` timezone transition schedule.
+    #[pyo3(get, set)]
+    pub performance_tz_transitions: Vec<(i64, i64)>,
     #[pyo3(get, set)]
     pub initial_capital: f64,
     #[pyo3(get, set)]
@@ -212,6 +218,8 @@ impl PyBacktestConfig {
         fee_minimum=0.0,
         fee_max_pct=0.0,
         retain_curves=true,
+        retain_daily_performance=false,
+        performance_tz_transitions=Vec::new(),
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -245,11 +253,15 @@ impl PyBacktestConfig {
         fee_minimum: f64,
         fee_max_pct: f64,
         retain_curves: bool,
+        retain_daily_performance: bool,
+        performance_tz_transitions: Vec<(i64, i64)>,
     ) -> PyResult<Self> {
         let squareoff_time_minutes = parse_squareoff_time(squareoff_time.as_deref())?;
         let fill_timing = parse_fill_timing(fill_timing.as_deref())?;
         Ok(Self {
             retain_curves,
+            retain_daily_performance,
+            performance_tz_transitions,
             initial_capital,
             fees,
             fee_per_share,
@@ -386,6 +398,8 @@ impl From<&PyBacktestConfig> for BacktestConfig {
     fn from(py_config: &PyBacktestConfig) -> Self {
         BacktestConfig {
             retain_curves: py_config.retain_curves,
+            retain_daily_performance: py_config.retain_daily_performance,
+            performance_tz_transitions: py_config.performance_tz_transitions.clone(),
             initial_capital: py_config.initial_capital,
             fees: py_config.fees,
             fee_per_share: py_config.fee_per_share,
@@ -1016,6 +1030,8 @@ pub struct PyBacktestResult {
     trades: Vec<PyTrade>,
     returns: Vec<f64>,
     orders: Vec<PyOrder>,
+    daily_performance_timestamps: Vec<i64>,
+    daily_performance_equity: Vec<f64>,
 }
 
 #[pymethods]
@@ -1033,6 +1049,16 @@ impl PyBacktestResult {
     /// Get returns as numpy array.
     fn returns<'py>(&self, py: Python<'py>) -> &'py PyArray1<f64> {
         vec_to_numpy_f64(py, self.returns.clone())
+    }
+
+    /// UTC timestamps for compact exchange-local end-of-day marks.
+    fn daily_performance_timestamps<'py>(&self, py: Python<'py>) -> &'py PyArray1<i64> {
+        vec_to_numpy_i64(py, self.daily_performance_timestamps.clone())
+    }
+
+    /// Net-liquidation values for compact exchange-local end-of-day marks.
+    fn daily_performance_equity<'py>(&self, py: Python<'py>) -> &'py PyArray1<f64> {
+        vec_to_numpy_f64(py, self.daily_performance_equity.clone())
     }
 
     /// Get list of trades.
@@ -2729,6 +2755,8 @@ pub(crate) fn convert_trade(t: crate::core::types::Trade) -> PyTrade {
 
 /// Convert Rust BacktestResult to Python PyBacktestResult.
 pub(crate) fn convert_result(result: crate::core::types::BacktestResult) -> PyBacktestResult {
+    let (daily_performance_timestamps, daily_performance_equity) =
+        result.daily_performance.map(|daily| (daily.timestamps, daily.equity)).unwrap_or_default();
     let metrics = PyBacktestMetrics {
         total_return_pct: result.metrics.total_return_pct,
         sharpe_ratio: result.metrics.sharpe_ratio,
@@ -2790,5 +2818,7 @@ pub(crate) fn convert_result(result: crate::core::types::BacktestResult) -> PyBa
         trades,
         orders,
         returns: result.returns,
+        daily_performance_timestamps,
+        daily_performance_equity,
     }
 }

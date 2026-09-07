@@ -3,6 +3,7 @@
 pub mod decimals;
 pub mod error;
 pub mod lots;
+pub mod performance;
 pub mod session;
 pub mod timeseries;
 pub mod types;

@@ -27,6 +27,7 @@
 use std::collections::{HashMap, VecDeque};
 
 use crate::accounts::{AccountMode, SharedAccount};
+use crate::core::performance::DailyPerformanceCollector;
 use crate::core::types::OhlcvBar;
 use crate::core::types::TickData;
 use crate::core::types::{
@@ -163,6 +164,7 @@ pub struct EventSession {
     streaming: StreamingMetrics,
     peak_equity: f64,
     sealed: bool,
+    daily_performance_transitions: Option<Vec<(i64, i64)>>,
 }
 
 impl EventSession {
@@ -176,6 +178,8 @@ impl EventSession {
     /// margin mode, one pool of locked initial margin.
     pub fn with_account(config: BacktestConfig, mode: AccountMode) -> Self {
         let pool = config.initial_capital;
+        let daily_performance_transitions =
+            config.retain_daily_performance.then(|| config.performance_tz_transitions.clone());
         Self {
             config,
             kernels: Vec::new(),
@@ -202,6 +206,7 @@ impl EventSession {
             streaming: StreamingMetrics::new(),
             peak_equity: pool,
             sealed: false,
+            daily_performance_transitions,
         }
     }
 
@@ -950,6 +955,15 @@ impl EventSession {
         let halted = self.account.is_halted() || self.kernels.iter().any(|k| k.risk_halted());
         let halted_at = self.account.halted_at();
 
+        let daily_performance = self.daily_performance_transitions.take().map(|transitions| {
+            let mut collector = DailyPerformanceCollector::new(transitions);
+            for (&timestamp, &equity) in self.timestamps.iter().zip(&self.equity_curve) {
+                collector.observe(timestamp, equity);
+            }
+            collector.reconcile_final(self.account.balance());
+            collector.finish()
+        });
+
         if !self.config.retain_curves {
             self.equity_curve = Vec::new();
             self.drawdown_curve = Vec::new();
@@ -962,7 +976,8 @@ impl EventSession {
             self.drawdown_curve,
             self.trades,
             self.returns,
-        );
+        )
+        .with_daily_performance(daily_performance);
         SessionOutcome { result, instruments: outcomes, rejected_entries, halted, halted_at }
     }
 }

@@ -9,6 +9,7 @@
 
 use std::collections::HashMap;
 
+use crate::core::performance::DailyPerformanceCollector;
 use crate::core::types::{BacktestConfig, BacktestResult, Direction, InstrumentConfig, Trade};
 use crate::execution::orders::OrderRecord;
 use crate::execution::{FeeModel, FillPrice, SlippageModel};
@@ -38,6 +39,7 @@ pub struct SingleRunner {
     streaming: StreamingMetrics,
     peak_equity: f64,
     last_bar: Option<(usize, KernelBar)>,
+    daily_performance_transitions: Option<Vec<(i64, i64)>>,
 }
 
 impl SingleRunner {
@@ -65,6 +67,8 @@ impl SingleRunner {
         )
         .with_risk_gate(risk);
 
+        let daily_performance_transitions =
+            config.retain_daily_performance.then(|| config.performance_tz_transitions.clone());
         Self {
             kernel,
             config,
@@ -77,6 +81,7 @@ impl SingleRunner {
             streaming: StreamingMetrics::new(),
             peak_equity: initial_capital,
             last_bar: None,
+            daily_performance_transitions,
         }
     }
 
@@ -275,6 +280,9 @@ impl SingleRunner {
 
         // Built before the result takes ownership of the parts.
         let order_log = self.order_log();
+        let final_equity = self
+            .last_bar
+            .map_or(self.config.initial_capital, |(_, bar)| self.kernel.equity(bar.close));
 
         let metrics = compute_backtest_metrics_with_config(
             &self.equity_curve,
@@ -284,6 +292,15 @@ impl SingleRunner {
             &self.timestamps,
             &self.config,
         );
+
+        let daily_performance = self.daily_performance_transitions.take().map(|transitions| {
+            let mut collector = DailyPerformanceCollector::new(transitions);
+            for (&timestamp, &equity) in self.timestamps.iter().zip(&self.equity_curve) {
+                collector.observe(timestamp, equity);
+            }
+            collector.reconcile_final(final_equity);
+            collector.finish()
+        });
 
         if !self.config.retain_curves {
             self.equity_curve = Vec::new();
@@ -299,6 +316,7 @@ impl SingleRunner {
             self.returns,
         )
         .with_orders(order_log)
+        .with_daily_performance(daily_performance)
     }
 
     /// Mark-to-market equity after the most recent step, or initial capital

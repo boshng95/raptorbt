@@ -110,6 +110,26 @@ class TestPortfolioModifyOrder:
         assert len(result.result.trades()) == 1
 
 
+def test_portfolio_daily_performance_compacts_the_merged_stream():
+    day = 86_400_000_000_000
+    config = _zero_fee_config(
+        retain_curves=False,
+        retain_daily_performance=True,
+        performance_tz_transitions=[(-1, 0)],
+    )
+    data = {
+        "AAA": _bars([100.0, 101.0], step=day),
+        "BBB": _bars([50.0, 51.0], start_ts=1_000, step=day),
+    }
+    result = run_portfolio_strategy(Strategy(), data, config=config).result
+    np.testing.assert_array_equal(
+        result.daily_performance_timestamps(),
+        np.array([1_000, day + 1_000], dtype=np.int64),
+    )
+    assert result.daily_performance_equity().size == 2
+    assert result.equity_curve().size == 0
+
+
 class TestPerSymbolIndicators:
     def test_indicators_are_isolated_per_symbol(self):
         """The headline: each symbol's SMA reflects only its own closes.

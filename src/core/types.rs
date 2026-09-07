@@ -443,6 +443,17 @@ pub enum FillTiming {
 pub struct BacktestConfig {
     /// Retain full curves in the completed result after exact metric computation.
     pub retain_curves: bool,
+    /// Retain one exchange-local end-of-day net-liquidation point.
+    ///
+    /// Disabled by default. Unlike `retain_curves`, memory grows with observed
+    /// trading days rather than bars.
+    #[serde(default)]
+    pub retain_daily_performance: bool,
+    /// Compact `(effective_utc_ns, offset_ns)` schedule used to identify the
+    /// exchange-local trading day, including daylight-saving transitions.
+    /// Empty means UTC.
+    #[serde(default)]
+    pub performance_tz_transitions: Vec<(i64, i64)>,
     /// Initial capital.
     pub initial_capital: f64,
     /// Transaction fees as fraction (0.001 = 0.1%).
@@ -653,6 +664,8 @@ impl Default for BacktestConfig {
     fn default() -> Self {
         Self {
             retain_curves: true,
+            retain_daily_performance: false,
+            performance_tz_transitions: Vec::new(),
             initial_capital: 100_000.0,
             fees: 0.001,
             fee_per_share: 0.0,
@@ -1042,6 +1055,15 @@ pub struct BacktestMetrics {
     pub mfe_capture_ratio: Option<f64>,
 }
 
+/// Compact daily performance data retained independently of full curves.
+#[derive(Debug, Clone, Default)]
+pub struct DailyPerformance {
+    /// UTC timestamp of the last observed mark in each exchange-local day.
+    pub timestamps: Vec<i64>,
+    /// Net-liquidation value at the corresponding timestamp.
+    pub equity: Vec<f64>,
+}
+
 /// Complete backtest result.
 #[derive(Debug, Clone)]
 pub struct BacktestResult {
@@ -1065,6 +1087,8 @@ pub struct BacktestResult {
     ///
     /// Empty for a run that placed no typed orders.
     pub orders: Vec<crate::execution::orders::OrderRecord>,
+    /// Compact exchange-local daily marks, when explicitly requested.
+    pub daily_performance: Option<DailyPerformance>,
 }
 
 impl BacktestResult {
@@ -1076,7 +1100,15 @@ impl BacktestResult {
         trades: Vec<Trade>,
         returns: Vec<f64>,
     ) -> Self {
-        Self { metrics, equity_curve, drawdown_curve, trades, returns, orders: Vec::new() }
+        Self {
+            metrics,
+            equity_curve,
+            drawdown_curve,
+            trades,
+            returns,
+            orders: Vec::new(),
+            daily_performance: None,
+        }
     }
 
     /// Attach the run's order log.
@@ -1088,6 +1120,13 @@ impl BacktestResult {
     /// does not track them".
     pub fn with_orders(mut self, orders: Vec<crate::execution::orders::OrderRecord>) -> Self {
         self.orders = orders;
+        self
+    }
+
+    /// Attach compact daily performance data without changing existing result
+    /// construction call sites.
+    pub fn with_daily_performance(mut self, daily_performance: Option<DailyPerformance>) -> Self {
+        self.daily_performance = daily_performance;
         self
     }
 }

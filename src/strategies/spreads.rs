@@ -537,6 +537,7 @@ impl SpreadBacktest {
             trades,
             returns,
             orders: Vec::new(),
+            daily_performance: None,
         }
     }
 
@@ -753,6 +754,7 @@ impl SpreadBacktest {
             // This path synthesises a result from leg P&L; it runs no
             // order book, so there are no orders to report.
             orders: Vec::new(),
+            daily_performance: None,
         }
     }
 }
