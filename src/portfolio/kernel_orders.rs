@@ -375,7 +375,7 @@ impl EngineKernel {
         // Nautilus does, and the difference is observable: it decides
         // whether an order ends the bar filled or one increment short.
         let offered = depth.cap();
-        let cap = match offered.is_finite() {
+        let mut cap = match offered.is_finite() {
             true => self.round_size(offered),
             false => offered,
         };
@@ -393,6 +393,17 @@ impl EngineKernel {
         let stop_attach = order.stop_price;
         let target_attach = order.target_price;
         let reduce_only = order.reduce_only;
+        // Upstream's `partial_fills` option slices explicit quantities and
+        // close-all orders only. Capital-fraction sizing still resolves and
+        // fills as one order unless the fork's independent bar-liquidity
+        // model was explicitly enabled.
+        if self.config.partial_fills
+            && self.stepping_trade
+            && !self.fill_model.bar_liquidity.is_bounded()
+            && matches!(qty, QtySpec::CapitalFrac(_))
+        {
+            cap = f64::INFINITY;
+        }
         // A fill taken from the book standing when the order reached the
         // venue happened at that instant, not when the bar it beat printed.
         // Anything the same order goes on to take from a print -- including
@@ -681,6 +692,9 @@ impl EngineKernel {
                         reason.as_str(),
                     );
                 }
+                _ if tif == TimeInForce::Fok => {
+                    self.expire_remainder(idx, id, tif, &client_id, events)
+                }
                 _ => reject(
                     &mut self.orders,
                     &mut self.risk,
@@ -732,7 +746,10 @@ impl EngineKernel {
                 (None, QtySpec::Units(units)) => units,
                 (None, QtySpec::CapitalFrac(_) | QtySpec::FullPosition) => open_size,
             };
-            let asked = match !reduce_only && requested > open_size {
+            let asked = match !reduce_only
+                && !(self.config.partial_fills && self.stepping_trade)
+                && requested > open_size
+            {
                 true => requested,
                 false => requested.min(open_size),
             };

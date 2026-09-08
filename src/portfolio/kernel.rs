@@ -18,11 +18,13 @@ use crate::core::types::{
 use crate::data::{DepthTick, OrderBook, QuoteTick, TradeTick};
 use crate::execution::algos::AlgoEngine;
 use crate::execution::fill::{FillDepth, FillRng, Tail};
-use crate::execution::orders::{MatchOutcome, OrderEngine, OrderKind, OrderStatus, TimeInForce};
+use crate::execution::orders::{
+    MatchOutcome, OrderEngine, OrderKind, OrderStatus, QtySpec, TimeInForce,
+};
 // Re-exported for `kernel_tests.rs`, which pulls this module in with `use
 // super::*`; the kernel itself does not name these types.
 #[cfg(test)]
-use crate::execution::orders::{OrderSide, QtySpec};
+use crate::execution::orders::OrderSide;
 use crate::execution::queue::QueueTracker;
 use crate::execution::{BarLiquidity, FeeModel, FillModel, FillPrice, SlippageModel};
 use crate::instruments::{InstrumentKind, InstrumentSpec};
@@ -1356,8 +1358,21 @@ impl EngineKernel {
         // after the position's own protective exits (stop > target > signal
         // keeps its priority) and before this bar's new signals.
         let ohlcv = bar.to_ohlcv_bar();
+        let tick_fill_model;
         let outcomes = match mode {
             StepMode::Bar => self.orders.match_bar(idx, &ohlcv, &self.fill_model),
+            StepMode::Trade if self.config.partial_fills => {
+                // Upstream's tick-path contract bounds an opt-in partial
+                // fill by the size of this individual print. This fork's
+                // fill engine expresses the same rule through its richer
+                // tape/liquidity model, while leaving bar execution and the
+                // default unlimited-depth path unchanged.
+                tick_fill_model = self
+                    .fill_model
+                    .clone()
+                    .with_bar_liquidity(BarLiquidity::VolumeShare { slices: 1.0 });
+                self.orders.match_trade(idx, &ohlcv, &tick_fill_model)
+            }
             StepMode::Trade => self.orders.match_trade(idx, &ohlcv, &self.fill_model),
         };
         for outcome in outcomes {
@@ -1508,13 +1523,18 @@ impl EngineKernel {
                 self.orders.get(id).map(|o| o.tif),
                 Some(TimeInForce::Ioc | TimeInForce::Fok)
             );
+            let slice_on_print = self.config.partial_fills
+                && self.stepping_trade
+                && self.orders.get(id).is_some_and(|order| {
+                    matches!(order.qty, QtySpec::Units(_) | QtySpec::FullPosition)
+                });
             // Submitted while this bar was observed, so the only thing
             // still ahead of it is the book the bar left showing -- which
             // is the closing print's size, or, on a bar that never left the
             // last traded price and so printed nothing, an older one.
             let depth = FillDepth::single(
                 self.orders.book_size(),
-                match immediate {
+                match immediate || slice_on_print {
                     true => Tail::Rests,
                     false => Tail::Sweep,
                 },
@@ -2039,14 +2059,17 @@ impl EngineKernel {
         let target_price = target_override.or(config_target.map(quantize));
 
         // Netting-with-averaging grows the position it already holds rather
-        // than opening a second one; the protective levels set at the first
-        // fill stand.
+        // than opening a second one. Protective levels ordinarily remain at
+        // the first fill; a resumed slice shifts derived levels with the
+        // new average below.
         // A netting-with-averaging run grows its single position on every
         // fill; a plain netting run only does so for an order finishing
         // what it already started, which is one position either way.
         let grows = self.ledger.policy() == PositionPolicy::NetAveraging
             || (terms.resuming && self.ledger.policy() != PositionPolicy::Independent);
         let existing = grows.then(|| self.ledger.first().map(|m| m.id)).flatten();
+        let previous_entry =
+            existing.and_then(|id| self.ledger.get(id).map(|managed| managed.position.entry_price));
         let position_id = match existing {
             Some(id) => {
                 let added = self.ledger.add_to_position(
@@ -2071,6 +2094,17 @@ impl EngineKernel {
                 entry_breakdown,
             )?,
         };
+        if terms.resuming && stop_override.is_none() && target_override.is_none() {
+            if let (Some(old_entry), Some(managed)) =
+                (previous_entry, self.ledger.get_mut(position_id))
+            {
+                let shift = managed.position.entry_price - old_entry;
+                managed.position.stop_price =
+                    managed.position.stop_price.map(|price| price + shift);
+                managed.position.target_price =
+                    managed.position.target_price.map(|price| price + shift);
+            }
+        }
         // `funding_cost` above already priced this entry under whichever
         // funding mode applies, in the evaluation order each mode requires.
         // Booking is the same act either way -- cash mode pays the notional
