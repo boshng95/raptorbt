@@ -1,6 +1,6 @@
 //! Order fill simulation models.
 
-use crate::core::lots::{floor_to_lot, snap_to_lot_grid};
+use crate::core::lots::LotGrid;
 use crate::core::types::{Direction, FillTiming, OhlcvBar, Price};
 
 /// Fill price model determining at what price orders are executed.
@@ -308,6 +308,21 @@ impl BarLiquidity {
         matches!(self, Self::VolumeShare { .. })
     }
 
+    /// Whether [`Self::share_on_grid`] will return a finite depth, without
+    /// performing its division or grid rounding.
+    #[inline]
+    pub(crate) fn has_finite_share(&self, volume: f64, grid: LotGrid) -> bool {
+        match self {
+            Self::Unlimited => false,
+            Self::VolumeShare { slices } => {
+                volume >= 0.0
+                    && volume.is_finite()
+                    && *slices > 0.0
+                    && ((grid.lot() > 0.0 && grid.lot().is_finite()) || volume > 0.0)
+            }
+        }
+    }
+
     /// Size every print but the bar's last shows, on the `quantum` size grid.
     ///
     /// Returns [`f64::INFINITY`] when no bound applies, so callers can clamp
@@ -321,13 +336,19 @@ impl BarLiquidity {
     /// which is what a venue that cannot quote a fraction of a lot shows.
     #[inline]
     pub fn share(&self, volume: f64, quantum: f64) -> f64 {
+        self.share_on_grid(volume, LotGrid::new(quantum))
+    }
+
+    #[inline]
+    pub(crate) fn share_on_grid(&self, volume: f64, grid: LotGrid) -> f64 {
+        let quantum = grid.lot();
         match self {
             Self::Unlimited => f64::INFINITY,
             Self::VolumeShare { slices } => {
                 if !(volume >= 0.0) || !volume.is_finite() || !(*slices > 0.0) {
                     f64::INFINITY
                 } else if quantum > 0.0 && quantum.is_finite() {
-                    floor_to_lot(volume / slices, quantum).max(quantum)
+                    grid.floor(volume / slices).max(quantum)
                 } else if volume > 0.0 {
                     volume / slices
                 } else {
@@ -351,7 +372,21 @@ impl BarLiquidity {
     /// The close then shows one increment rather than a negative size.
     #[inline]
     pub fn last_share(&self, volume: f64, quantum: f64) -> f64 {
-        let share = self.share(volume, quantum);
+        self.last_share_on_grid(volume, LotGrid::new(quantum))
+    }
+
+    #[inline]
+    pub(crate) fn last_share_on_grid(&self, volume: f64, grid: LotGrid) -> f64 {
+        let share = self.share_on_grid(volume, grid);
+        self.last_share_from(volume, grid, share)
+    }
+
+    /// Closing share when the common share has already been calculated for
+    /// this bar. Replay needs both, so deriving it twice only repeats the
+    /// grid division and rounding.
+    #[inline]
+    pub(crate) fn last_share_from(&self, volume: f64, grid: LotGrid, share: f64) -> f64 {
+        let quantum = grid.lot();
         match self {
             Self::VolumeShare { slices } if share.is_finite() => {
                 let claimed = (slices - 1.0) * share;
@@ -359,7 +394,7 @@ impl BarLiquidity {
                     return quantum.max(0.0);
                 }
                 let floor = if quantum > 0.0 { quantum } else { 0.0 };
-                snap_to_lot_grid(volume - claimed, quantum).max(floor)
+                grid.snap(volume - claimed).max(floor)
             }
             _ => share,
         }
@@ -471,6 +506,10 @@ impl BarTape {
         self.book.map_or(f64::INFINITY, |(_, size)| size)
     }
 
+    pub(crate) fn set_book(&mut self, book: Option<Print>) {
+        self.book = book;
+    }
+
     /// Replay one step onto the tape and return the prints it put up.
     pub fn replay(
         &mut self,
@@ -479,7 +518,17 @@ impl BarTape {
         quantum: f64,
         kind: StepKind,
     ) -> Tape {
-        let share = liquidity.share(bar.volume, quantum);
+        self.replay_on_grid(bar, liquidity, LotGrid::new(quantum), kind)
+    }
+
+    pub(crate) fn replay_on_grid(
+        &mut self,
+        bar: &OhlcvBar,
+        liquidity: BarLiquidity,
+        grid: LotGrid,
+        kind: StepKind,
+    ) -> Tape {
+        let share = liquidity.share_on_grid(bar.volume, grid);
         if !share.is_finite() {
             // Nothing bounds a fill here, but the tape still tracks where
             // the market is so a later bounded step starts from the truth.
@@ -510,7 +559,7 @@ impl BarTape {
             here = bar.low;
         }
         if bar.close != here {
-            tape.push((bar.close, liquidity.last_share(bar.volume, quantum)));
+            tape.push((bar.close, liquidity.last_share_from(bar.volume, grid, share)));
         }
         if let Some(&print) = tape.prints().last() {
             self.book = Some(print);
@@ -576,7 +625,7 @@ impl BarTape {
     /// The book as it stands to an order priced at `price`, or `None` when
     /// what is showing is not marketable against it.
     fn standing_for(&self, price: Price, buying: bool) -> Option<Print> {
-        let (book_price, size) = self.book?;
+        let (book_price, size) = self.book()?;
         let marketable = if buying { book_price <= price } else { book_price >= price };
         marketable.then_some((book_price, size))
     }

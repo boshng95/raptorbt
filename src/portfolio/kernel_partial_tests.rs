@@ -140,7 +140,7 @@ fn a_derived_stop_follows_the_average_and_an_explicit_one_stays() {
 }
 
 #[test]
-fn a_closing_order_reduces_across_prints_and_never_reverses() {
+fn a_closing_order_reduces_into_one_round_trip_and_never_reverses() {
     let mut kernel = partial_kernel();
     submit(&mut kernel, OrderSide::Buy, QtySpec::Units(100.0), TimeInForce::Gtc, "o");
     kernel.step_trade(1, &print(1, 100.0, 100.0), StepInput::default());
@@ -151,21 +151,26 @@ fn a_closing_order_reduces_across_prints_and_never_reverses() {
     let events = kernel.step_trade(2, &print(2, 105.0, 40.0), StepInput::default());
     assert_eq!(fills(&events), vec![40.0]);
     assert!((kernel.position_snapshot().unwrap().size - 60.0).abs() < 1e-9);
-    let trades: Vec<&Trade> = events
-        .iter()
-        .filter_map(|e| match e {
-            EngineEvent::Exited { trade, .. } => Some(&**trade),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(trades.len(), 1);
-    assert!((trades[0].size - 40.0).abs() < 1e-9);
-    assert!((trades[0].pnl - 200.0).abs() < 1e-9, "40 x (105-100) = 200, got {}", trades[0].pnl);
+    assert!(
+        !events.iter().any(|event| matches!(event, EngineEvent::Exited { .. })),
+        "Nautilus reports one round trip when the position reaches flat: {events:?}"
+    );
     let events = kernel.step_trade(3, &print(3, 106.0, 500.0), StepInput::default());
     assert_eq!(fills(&events), vec![60.0]);
     assert!(!kernel.is_in_position());
     assert_eq!(kernel.order(id).unwrap().status, OrderStatus::Filled);
     assert!((kernel.order(id).unwrap().filled_qty - 100.0).abs() < 1e-9);
+    let trades: Vec<&Trade> = events
+        .iter()
+        .filter_map(|event| match event {
+            EngineEvent::Exited { trade, .. } => Some(&**trade),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(trades.len(), 1);
+    assert!((trades[0].size - 100.0).abs() < 1e-9);
+    assert!((trades[0].exit_price - 105.6).abs() < 1e-9);
+    assert!((trades[0].pnl - 560.0).abs() < 1e-9, "got {}", trades[0].pnl);
     let events = kernel.step_trade(4, &print(4, 106.0, 500.0), StepInput::default());
     assert!(!kernel.is_in_position(), "the surplus must never reverse: {events:?}");
     // Cash: 100_000 - 10_000 + 40*105 + 60*106 = 100_560.

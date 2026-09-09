@@ -2266,3 +2266,7 @@ impl EngineKernel {
 #[cfg(test)]
 #[path = "kernel_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "kernel_partial_tests.rs"]
+mod partial_tests;

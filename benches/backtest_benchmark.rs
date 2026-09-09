@@ -1,7 +1,9 @@
 //! Benchmark for RaptorBT backtesting performance.
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
-use raptorbt::core::types::{BacktestConfig, CompiledSignals, Direction, OhlcvData};
+use raptorbt::core::types::{
+    BacktestConfig, CompiledSignals, Direction, InstrumentConfig, OhlcvData,
+};
 use raptorbt::indicators::trend::{ema, sma};
 use raptorbt::portfolio::engine::PortfolioEngine;
 
@@ -86,6 +88,45 @@ fn bench_single_backtest(c: &mut Criterion) {
     group.finish();
 }
 
+/// Keep the compatibility path visible in the benchmark suite: its four
+/// synthetic prints and fine decimal lot grid are the settings used by the
+/// Nautilus adapter and exercise different hot-path work from the defaults.
+fn bench_nautilus_parity(c: &mut Criterion) {
+    let mut group = c.benchmark_group("nautilus_parity");
+
+    for size in [1000, 5000, 10000, 50000].iter() {
+        group.bench_with_input(BenchmarkId::new("bars", size), size, |b, &size| {
+            let ohlcv = generate_sample_data(size);
+            let signals = generate_sample_signals(&ohlcv.close, 10, 30);
+            let config = BacktestConfig {
+                retain_curves: false,
+                retain_daily_performance: true,
+                bar_volume_slices: 4.0,
+                same_bar_marketable_limit_on_close: true,
+                ..BacktestConfig::default()
+            };
+            let instrument = InstrumentConfig {
+                lot_size: Some(0.00001),
+                price_increment: Some(0.01),
+                currency_precision: Some(8),
+                ..InstrumentConfig::default()
+            };
+            let engine = PortfolioEngine::new(config);
+
+            b.iter(|| {
+                let result = engine.run_single_with_instrument_config(
+                    black_box(&ohlcv),
+                    black_box(&signals),
+                    Some(black_box(&instrument)),
+                );
+                black_box(result)
+            });
+        });
+    }
+
+    group.finish();
+}
+
 fn bench_sma(c: &mut Criterion) {
     let mut group = c.benchmark_group("sma");
 
@@ -120,5 +161,5 @@ fn bench_ema(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_single_backtest, bench_sma, bench_ema);
+criterion_group!(benches, bench_single_backtest, bench_nautilus_parity, bench_sma, bench_ema);
 criterion_main!(benches);

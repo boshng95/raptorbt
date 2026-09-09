@@ -1,9 +1,8 @@
 # Nautilus parity branch
 
-This branch is based on upstream `v0.11.0` and carries seventeen narrowly
-scoped compatibility corrections used by algotrade-nautilus backtest
-experiments, plus four fixes to pre-existing upstream bugs (see the end of
-this section).
+This branch tracks upstream through `v0.13.1` and carries narrowly scoped
+compatibility corrections used by algotrade-nautilus backtest experiments,
+plus fixes to pre-existing upstream bugs (see the end of this section).
 The corrections are opt-in or default-neutral for existing callers, except
 where a stated one is simply a more accurate reading of the same arithmetic.
 

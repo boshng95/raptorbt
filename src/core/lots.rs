@@ -7,6 +7,58 @@
 //! the product back up can land an ULP above the decimal size a venue would
 //! have quoted.
 
+/// A lot increment together with the decimal scale derived from it.
+///
+/// The increment is immutable for an instrument but the old helpers derived
+/// its scale with `log10` and `powi` on every bar and every fill. Keeping that
+/// invariant here makes the hot path arithmetic-only without changing a
+/// single floating-point operation applied to the actual size.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct LotGrid {
+    lot: f64,
+    scale: Option<f64>,
+}
+
+impl Default for LotGrid {
+    fn default() -> Self {
+        Self::new(0.0)
+    }
+}
+
+impl LotGrid {
+    pub(crate) fn new(lot: f64) -> Self {
+        let scale = if lot > 0.0 && lot.is_finite() {
+            let decimals = (-lot.log10()).ceil().max(0.0);
+            // Beyond ~15 significant decimals the scaling itself loses
+            // precision, so leave values alone rather than corrupting them.
+            (decimals <= 15.0).then(|| 10f64.powi(decimals as i32))
+        } else {
+            None
+        };
+        Self { lot, scale }
+    }
+
+    #[inline]
+    pub(crate) fn lot(self) -> f64 {
+        self.lot
+    }
+
+    #[inline]
+    pub(crate) fn floor(self, raw_size: f64) -> f64 {
+        let lots = raw_size / self.lot;
+        let boundary_tolerance = f64::EPSILON * lots.abs().max(1.0) * 4.0;
+        self.snap((lots + boundary_tolerance).floor() * self.lot)
+    }
+
+    #[inline]
+    pub(crate) fn snap(self, value: f64) -> f64 {
+        match self.scale {
+            Some(scale) if value.is_finite() => (value * scale).round() / scale,
+            _ => value,
+        }
+    }
+}
+
 /// Floor to the lot grid without dropping an exact decimal-grid value
 /// because its binary quotient landed a few ULPs below the integer boundary.
 ///
@@ -15,9 +67,7 @@
 /// quotient is already larger than any fixed epsilon small enough to be safe
 /// on a size of 0.1.
 pub(crate) fn floor_to_lot(raw_size: f64, lot: f64) -> f64 {
-    let lots = raw_size / lot;
-    let boundary_tolerance = f64::EPSILON * lots.abs().max(1.0) * 4.0;
-    snap_to_lot_grid((lots + boundary_tolerance).floor() * lot, lot)
+    LotGrid::new(lot).floor(raw_size)
 }
 
 /// Return `value` expressed on the lot increment's own decimal scale.
@@ -33,17 +83,7 @@ pub(crate) fn floor_to_lot(raw_size: f64, lot: f64) -> f64 {
 /// the commission. Rounding onto the increment's decimal scale recovers the
 /// size that was intended.
 pub(crate) fn snap_to_lot_grid(value: f64, lot: f64) -> f64 {
-    if !(lot > 0.0) || !value.is_finite() {
-        return value;
-    }
-    let decimals = (-lot.log10()).ceil().max(0.0);
-    // Beyond ~15 significant decimals the scaling itself loses precision, so
-    // leave the value alone rather than corrupt it.
-    if decimals > 15.0 {
-        return value;
-    }
-    let scale = 10f64.powi(decimals as i32);
-    (value * scale).round() / scale
+    LotGrid::new(lot).snap(value)
 }
 
 #[cfg(test)]
@@ -90,5 +130,36 @@ mod tests {
         // and downstream that lot lands on whatever print carries the
         // rounding remainder.
         assert_eq!(floor_to_lot(1925.34 / 4.0, 0.00001), 481.335);
+    }
+
+    #[test]
+    fn cached_grid_is_bit_identical_to_uncached_arithmetic() {
+        fn uncached_snap(value: f64, lot: f64) -> f64 {
+            if !matches!(lot.partial_cmp(&0.0), Some(std::cmp::Ordering::Greater))
+                || !value.is_finite()
+            {
+                return value;
+            }
+            let decimals = (-lot.log10()).ceil().max(0.0);
+            if decimals > 15.0 {
+                return value;
+            }
+            let scale = 10f64.powi(decimals as i32);
+            (value * scale).round() / scale
+        }
+
+        fn uncached_floor(raw_size: f64, lot: f64) -> f64 {
+            let lots = raw_size / lot;
+            let boundary_tolerance = f64::EPSILON * lots.abs().max(1.0) * 4.0;
+            uncached_snap((lots + boundary_tolerance).floor() * lot, lot)
+        }
+
+        for lot in [0.00001, 0.001, 0.1, 1.0, 25.0, 1e-16, 0.0, -1.0] {
+            let grid = LotGrid::new(lot);
+            for value in [0.0, 0.101849, 0.10379, 481.335, 1925.34, f64::INFINITY] {
+                assert_eq!(grid.snap(value).to_bits(), uncached_snap(value, lot).to_bits());
+                assert_eq!(grid.floor(value).to_bits(), uncached_floor(value, lot).to_bits());
+            }
+        }
     }
 }

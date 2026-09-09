@@ -8,8 +8,9 @@
 //! itself, on the submission bar (same-bar timing) or the bar after
 //! (next-bar-open), mirroring the signal-entry path.
 
+use crate::core::lots::LotGrid;
 use crate::core::types::{Direction, OhlcvBar, Price, Timestamp};
-use crate::execution::fill::{BarTape, FillDepth, FillModel, StepKind};
+use crate::execution::fill::{BarLiquidity, BarTape, FillDepth, FillModel, StepKind};
 use crate::execution::orders::order::{Order, OrderKind, OrderStatus, TimeInForce};
 use crate::execution::orders::OrderSide;
 
@@ -61,6 +62,33 @@ fn side_as_fill_args(side: OrderSide) -> (Direction, bool) {
     }
 }
 
+/// A standing book whose size has not been requested yet.
+///
+/// The no-order path can determine the last traded price without performing
+/// decimal-grid rounding. Keeping the exact inputs delays that work until a
+/// later order actually observes the depth.
+#[derive(Debug, Clone, Copy)]
+struct DeferredBook {
+    price: Price,
+    volume: f64,
+    liquidity: BarLiquidity,
+    grid: LotGrid,
+    closing: bool,
+}
+
+impl DeferredBook {
+    #[inline]
+    fn print(self) -> (Price, f64) {
+        let share = self.liquidity.share_on_grid(self.volume, self.grid);
+        let size = if self.closing {
+            self.liquidity.last_share_from(self.volume, self.grid, share)
+        } else {
+            share
+        };
+        (self.price, size)
+    }
+}
+
 /// Owns all orders for one session and matches resting ones per bar.
 #[derive(Debug, Default)]
 pub struct OrderEngine {
@@ -93,6 +121,12 @@ pub struct OrderEngine {
     /// Entry latency on the tick path: an order is invisible to prints
     /// before `submitted_ts + latency`. `0` (default) = same print.
     order_latency_ns: i64,
+    /// Decimal scale for the instrument's immutable size increment.
+    /// Refreshed from the public fill model only when that increment changes.
+    size_grid: LotGrid,
+    /// Last traded book left by a step with no matching orders. Its depth is
+    /// resolved only if a later order asks to see it.
+    deferred_book: Option<DeferredBook>,
 }
 
 impl OrderEngine {
@@ -120,7 +154,7 @@ impl OrderEngine {
     /// pass, and they meet the same book any other order submitted during
     /// a bar meets.
     pub fn book_size(&self) -> f64 {
-        self.tape.book_size()
+        self.deferred_book.map_or_else(|| self.tape.book_size(), |book| book.print().1)
     }
 
     /// Set the tick-path order-entry latency (see `order_latency_ns`).
@@ -334,6 +368,7 @@ impl OrderEngine {
     /// outcomes are never `on_arrival`: the fill happens now, not when the
     /// order was sent.
     pub fn walk_book(&mut self) -> Vec<MatchOutcome> {
+        self.materialize_book();
         let book = self.tape;
         let Some((at, _)) = book.book() else { return Vec::new() };
 
@@ -371,6 +406,64 @@ impl OrderEngine {
         actions
     }
 
+    #[inline]
+    fn materialize_book(&mut self) {
+        if let Some(book) = self.deferred_book.take() {
+            self.tape.set_book(Some(book.print()));
+        }
+    }
+
+    #[inline]
+    fn advance_without_orders(
+        &mut self,
+        bar: &OhlcvBar,
+        liquidity: BarLiquidity,
+        grid: LotGrid,
+        kind: StepKind,
+    ) {
+        if !liquidity.has_finite_share(bar.volume, grid) {
+            self.deferred_book = None;
+            self.tape.set_book(Some((bar.close, f64::INFINITY)));
+            return;
+        }
+        if kind == StepKind::Print {
+            self.deferred_book = Some(DeferredBook {
+                price: bar.close,
+                volume: bar.volume,
+                liquidity,
+                grid,
+                closing: false,
+            });
+            return;
+        }
+
+        let previous = self
+            .deferred_book
+            .map(|book| book.price)
+            .or_else(|| self.tape.book().map(|(price, _)| price));
+        let mut here = previous.unwrap_or(bar.open);
+        let mut last = None;
+        if previous.is_none() || here != bar.open {
+            last = Some((bar.open, false));
+            here = bar.open;
+        }
+        if bar.high > here {
+            last = Some((bar.high, false));
+            here = bar.high;
+        }
+        if bar.low < here {
+            last = Some((bar.low, false));
+            here = bar.low;
+        }
+        if bar.close != here {
+            last = Some((bar.close, true));
+        }
+        if let Some((price, closing)) = last {
+            self.deferred_book =
+                Some(DeferredBook { price, volume: bar.volume, liquidity, grid, closing });
+        }
+    }
+
     /// Statuses of the parents referenced by working orders.
     ///
     /// Snapshotted before a matching pass, and load-bearing rather than
@@ -403,6 +496,13 @@ impl OrderEngine {
         let tz = self.tz_offset_ns;
         let latency = self.order_latency_ns;
 
+        // Narrow the lazy live index before deciding whether a matching tape
+        // is needed. With no working orders only the standing book survives
+        // this step, so building the per-print tape and parent snapshot is
+        // pure overhead.
+        let ledger = &self.orders;
+        self.working.retain(|&id| !ledger[id as usize].status.is_terminal());
+
         // Replay the step onto the tape first: resting orders match against
         // the prints it puts up, and orders submitted while it was observed
         // match against the book it leaves behind. Both are taken from the
@@ -413,18 +513,29 @@ impl OrderEngine {
             MatchMode::Bar => StepKind::Bar,
             MatchMode::Trade => StepKind::Print,
         };
+        if self.working.is_empty() && fill_model.bar_liquidity == BarLiquidity::Unlimited {
+            self.deferred_book = None;
+            self.tape.set_book(Some((bar.close, f64::INFINITY)));
+            return Vec::new();
+        }
+
+        // `FillModel::size_quantum` remains public, so tolerate a caller
+        // changing it between steps while keeping its expensive decimal
+        // scale cached for the normal immutable-instrument case.
+        if self.size_grid.lot().to_bits() != fill_model.size_quantum.to_bits() {
+            self.size_grid = LotGrid::new(fill_model.size_quantum);
+        }
+        let size_grid = self.size_grid;
+        if self.working.is_empty() {
+            self.advance_without_orders(bar, fill_model.bar_liquidity, size_grid, step_kind);
+            return Vec::new();
+        }
+        self.materialize_book();
         // The book as it stood before this step, for an order that reached
         // the venue ahead of the bar it was submitted on.
         let prior_book = self.tape;
-        let tape =
-            self.tape.replay(bar, fill_model.bar_liquidity, fill_model.size_quantum, step_kind);
+        let tape = self.tape.replay_on_grid(bar, fill_model.bar_liquidity, size_grid, step_kind);
         let book = self.tape;
-
-        // Drop the orders that finished on an earlier step. This is the
-        // only place the live index is pruned, and it costs one pass over
-        // the live orders -- not over every order the run has placed.
-        let ledger = &self.orders;
-        self.working.retain(|&id| !ledger[id as usize].status.is_terminal());
 
         let parent_state = self.parent_states();
 
@@ -818,6 +929,125 @@ mod tests {
     /// `volume / 4` at that price and prints nothing after the first one.
     fn quiet(ts: i64, price: f64, volume: f64) -> OhlcvBar {
         OhlcvBar { timestamp: ts, open: price, high: price, low: price, close: price, volume }
+    }
+
+    #[test]
+    fn deferred_no_order_book_matches_eager_replay_when_an_order_arrives() {
+        let fm = FillModel {
+            bar_liquidity: BarLiquidity::NAUTILUS,
+            size_quantum: 0.00001,
+            ..FillModel::default()
+        };
+        let leading = [
+            OhlcvBar {
+                timestamp: 1,
+                open: 100.0,
+                high: 110.0,
+                low: 90.0,
+                close: 105.0,
+                volume: 0.3847,
+            },
+            quiet(2, 105.0, 12.0),
+        ];
+        let mut deferred = OrderEngine::new();
+        let mut eager = OrderEngine::new();
+        let grid = LotGrid::new(fm.size_quantum);
+        for (idx, step) in leading.iter().enumerate() {
+            assert!(deferred.match_bar(idx, step, &fm).is_empty());
+            let _ = eager.tape.replay_on_grid(step, fm.bar_liquidity, grid, StepKind::Bar);
+            assert_eq!(deferred.book_size().to_bits(), eager.book_size().to_bits());
+        }
+        assert!(deferred.deferred_book.is_some());
+
+        for engine in [&mut deferred, &mut eager] {
+            let mut order = Order::plain(
+                OrderSide::Buy,
+                QtySpec::Units(1.0),
+                OrderKind::Limit { price: 105.0 },
+                TimeInForce::Gtc,
+            );
+            order.submitted_idx = 1;
+            order.submitted_ts = 2;
+            let _ = order.transition(OrderStatus::Accepted);
+            engine.submit(order);
+        }
+        let step = quiet(3, 105.0, 99_000.0);
+        assert_eq!(deferred.match_bar(2, &step, &fm), eager.match_bar(2, &step, &fm));
+    }
+
+    #[test]
+    fn deferred_no_order_steps_leave_the_exact_eager_book() {
+        let models = [
+            FillModel::default(),
+            FillModel {
+                bar_liquidity: BarLiquidity::NAUTILUS,
+                size_quantum: 0.00001,
+                ..FillModel::default()
+            },
+            FillModel {
+                bar_liquidity: BarLiquidity::NAUTILUS,
+                size_quantum: 0.0,
+                ..FillModel::default()
+            },
+            FillModel {
+                bar_liquidity: BarLiquidity::VolumeShare { slices: 2.0 },
+                size_quantum: 0.1,
+                ..FillModel::default()
+            },
+            FillModel {
+                bar_liquidity: BarLiquidity::VolumeShare { slices: 0.0 },
+                size_quantum: 0.1,
+                ..FillModel::default()
+            },
+        ];
+        let steps = [
+            (
+                OhlcvBar {
+                    timestamp: 1,
+                    open: 100.0,
+                    high: 110.0,
+                    low: 90.0,
+                    close: 105.0,
+                    volume: 0.3847,
+                },
+                MatchMode::Bar,
+            ),
+            (quiet(2, 105.0, 12.0), MatchMode::Bar),
+            (quiet(3, 105.0, 0.0), MatchMode::Bar),
+            (
+                OhlcvBar {
+                    timestamp: 4,
+                    open: 103.0,
+                    high: 112.0,
+                    low: 95.0,
+                    close: 108.0,
+                    volume: 1_000.0,
+                },
+                MatchMode::Bar,
+            ),
+            (quiet(5, 108.0, 0.0), MatchMode::Trade),
+            (quiet(6, 109.0, 12.0), MatchMode::Trade),
+        ];
+
+        for fm in &models {
+            let mut deferred = OrderEngine::new();
+            let mut eager = OrderEngine::new();
+            let grid = LotGrid::new(fm.size_quantum);
+            for (idx, (step, mode)) in steps.iter().enumerate() {
+                assert!(deferred.match_events(idx, step, fm, *mode).is_empty());
+                let kind = match mode {
+                    MatchMode::Bar => StepKind::Bar,
+                    MatchMode::Trade => StepKind::Print,
+                };
+                let _ = eager.tape.replay_on_grid(step, fm.bar_liquidity, grid, kind);
+
+                let deferred_book = deferred
+                    .deferred_book
+                    .map(DeferredBook::print)
+                    .or_else(|| deferred.tape.book());
+                assert_eq!(deferred_book, eager.tape.book(), "model {fm:?}, step {idx}");
+            }
+        }
     }
 
     #[test]

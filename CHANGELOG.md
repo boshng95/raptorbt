@@ -59,6 +59,16 @@ branch.
 
 ### Changed
 
+- **No-order bars retain the same standing book without building a matching
+  tape.** The last traded price is advanced immediately, while bounded depth
+  remains in its original volume/grid inputs until an order actually observes
+  it. Lot-grid decimal scales are cached per instrument as well. Both paths
+  are bit-exact against eager replay; the benchmark suite now keeps the
+  Nautilus configuration visible alongside upstream defaults.
+- **The upstream partial-fill suite is compiled again.** Its closing-order
+  assertion now pins this branch's intentional Nautilus contract: fills are
+  reported per slice, while one `Trade` is emitted when the whole round trip
+  reaches flat.
 - **The unfunded-sizing guard asks the funding mode, not the leverage
   rate.** A per-contract deposit cannot answer "what rate funds this",
   which is what the guard used to ask. It now asks each mode in its own
@@ -97,21 +107,13 @@ branch.
     settlement.
   - The legal-transition table already listed both pairs upstream adds.
 
-- **`BacktestConfig.partial_fills` is gone**, with the tick-path partial
-  fills it switched on and their tests. It cannot be honoured here: it
-  assumes a marketable order *rests* as `PartiallyFilled` when a print is
-  too small, whereas this branch's book model sweeps such an order and
-  fills the remainder one increment worse. The two models disagree about
-  what a market order does, so the flag could only ever have been wired to
-  something it does not mean. `bar_volume_slices` remains the way to bound
-  a fill by traded volume, and reproduces Nautilus at `slices = 4`.
-
-  Deferred, each to land on its own with its own tests: print-bounded
-  resting fills on the tick path (the honest version of the above), true
-  fill-or-kill (a print too small for the whole order fills none of it --
-  `Fok` still behaves as `Ioc` here), and `shift_protective` (moving a
-  derived stop or target by the change in average entry). All three change
-  outcomes and none belongs inside a merge.
+- **`BacktestConfig.partial_fills` is reconciled with this branch's book
+  model.** A tick print bounds an opted-in fill and leaves the order working;
+  FOK, latency, averaged entries and derived-protective movement are covered
+  by the active partial-fill suite. `bar_volume_slices` remains the separate
+  bar-path control and reproduces Nautilus at `slices = 4`. Closing slices
+  keep this branch's accounting contract described above: one `Trade` per
+  round trip rather than one per slice.
 
 ## [0.13.3] - 2026-09-10
 
