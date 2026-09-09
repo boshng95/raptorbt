@@ -310,10 +310,9 @@ class TestPortfolioMargin:
             account_type="margin",
             leverage=float("inf"),
         )
-        # The signal path reports the reason by its variant name, as it
-        # does for every other refusal (see ``test_strategy.py``); the
-        # order path spells the same reason ``unfunded_sizing``.
-        assert strategy.refusals == ["UnfundedSizing"]
+        # Entry and order refusals share the stable snake_case reporting
+        # contract introduced in 0.13.3.
+        assert strategy.refusals == ["unfunded_sizing"]
         assert result.result.metrics.total_trades == 0
 
     def test_rejects_invalid_account_type(self):

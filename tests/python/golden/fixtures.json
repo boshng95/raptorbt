@@ -27705,7 +27705,7 @@
     "exit_idx": 196,
     "exit_price": "0x1.38af6d5e8da31p+6",
     "exit_reason": "TakeProfit",
-    "fees": "0x1.72b06da8363b9p+7",
+    "fees": "0x1.72b06da8363b8p+7",
     "pnl": "0x1.e73aa28afcfa4p+11",
     "size": "0x1.2ee7a4157bb64p+10"
    },
@@ -30019,9 +30019,9 @@
    "0x1.77d53aa0a4523p+16"
   ],
   "max_drawdown_pct": "0x1.aea6a32e76d7bp+2",
-  "omega": "0x1.d8f26a707029bp-1",
+  "omega": "0x1.d8f26a7070293p-1",
   "sharpe": "-0x1.427a561c5d87ep+2",
-  "sortino": "-0x1.98ce52f0b001fp+2",
+  "sortino": "-0x1.98ce52f0b0082p+2",
   "total_return_pct": "-0x1.e4b4e963cc851p+1",
   "trades": [
    {

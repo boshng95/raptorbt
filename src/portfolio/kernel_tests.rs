@@ -498,7 +498,7 @@ fn a_fill_taken_before_a_bar_is_dated_when_the_order_arrived() {
     let trade = events
         .iter()
         .find_map(|event| match event {
-            EngineEvent::Exited { trade, .. } => Some(trade),
+            EngineEvent::Exited { trade, .. } => Some(&**trade),
             _ => None,
         })
         .unwrap_or_else(|| panic!("no round trip, got {events:?}"));
@@ -644,7 +644,7 @@ fn an_exit_bounded_by_volume_leaves_the_position_open() {
     let trades: Vec<&Trade> = events
         .iter()
         .filter_map(|e| match e {
-            EngineEvent::Exited { trade, .. } => Some(trade),
+            EngineEvent::Exited { trade, .. } => Some(&**trade),
             _ => None,
         })
         .collect();

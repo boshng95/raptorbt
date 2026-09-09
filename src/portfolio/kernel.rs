@@ -1774,7 +1774,7 @@ impl EngineKernel {
                     price: exit_price,
                     fees,
                     gross_realized: gross_pnl,
-                    event: EngineEvent::Exited { idx, trade: *trade },
+                    event: EngineEvent::Exited { idx, trade },
                 }
             }
         }
@@ -1870,7 +1870,7 @@ impl EngineKernel {
                     settle_fee,
                     settle_price,
                 );
-                events.push(EngineEvent::Exited { idx, trade: *trade });
+                events.push(EngineEvent::Exited { idx, trade });
             }
         }
         events

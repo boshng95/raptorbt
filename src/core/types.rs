@@ -1235,12 +1235,26 @@ impl Position {
     /// are deliberately not deducted -- an excursion measures how far price
     /// travelled while the position was open, not what the round trip cost.
     pub fn excursions(&self, contract_multiplier: f64) -> (Price, Price, f64, f64) {
+        self.excursions_for_size(self.size, contract_multiplier)
+    }
+
+    /// Intra-trade extremes for an explicit completed size.
+    ///
+    /// A partial-fill ledger creates the round-trip record after its final
+    /// reduction has taken the live position size to zero. It supplies the
+    /// accumulated closing size here; the single-fill position manager uses
+    /// [`Self::excursions`] and therefore retains the original arithmetic.
+    pub(crate) fn excursions_for_size(
+        &self,
+        size: f64,
+        contract_multiplier: f64,
+    ) -> (Price, Price, f64, f64) {
         let (adverse_price, favourable_price) = match self.direction {
             Direction::Long => (self.lowest_since_entry, self.highest_since_entry),
             Direction::Short => (self.highest_since_entry, self.lowest_since_entry),
         };
         let multiplier = self.direction.multiplier() * contract_multiplier;
-        let excursion = |price: Price| (price - self.entry_price) * self.size * multiplier;
+        let excursion = |price: Price| (price - self.entry_price) * size * multiplier;
         // Clamped so the documented invariants hold even when a single bar's
         // high/low straddles the entry fill: MAE is never positive, MFE never
         // negative.

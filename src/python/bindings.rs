@@ -1996,6 +1996,7 @@ pub fn batch_single_backtest(
                     exits: item.exits,
                     position_sizes: item.position_sizes,
                     direction,
+                    entry_directions: None,
                     weight: item.weight,
                 },
                 config: item

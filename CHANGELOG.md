@@ -46,6 +46,11 @@ branch.
 
 ### Fixed
 
+- **Upstream trade excursions survive this branch's sliced closes.** The
+  upstream metric reads an open position's live size; this branch creates one
+  round-trip record only after the last slice has reduced that size to zero.
+  The ledger now supplies the accumulated closed size, retaining upstream's
+  MAE/MFE values without changing fill or settlement behaviour.
 - **A fill produced by a book walk re-prices the option groups.**
   `PortfolioSession::walk_book` lends the kernel the pool's capital,
   matches, and reconciles the result back exactly as the step path does, so
@@ -82,6 +87,11 @@ branch.
 
 ### Merged
 
+- **Upstream 0.13.2/0.13.3 is integrated.** This retains the authors'
+  no-copy NumPy input path, allocation-free return metrics, conditional ATR
+  allocation, parallel single-instrument batch API, diagnostic metrics and
+  complete order log. Entry rejection names follow 0.13.3's stable
+  snake_case reporting contract.
 - **Upstream 0.13.0/0.13.1 (tick-path realism) merged into this branch.**
   Taken as-is: everything that auto-merged -- print size, L1 sizes and open
   interest on the tick path, the queue-fill model, the cross-instrument

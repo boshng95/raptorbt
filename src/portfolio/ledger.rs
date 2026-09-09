@@ -507,7 +507,7 @@ impl PositionLedger {
         // Same shared definition as the per-symbol manager; this path tracks
         // extremes too (see `update_extremes` in the price-update loop).
         let (adverse_price, favourable_price, mae_pnl, mfe_pnl) =
-            pos.excursions(self.contract_multiplier);
+            pos.excursions_for_size(closed_size, self.contract_multiplier);
 
         Trade {
             id: self.trade_counter,
@@ -596,6 +596,7 @@ mod tests {
         let id = ledger
             .open_position(0, 0, 100.0, 10.0, Direction::Long, None, None, 2.0, None)
             .unwrap();
+        ledger.update_price(120.0, 90.0);
 
         // Three units off at 110, the rest at 120. No trade until flat --
         // one position is one trade, however many fills it took.
@@ -631,6 +632,8 @@ mod tests {
         assert_eq!(trade.fees, 3.0);
         assert_eq!(trade.pnl, 170.0 - 3.0);
         assert_eq!(trade.exit_idx, 2);
+        assert_eq!(trade.mae_pnl, Some(-100.0));
+        assert_eq!(trade.mfe_pnl, Some(200.0));
     }
 
     #[test]
