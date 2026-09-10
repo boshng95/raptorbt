@@ -46,6 +46,11 @@ branch.
 
 ### Fixed
 
+- **An unfilled IOC/FOK is canceled by an off-schedule book walk.** A
+  portfolio venue evaluates an order immediately when it drains the command,
+  even if another instrument's bar triggered that drain. A non-marketable
+  immediate limit now dies on that standing book instead of surviving into
+  the target instrument's next bar and filling from future range data.
 - **Upstream trade excursions survive this branch's sliced closes.** The
   upstream metric reads an open position's live size; this branch creates one
   round-trip record only after the last slice has reduced that size to zero.

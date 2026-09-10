@@ -299,14 +299,17 @@ where a stated one is simply a more accurate reading of the same arithmetic.
 
     A walk is the resting-order phase of a step and nothing else. No bar
     arrived, so nothing is replayed onto the tape, no extreme moves, no exit
-    or entry is evaluated, nothing expires, no margin mark is taken and no
-    equity is sampled -- the reference engine adds no data point for a
-    settlement either. Each walk offers the same standing size once more,
-    because nothing traded in between to deplete it, and only a plain limit
-    can take it: a stop is armed by a print and there is none here, and a
-    market order was swept when it arrived. A fill it produces happened at
-    `ts_now`, not when the bar that left the book printed. An instrument
-    that has not seen a bar yet has no book, and yields nothing.
+    or entry is evaluated, no time-based expiry occurs, no margin mark is
+    taken and no equity is sampled -- the reference engine adds no data point
+    for a settlement either. Each walk offers the same standing size once
+    more, because nothing traded in between to deplete it, and only a plain
+    limit can take it: a stop is armed by a print and there is none here, and
+    a market order was swept when it arrived. An IOC/FOK limit gets exactly
+    this one immediate evaluation and is canceled if it cannot cross; allowing
+    it to survive into a later bar would turn an immediate order into a
+    resting one. A fill the walk produces happened at `ts_now`, not when the
+    bar that left the book printed. An instrument that has not seen a bar yet
+    has no book, and yields nothing.
 
 ## Upstream fixes
 

@@ -362,7 +362,10 @@ impl OrderEngine {
     ///
     /// Only a plain limit crosses a standing book: a stop is armed by a
     /// print and there is none here, and a market order was swept when it
-    /// arrived. That is the division the arrival path makes too.
+    /// arrived. That is the division the arrival path makes too. An IOC/FOK
+    /// limit which cannot cross is canceled here: this walk is its immediate
+    /// arrival evaluation, so letting it survive until a later bar would turn
+    /// it into a resting order.
     ///
     /// The caller dates the walk by the bar it hands the kernel, so the
     /// outcomes are never `on_arrival`: the fill happens now, not when the
@@ -392,6 +395,14 @@ impl OrderEngine {
             let OrderKind::Limit { price } = order.kind else { continue };
             let depth = book.offered_once(price, order.side == OrderSide::Buy);
             if depth.is_empty() {
+                let id = order.id;
+                let immediate = matches!(order.tif, TimeInForce::Ioc | TimeInForce::Fok);
+                if immediate {
+                    if let Some(order) = self.orders.get_mut(id as usize) {
+                        let _ = order.transition(OrderStatus::Canceled);
+                    }
+                    actions.push(MatchOutcome::Cancel { order_id: id });
+                }
                 continue;
             }
             actions.push(MatchOutcome::Fill {
@@ -1086,6 +1097,27 @@ mod tests {
             engine_with(OrderKind::StopMarket { trigger: 10.0 }, OrderSide::Buy, TimeInForce::Gtc);
         engine.match_bar(1, &quiet(1, 10.0, 4_000.0), &fm);
         assert_eq!(engine.walk_book(), vec![]);
+    }
+
+    #[test]
+    fn a_walk_cancels_an_immediate_limit_that_cannot_cross() {
+        // Prime a standing book first, then submit the IOC as an order-flow
+        // arrival between bars. Its one evaluation is this walk; it must not
+        // survive to inspect the next bar's range.
+        let fm = FillModel::default().with_bar_liquidity(BarLiquidity::NAUTILUS);
+        let mut engine = OrderEngine::new();
+        engine.match_bar(0, &quiet(0, 10.0, 4_000.0), &fm);
+        let mut order = Order::plain(
+            OrderSide::Buy,
+            QtySpec::Units(1.0),
+            OrderKind::Limit { price: 9.0 },
+            TimeInForce::Ioc,
+        );
+        let _ = order.transition(OrderStatus::Accepted);
+        let id = engine.submit(order);
+
+        assert_eq!(engine.walk_book(), vec![MatchOutcome::Cancel { order_id: id }]);
+        assert_eq!(engine.get(id).map(|order| order.status), Some(OrderStatus::Canceled));
     }
 
     #[test]
