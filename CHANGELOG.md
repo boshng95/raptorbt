@@ -5,40 +5,6 @@ All notable changes to raptorbt are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.13.4] - 2026-09-10
-
-**In plain words: a scheduled hook on a live tick stream now fires at the time
-it asked for, even when the row that revealed that time carried no price. A
-timer set for 09:20 waited for the next print the engine accepted — for an
-index that only ticks on a trade, or a feed that sends quote-only rows, that
-could be seconds or minutes after 09:20, and a strategy reading the clock at
-the wrong instant made the wrong decision.**
-
-### Fixed
-
-- **`TickStrategyStream.push_tick` advances the clock on a refused row.** A
-  row with `ltp == 0` and no two-sided book appends no event (the return value
-  is still 0), but its timestamp proves the market reached that instant, so
-  every alert and timer due by then now fires inside that push, on that
-  symbol's own clock. Before, the time event fired on the next accepted print
-  of the same symbol, with `ts_fired` set to that later print.
-- Orders a timer submits between prints are routed to their instrument at once
-  and stamped on its last stepped print, so they match from its next one —
-  the rule `submission_idx` already applied to cross-instrument orders.
-  `enter()` / `close_position()` intents, which name no symbol, are held for
-  that symbol's next trade event; another symbol's print cannot drain them.
-
-### Changed
-
-- `drive_tick_events` takes an optional `before_trade(symbol)` callback, and
-  the clock step is factored into `advance_clock(strategy, ctx, clocks,
-  symbol, ts)`; both are internal to the strategy runners.
-
-### Not changed
-
-- `run_tick_strategy` (the batch replay) still drops such rows in the Rust
-  merge, so it cannot fire on them. The stream's docstring and the README say
-  so; feed the batch runner rows that carry a price.
 ## [Unreleased]
 
 Where the 0.12.1 option-margin work met the Nautilus-parity work on this
@@ -69,6 +35,10 @@ branch.
 
 ### Changed
 
+- **`PortfolioSession.run_until(ts_ns)` exposes event-aware incremental
+  replay.** It applies scheduled items strictly before the boundary, returns
+  after the first event-producing batch, and leaves same-timestamp siblings
+  pending so an external strategy host can react between venue events.
 - **No-order bars retain the same standing book without building a matching
   tape.** The last traded price is advanced immediately, while bounded depth
   remains in its original volume/grid inputs until an order actually observes
@@ -129,6 +99,41 @@ branch.
   bar-path control and reproduces Nautilus at `slices = 4`. Closing slices
   keep this branch's accounting contract described above: one `Trade` per
   round trip rather than one per slice.
+
+## [0.13.4] - 2026-09-10
+
+**In plain words: a scheduled hook on a live tick stream now fires at the time
+it asked for, even when the row that revealed that time carried no price. A
+timer set for 09:20 waited for the next print the engine accepted — for an
+index that only ticks on a trade, or a feed that sends quote-only rows, that
+could be seconds or minutes after 09:20, and a strategy reading the clock at
+the wrong instant made the wrong decision.**
+
+### Fixed
+
+- **`TickStrategyStream.push_tick` advances the clock on a refused row.** A
+  row with `ltp == 0` and no two-sided book appends no event (the return value
+  is still 0), but its timestamp proves the market reached that instant, so
+  every alert and timer due by then now fires inside that push, on that
+  symbol's own clock. Before, the time event fired on the next accepted print
+  of the same symbol, with `ts_fired` set to that later print.
+- Orders a timer submits between prints are routed to their instrument at once
+  and stamped on its last stepped print, so they match from its next one —
+  the rule `submission_idx` already applied to cross-instrument orders.
+  `enter()` / `close_position()` intents, which name no symbol, are held for
+  that symbol's next trade event; another symbol's print cannot drain them.
+
+### Changed
+
+- `drive_tick_events` takes an optional `before_trade(symbol)` callback, and
+  the clock step is factored into `advance_clock(strategy, ctx, clocks,
+  symbol, ts)`; both are internal to the strategy runners.
+
+### Not changed
+
+- `run_tick_strategy` (the batch replay) still drops such rows in the Rust
+  merge, so it cannot fire on them. The stream's docstring and the README say
+  so; feed the batch runner rows that carry a price.
 
 ## [0.13.3] - 2026-09-10
 
