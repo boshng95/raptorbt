@@ -44,6 +44,103 @@ fn schedule_interleaves_deterministically() {
     assert_eq!(order, vec![(0, 0, 0), (1, 0, 5), (0, 1, 10), (1, 1, 15), (0, 2, 20), (1, 2, 25)]);
 }
 
+fn run_until_session() -> EventSession {
+    let config = BacktestConfig { fees: 0.0, ..BacktestConfig::default() };
+    let mut session = EventSession::new(config);
+    let a = session.add_instrument("AAA".into(), Direction::Long, None, None, PositionPolicy::Net);
+    let b = session.add_instrument("BBB".into(), Direction::Long, None, None, PositionPolicy::Net);
+    // Registration order breaks the tie at timestamp 10.
+    session.set_bars(a, bars(0, &[100.0, 101.0, 102.0]));
+    session.set_bars(b, bars(10, &[50.0, 51.0]));
+    session.seal();
+    session
+}
+
+fn arm_run_until_order(session: &mut EventSession) {
+    use crate::execution::orders::{OrderKind, OrderSide, QtySpec, TimeInForce};
+
+    // Establish AAA's first book, then rest an order which fills when AAA's
+    // timestamp-10 event arrives. BBB has another event at that timestamp.
+    session.apply_current(StepInput::default());
+    session.kernel_mut(0).submit_order(
+        OrderSide::Buy,
+        QtySpec::Units(1.0),
+        OrderKind::Limit { price: 101.0 },
+        TimeInForce::Gtc,
+        0,
+        0,
+        "wake".to_string(),
+        None,
+        None,
+    );
+}
+
+#[test]
+fn run_until_is_strict_and_leaves_a_same_timestamp_sibling_pending() {
+    let mut session = run_until_session();
+    arm_run_until_order(&mut session);
+
+    let before = session.current().expect("AAA timestamp-10 event");
+    assert_eq!(before.timestamp(), 10);
+    let (events, event_ts) = session.run_until(10);
+    assert!(events.is_empty());
+    assert_eq!(event_ts, None);
+    assert_eq!(session.current().expect("boundary remains pending").instrument, 0);
+
+    let (events, event_ts) = session.run_until(11);
+    assert!(!events.is_empty(), "the resting order must wake the driver");
+    assert_eq!(event_ts, Some(10));
+    let sibling = session.current().expect("same-timestamp sibling remains");
+    assert_eq!((sibling.instrument, sibling.timestamp()), (1, 10));
+}
+
+#[test]
+fn repeated_run_until_matches_applying_every_event() {
+    let mut batched = run_until_session();
+    let mut stepped = run_until_session();
+    arm_run_until_order(&mut batched);
+    arm_run_until_order(&mut stepped);
+
+    let mut batched_events = Vec::new();
+    loop {
+        let (events, event_ts) = batched.run_until(i64::MAX);
+        batched_events.extend(events.into_iter().map(|event| format!("{event:?}")));
+        if event_ts.is_none() {
+            break;
+        }
+    }
+    let mut stepped_events = Vec::new();
+    while stepped.current().is_some() {
+        stepped_events.extend(
+            stepped
+                .apply_current(StepInput::default())
+                .into_iter()
+                .map(|event| format!("{event:?}")),
+        );
+    }
+
+    assert_eq!(batched_events, stepped_events, "engine event order changed");
+    assert_eq!(batched.remaining(), stepped.remaining());
+    assert_eq!(batched.current().map(|event| event.timestamp()), None);
+    assert_eq!(stepped.current().map(|event| event.timestamp()), None);
+    assert_eq!(batched.cash(), stepped.cash());
+    assert_eq!(batched.free_capital(), stepped.free_capital());
+    for instrument in 0..2 {
+        assert_eq!(
+            format!("{:?}", batched.kernel(instrument).position_snapshots()),
+            format!("{:?}", stepped.kernel(instrument).position_snapshots()),
+        );
+        assert_eq!(
+            format!("{:?}", batched.kernel(instrument).open_orders()),
+            format!("{:?}", stepped.kernel(instrument).open_orders()),
+        );
+    }
+
+    let batched_outcome = batched.finish();
+    let stepped_outcome = stepped.finish();
+    assert_eq!(format!("{batched_outcome:?}"), format!("{stepped_outcome:?}"));
+}
+
 #[test]
 fn shared_pool_constrains_second_instrument() {
     let mut session = session_two_instruments();

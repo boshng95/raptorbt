@@ -817,6 +817,28 @@ impl EventSession {
         events
     }
 
+    /// Apply quiet schedule entries strictly before `ts_ns`.
+    ///
+    /// Stops after the first entry which emits an engine event so a policy
+    /// driver can observe and answer that event before any later market data is
+    /// consumed.  The cursor has already advanced past the emitting entry and
+    /// may therefore point at another entry carrying the same timestamp.
+    pub fn run_until(&mut self, ts_ns: Timestamp) -> (Vec<EngineEvent>, Option<Timestamp>) {
+        loop {
+            let Some(entry) = self.current() else {
+                return (Vec::new(), None);
+            };
+            let event_ts = entry.timestamp();
+            if event_ts >= ts_ns {
+                return (Vec::new(), None);
+            }
+            let events = self.apply_current(StepInput::default());
+            if !events.is_empty() {
+                return (events, Some(event_ts));
+            }
+        }
+    }
+
     /// Settle one instrument's resting orders against the market it last
     /// saw, at `ts_now`, without consuming a schedule entry.
     ///

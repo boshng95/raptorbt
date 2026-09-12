@@ -480,6 +480,12 @@ impl PyPortfolioSession {
         Ok(self.session_mut()?.apply_current(input).into_iter().map(PyEngineEvent::from).collect())
     }
 
+    /// Apply quiet events before `ts_ns`, stopping at the first emitted batch.
+    fn run_until(&mut self, ts_ns: i64) -> PyResult<(Vec<PyEngineEvent>, Option<i64>)> {
+        let (events, event_ts) = self.session_mut()?.run_until(ts_ns);
+        Ok((events.into_iter().map(PyEngineEvent::from).collect(), event_ts))
+    }
+
     /// Settle one instrument's resting orders at `ts_now`, off-schedule.
     ///
     /// A venue walks every book it keeps each time it drains a batch of
