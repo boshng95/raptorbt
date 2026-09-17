@@ -92,7 +92,12 @@ impl FeeModel {
             FeeModel::Custom { base, per_share } => base + size.abs() * per_share,
             FeeModel::Brokerage { percentage, per_share, minimum, max_percentage } => {
                 let mut fee = if *per_share > 0.0 {
-                    size.abs() * per_share
+                    // Shares and the published rate are decimals. Recover
+                    // their exact product before currency quantization: for
+                    // 203 shares at $0.005, binary multiplication yields
+                    // 1.0150000000000001 and rounds a cent too high.
+                    decimal_product(&[size.abs(), *per_share])
+                        .unwrap_or_else(|| size.abs() * per_share)
                 } else {
                     rate_on_notional(price, size.abs(), *percentage)
                 };
@@ -252,6 +257,14 @@ mod tests {
         assert!((fee.calculate(258.26, 36.0, Direction::Long) - 1.0).abs() < 1e-10);
         assert!((fee.calculate(100.0, 1_000.0, Direction::Long) - 5.0).abs() < 1e-10);
         assert!((fee.calculate(1.0, 10.0, Direction::Long) - 0.10).abs() < 1e-10);
+    }
+
+    #[test]
+    fn brokerage_per_share_half_cent_matches_decimal_venue_fee() {
+        let fee = FeeModel::brokerage(0.0, 0.005, 1.0, 0.01);
+        let raw = fee.calculate(227.4, 203.0, Direction::Long);
+        assert_eq!(raw, 1.015);
+        assert_eq!(crate::core::decimals::quantize_money(raw, Some(2)), 1.01);
     }
 
     #[test]
