@@ -6,6 +6,7 @@
 //! strategy hooks. Result accounting is shared with the array-based runners,
 //! so both paths produce identical metrics for identical decisions.
 
+use numpy::PyReadonlyArray1;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
@@ -390,6 +391,72 @@ impl PyKernelSession {
         };
 
         Ok(runner.step(idx, &bar, input).into_iter().map(PyEngineEvent::from).collect())
+    }
+
+    /// Step consecutive bars with no Python handlers, stopping at the first
+    /// engine event so the driver can dispatch it at its original bar index.
+    #[pyo3(signature = (start, end, timestamps, open, high, low, close, volume, atr=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn step_until_event(
+        &mut self,
+        start: usize,
+        end: usize,
+        timestamps: PyReadonlyArray1<'_, i64>,
+        open: PyReadonlyArray1<'_, f64>,
+        high: PyReadonlyArray1<'_, f64>,
+        low: PyReadonlyArray1<'_, f64>,
+        close: PyReadonlyArray1<'_, f64>,
+        volume: PyReadonlyArray1<'_, f64>,
+        atr: Option<PyReadonlyArray1<'_, f64>>,
+    ) -> PyResult<(usize, Vec<PyEngineEvent>)> {
+        let ts = timestamps
+            .as_slice()
+            .map_err(|_| PyValueError::new_err("timestamps must be contiguous"))?;
+        let o = open.as_slice().map_err(|_| PyValueError::new_err("open must be contiguous"))?;
+        let h = high.as_slice().map_err(|_| PyValueError::new_err("high must be contiguous"))?;
+        let l = low.as_slice().map_err(|_| PyValueError::new_err("low must be contiguous"))?;
+        let c = close.as_slice().map_err(|_| PyValueError::new_err("close must be contiguous"))?;
+        let v =
+            volume.as_slice().map_err(|_| PyValueError::new_err("volume must be contiguous"))?;
+        let atr_values = atr
+            .as_ref()
+            .map(|array| array.as_slice())
+            .transpose()
+            .map_err(|_| PyValueError::new_err("atr must be contiguous"))?;
+        let n = ts.len();
+        if start >= end
+            || end > n
+            || [o.len(), h.len(), l.len(), c.len(), v.len()].iter().any(|&length| length != n)
+            || atr_values.is_some_and(|values| values.len() != n)
+        {
+            return Err(PyValueError::new_err("invalid idle bar range or array lengths"));
+        }
+        let runner = self
+            .runner
+            .as_mut()
+            .ok_or_else(|| PyValueError::new_err("session is finished; create a new one"))?;
+        if start != runner.bars_seen() {
+            return Err(PyValueError::new_err("idle range must start at the next bar"));
+        }
+        for idx in start..end {
+            let bar = KernelBar {
+                timestamp: ts[idx],
+                open: o[idx],
+                high: h[idx],
+                low: l[idx],
+                close: c[idx],
+                volume: v[idx],
+            };
+            let input = StepInput {
+                atr: atr_values.map_or(0.0, |values| values[idx]),
+                ..StepInput::default()
+            };
+            let events = runner.step(idx, &bar, input);
+            if !events.is_empty() {
+                return Ok((idx, events.into_iter().map(PyEngineEvent::from).collect()));
+            }
+        }
+        Ok((end - 1, Vec::new()))
     }
 
     /// Settle resting orders off-schedule, at `ts_now`.

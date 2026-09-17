@@ -86,6 +86,7 @@ def run_strategy_backtest(
     account_type: str = "cash",
     leverage: float = 1.0,
     limits: ExecutionLimits = ExecutionLimits(),
+    bar_callback_mask=None,
 ) -> BacktestResult:
     """Run a class-based strategy over OHLCV arrays.
 
@@ -112,6 +113,11 @@ def run_strategy_backtest(
     engine (exits before entries, stop > target > signal), and resulting
     events are dispatched to the ``on_order_*`` / ``on_position_*`` hooks
     before the next bar.
+
+    ``bar_callback_mask`` can omit ``on_bar`` on selected bars while the
+    kernel still steps every bar and dispatches fills and other events. A
+    strategy can force the next callback by setting ``bar_callback_required``
+    true from any hook. All bars call ``on_bar`` when the mask is omitted.
 
     Raises:
         ValueError: on inconsistent array lengths, on conflicting same-bar
@@ -146,6 +152,10 @@ def run_strategy_backtest(
             )
     if n == 0:
         raise ValueError("cannot backtest zero bars")
+    if bar_callback_mask is not None:
+        bar_callback_mask = np.asarray(bar_callback_mask, dtype=np.bool_)
+        if len(bar_callback_mask) != n:
+            raise ValueError("bar_callback_mask must match the primary stream")
 
     session = KernelSession(
         symbol=symbol,
@@ -187,10 +197,16 @@ def run_strategy_backtest(
     # on_start. Completed composite bars dispatch before the primary on_bar
     # of the bar that completed them (they closed strictly earlier).
     streams = StreamState(strategy)
+    has_stream_handlers = bool(strategy._bar_subscriptions or strategy._indicators)
 
     # client order id -> engine order id, for cancel/modify routing.
     id_map: dict[str, int] = {}
     budget = limits.budget()
+    callback_indexes = (
+        np.flatnonzero(bar_callback_mask)
+        if bar_callback_mask is not None and hasattr(session, "step_until_event")
+        else None
+    )
 
     def apply_commands(i: int) -> bool:
         """Route one batch of queued commands into the engine.
@@ -286,7 +302,35 @@ def run_strategy_backtest(
         while apply_commands(i):
             dispatch_events(strategy, ctx, session.walk_book(ts_now))
 
+    idle_until = 0
     for i in range(n):
+        if i < idle_until:
+            continue
+        if (
+            callback_indexes is not None
+            and not bar_callback_mask[i]
+            and not getattr(strategy, "bar_callback_required", False)
+            and not has_stream_handlers
+            and not strategy.clock._alerts
+            and not strategy.clock._timers
+            and not strategy._pending_commands
+            and not strategy._pending_orders
+        ):
+            next_callback = int(np.searchsorted(callback_indexes, i))
+            limit = (
+                int(callback_indexes[next_callback])
+                if next_callback < len(callback_indexes)
+                else n
+            )
+            last, events = session.step_until_event(
+                i, limit, timestamps, open_, high, low, close, volume, atr_values
+            )
+            ctx.idx = last
+            strategy.clock._now = int(timestamps[last])
+            dispatch_events(strategy, ctx, events)
+            settle(last)
+            idle_until = last + 1
+            continue
         ctx.idx = i
 
         # Clock first: scheduled times precede the bar revealing them.
@@ -305,7 +349,12 @@ def run_strategy_backtest(
             float(volume[i]),
         )
 
-        strategy.on_bar(ctx)
+        if (
+            bar_callback_mask is None
+            or bar_callback_mask[i]
+            or getattr(strategy, "bar_callback_required", False)
+        ):
+            strategy.on_bar(ctx)
         apply_commands(i)
 
         entry = False

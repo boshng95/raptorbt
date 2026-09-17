@@ -508,6 +508,7 @@ def run_tick_backtest(
     # rate, which cannot express per-order brokerage at any rate.
     fee_segment: str | None = ...,
 ) -> BacktestResult: ...
+
 # Returns (strategy_id, result) pairs, not bare results: the id is what lets a
 # caller match a result back to the item that produced it. Declared as
 # `list[BacktestResult]` through 0.13.1, which is simply wrong -- indexing a
@@ -682,6 +683,7 @@ def simulate_rebalance_policy(
     dp_charge_per_isin: float = ...,
     periods_per_year: float = ...,
 ) -> RebalanceSimResult: ...
+
 # Keys since 0.9.0: brokerage_flat (per-order cap in rupees; 0 on equity
 # delivery, where the broker charges nothing), brokerage_rate (percentage
 # alternative per order, 0 where only the flat applies -- charge is
@@ -1129,6 +1131,18 @@ class KernelSession:
         stop_price: float | None = ...,
         target_price: float | None = ...,
     ) -> list[EngineEvent]: ...
+    def step_until_event(
+        self,
+        start: int,
+        end: int,
+        timestamps: _I64,
+        open: _F64,
+        high: _F64,
+        low: _F64,
+        close: _F64,
+        volume: _F64,
+        atr: _F64 | None = ...,
+    ) -> tuple[int, list[EngineEvent]]: ...
     def walk_book(self, ts_now: int) -> list[EngineEvent]: ...
     def submit_order(
         self,
