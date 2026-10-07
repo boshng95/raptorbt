@@ -2903,7 +2903,7 @@ fn cash_after_unwinding_in(pieces: &[f64]) -> f64 {
     );
     assert!(matches!(entered, Some(OpenResult { event: EngineEvent::Entered { .. }, .. })));
     for cap in pieces {
-        kernel.reduce_at(1, &bar(1, 110.0), 0, 110.0, ExitReason::Signal, *cap, None, None);
+        kernel.reduce_at(1, &bar(1, 110.0), 0, 110.0, ExitReason::Signal, *cap, None, FillFee::OWN);
     }
     assert_eq!(kernel.ledger.open_count(), 0, "the position must end flat");
     kernel.cash()
@@ -2942,8 +2942,10 @@ fn each_closing_fill_reports_only_the_pnl_it_realized() {
     );
     assert!(matches!(entered, Some(OpenResult { event: EngineEvent::Entered { .. }, .. })));
 
-    let first = kernel.reduce_at(1, &bar(1, 110.0), 0, 110.0, ExitReason::Signal, 4.0, None, None);
-    let second = kernel.reduce_at(1, &bar(1, 110.0), 0, 110.0, ExitReason::Signal, 6.0, None, None);
+    let first =
+        kernel.reduce_at(1, &bar(1, 110.0), 0, 110.0, ExitReason::Signal, 4.0, None, FillFee::OWN);
+    let second =
+        kernel.reduce_at(1, &bar(1, 110.0), 0, 110.0, ExitReason::Signal, 6.0, None, FillFee::OWN);
     let ReduceResult::Reduced { gross_realized: first_gross, fees: first_fees, .. } = &first else {
         panic!("expected a partial reduction, got {first:?}");
     };

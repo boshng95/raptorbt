@@ -13,7 +13,7 @@ use crate::execution::orders::{
 };
 use crate::execution::queue::QueueVerdict;
 use crate::portfolio::kernel::{
-    EngineEvent, EngineKernel, FillTerms, KernelBar, OpenResult, ReduceResult,
+    EngineEvent, EngineKernel, FillFee, FillTerms, KernelBar, OpenResult, ReduceResult,
 };
 use crate::portfolio::ledger::PositionPolicy;
 use crate::portfolio::risk::RiskGate;
@@ -629,7 +629,7 @@ impl EngineKernel {
                 all_or_none: tif == TimeInForce::Fok,
                 resuming,
                 at: arrived_at,
-                fee: None,
+                fee: FillFee { settled: None, order: Some(id) },
             };
             match self.open_at(
                 idx,
@@ -757,7 +757,7 @@ impl EngineKernel {
             // absorb of the one fill is there to split between them.
             let taking = cap.min(asked);
             let (close_fee, flip_size, flip_fee) =
-                self.split_flip_fee(bar, raw_price, direction, open_size, taking);
+                self.split_flip_fee(bar, raw_price, direction, open_size, taking, Some(id));
             match self.reduce_at(
                 idx,
                 bar,
@@ -766,7 +766,7 @@ impl EngineKernel {
                 ExitReason::Order,
                 taking,
                 arrived_at,
-                close_fee,
+                FillFee { settled: close_fee, order: Some(id) },
             ) {
                 ReduceResult::Closed { size, price, fees, gross_realized, event } => {
                     executed = Some(price);
@@ -896,7 +896,7 @@ impl EngineKernel {
                 all_or_none: false,
                 resuming: true,
                 at: arrived_at,
-                fee: Some(fee),
+                fee: FillFee { settled: Some(fee), order: Some(id) },
             },
         );
         match opened {

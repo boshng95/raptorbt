@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::core::types::{Price, Timestamp};
+use crate::execution::fees::OrderBilling;
 
 /// Which way an order trades.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -311,6 +312,10 @@ pub struct Order {
     /// quietly grow or shrink between fills.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved_qty: Option<f64>,
+    /// What this order's fills have been billed, for a schedule that charges
+    /// the order once rather than each fill.
+    #[serde(default)]
+    pub billing: OrderBilling,
 }
 
 /// What became of one order, once the run is over.
@@ -464,6 +469,7 @@ impl Order {
             triggered: false,
             filled_qty: 0.0,
             resolved_qty: None,
+            billing: OrderBilling::default(),
         }
     }
 

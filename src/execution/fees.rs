@@ -1,8 +1,34 @@
 //! Fee calculation models.
 
+use serde::{Deserialize, Serialize};
+
 use crate::core::decimals::decimal_product;
 use crate::core::types::{Direction, Price};
 use crate::execution::indian_costs::{self, FeeBreakdown, Segment};
+
+/// What one order's fills have been billed so far.
+///
+/// A broker bills an order, not each print it took. IB's floor and notional
+/// cap apply once to the whole order: an order for 300 shares that fills as
+/// 100 and 200 pays one $1 minimum, not two. Pricing each fill on its own
+/// size would charge the floor once per fill -- an amount the broker never
+/// takes, and one the strategy sized its order without.
+///
+/// So an order carries the schedule's charge on everything it has filled,
+/// before the floor and cap are applied, and what its fills were actually
+/// charged. Each further fill pays the order's charge on its new total less
+/// what is already paid. An order that fills in one piece pays exactly what
+/// [`FeeModel::calculate`] charges for its size.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct OrderBilling {
+    /// The schedule's base charge on every unit filled, before the floor and
+    /// the cap.
+    pub base: f64,
+    /// The notional cap on every unit filled; zero for an uncapped schedule.
+    pub cap: f64,
+    /// What the order's fills were charged, each already settled money.
+    pub charged: f64,
+}
 
 /// Fee model for calculating transaction costs.
 #[derive(Debug, Clone)]
@@ -90,29 +116,83 @@ impl FeeModel {
                 rate_on_notional(price, size.abs(), applicable_rate)
             }
             FeeModel::Custom { base, per_share } => base + size.abs() * per_share,
-            FeeModel::Brokerage { percentage, per_share, minimum, max_percentage } => {
-                let mut fee = if *per_share > 0.0 {
-                    // Shares and the published rate are decimals. Recover
-                    // their exact product before currency quantization: for
-                    // 203 shares at $0.005, binary multiplication yields
-                    // 1.0150000000000001 and rounds a cent too high.
-                    decimal_product(&[size.abs(), *per_share])
-                        .unwrap_or_else(|| size.abs() * per_share)
-                } else {
-                    rate_on_notional(price, size.abs(), *percentage)
-                };
-                if *minimum > 0.0 {
-                    fee = fee.max(*minimum);
-                }
-                if *max_percentage > 0.0 {
-                    fee = fee.min(rate_on_notional(price, size.abs(), *max_percentage));
-                }
-                fee
+            FeeModel::Brokerage { .. } => {
+                let (base, cap) = self.brokerage_parts(price, size);
+                self.brokerage_charge(base, cap)
             }
             FeeModel::Indian { segment } => {
                 indian_costs::calculate_side(*segment, trade_value, _direction, true).total()
             }
         }
+    }
+
+    /// Whether the schedule charges an order once rather than each fill.
+    ///
+    /// Only a floor or a notional cap makes the difference: without them the
+    /// schedule is linear in size, and billing the order or its fills comes
+    /// to the same charge.
+    pub fn bills_per_order(&self) -> bool {
+        matches!(
+            self,
+            FeeModel::Brokerage { minimum, max_percentage, .. }
+                if *minimum > 0.0 || *max_percentage > 0.0
+        )
+    }
+
+    /// The order's billing once a fill of `size` at `price` is added to it.
+    ///
+    /// The charge itself is left to the caller, which settles it in the
+    /// account's currency: [`Self::order_charge`] of the result, less what
+    /// the order already paid. `None` for a schedule billed per fill.
+    pub fn accrue(&self, billed: &OrderBilling, price: Price, size: f64) -> Option<OrderBilling> {
+        if !self.bills_per_order() {
+            return None;
+        }
+        let (base, cap) = self.brokerage_parts(price, size);
+        Some(OrderBilling { base: billed.base + base, cap: billed.cap + cap, ..*billed })
+    }
+
+    /// What the schedule charges an order with this billing, unsettled.
+    pub fn order_charge(&self, billed: &OrderBilling) -> f64 {
+        self.brokerage_charge(billed.base, billed.cap)
+    }
+
+    /// A brokerage fill's base charge and notional cap, before either the
+    /// floor or the cap is applied. Zero for any other schedule.
+    fn brokerage_parts(&self, price: Price, size: f64) -> (f64, f64) {
+        let FeeModel::Brokerage { percentage, per_share, max_percentage, .. } = self else {
+            return (0.0, 0.0);
+        };
+        let base = if *per_share > 0.0 {
+            // Shares and the published rate are decimals. Recover their
+            // exact product before currency quantization: for 203 shares at
+            // $0.005, binary multiplication yields 1.0150000000000001 and
+            // rounds a cent too high.
+            decimal_product(&[size.abs(), *per_share]).unwrap_or_else(|| size.abs() * per_share)
+        } else {
+            rate_on_notional(price, size.abs(), *percentage)
+        };
+        let cap = if *max_percentage > 0.0 {
+            rate_on_notional(price, size.abs(), *max_percentage)
+        } else {
+            0.0
+        };
+        (base, cap)
+    }
+
+    /// The floor and the cap applied to a brokerage base charge.
+    fn brokerage_charge(&self, base: f64, cap: f64) -> f64 {
+        let FeeModel::Brokerage { minimum, max_percentage, .. } = self else {
+            return base;
+        };
+        let mut fee = base;
+        if *minimum > 0.0 {
+            fee = fee.max(*minimum);
+        }
+        if *max_percentage > 0.0 {
+            fee = fee.min(cap);
+        }
+        fee
     }
 
     /// Itemized costs for one side of a trade.
@@ -257,6 +337,30 @@ mod tests {
         assert!((fee.calculate(258.26, 36.0, Direction::Long) - 1.0).abs() < 1e-10);
         assert!((fee.calculate(100.0, 1_000.0, Direction::Long) - 5.0).abs() < 1e-10);
         assert!((fee.calculate(1.0, 10.0, Direction::Long) - 0.10).abs() < 1e-10);
+    }
+
+    #[test]
+    fn a_brokerage_order_billed_in_pieces_owes_what_it_owes_whole() {
+        let fee = FeeModel::brokerage(0.0, 0.005, 1.0, 0.01);
+        assert!(fee.bills_per_order());
+
+        let first = fee.accrue(&OrderBilling::default(), 100.0, 40.0).expect("per order");
+        assert_eq!(fee.order_charge(&first), fee.calculate(100.0, 40.0, Direction::Long));
+        let whole = fee.accrue(&first, 100.0, 260.0).expect("per order");
+        assert!(
+            (fee.order_charge(&whole) - fee.calculate(100.0, 300.0, Direction::Long)).abs() < 1e-12
+        );
+        // The cap is the whole order's too: 10 shares at $1 cap at 10 cents.
+        let tiny = fee.accrue(&OrderBilling::default(), 1.0, 4.0).expect("per order");
+        let tiny = fee.accrue(&tiny, 1.0, 6.0).expect("per order");
+        assert!((fee.order_charge(&tiny) - 0.10).abs() < 1e-12);
+    }
+
+    #[test]
+    fn a_linear_schedule_bills_each_fill() {
+        assert!(!FeeModel::Percentage(0.001).bills_per_order());
+        assert!(!FeeModel::brokerage(0.001, 0.0, 0.0, 0.0).bills_per_order());
+        assert!(FeeModel::Percentage(0.001).accrue(&OrderBilling::default(), 100.0, 1.0).is_none());
     }
 
     #[test]

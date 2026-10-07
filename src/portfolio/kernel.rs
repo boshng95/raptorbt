@@ -26,7 +26,7 @@ use crate::execution::orders::{
 #[cfg(test)]
 use crate::execution::orders::OrderSide;
 use crate::execution::queue::QueueTracker;
-use crate::execution::{BarLiquidity, FeeModel, FillModel, FillPrice, SlippageModel};
+use crate::execution::{BarLiquidity, FeeModel, FillModel, FillPrice, OrderBilling, SlippageModel};
 use crate::instruments::{InstrumentKind, InstrumentSpec};
 use crate::portfolio::ledger::{PositionLedger, PositionPolicy, ReduceOutcome};
 use crate::portfolio::option_groups::OptionLeg;
@@ -369,6 +369,24 @@ pub(crate) struct FillTerms {
     /// the bar it beat has not happened yet. `None` stamps the bar, which is
     /// when every other fill occurs.
     pub at: Option<Timestamp>,
+    /// How the fill is charged.
+    pub fee: FillFee,
+}
+
+impl FillTerms {
+    /// Terms for a fill nothing constrains: a whole, fresh order.
+    pub const WHOLE: Self = Self {
+        cap: f64::INFINITY,
+        all_or_none: false,
+        resuming: false,
+        at: None,
+        fee: FillFee::OWN,
+    };
+}
+
+/// How one fill is charged.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct FillFee {
     /// Commission already settled for this leg, when it is one half of a
     /// fill the venue billed once.
     ///
@@ -377,14 +395,21 @@ pub(crate) struct FillTerms {
     /// brokerage schedule with a per-order floor or a notional cap is not
     /// linear in size -- so pricing each leg on its own would bill an amount
     /// the venue never took. `None` means the ordinary charge for this
-    /// fill's own size.
-    pub fee: Option<f64>,
+    /// fill's size.
+    pub settled: Option<f64>,
+    /// The order this fill belongs to, when it came from one.
+    ///
+    /// A broker bills the order, not each print it took: under a schedule
+    /// with a floor or a cap, a fill pays the order's charge on everything
+    /// filled so far less what its earlier fills paid (see
+    /// [`OrderBilling`]). A fill with no order -- a signal entry, a stop, a
+    /// liquidation -- is the whole of its own order.
+    pub order: Option<u64>,
 }
 
-impl FillTerms {
-    /// Terms for a fill nothing constrains: a whole, fresh order.
-    pub const WHOLE: Self =
-        Self { cap: f64::INFINITY, all_or_none: false, resuming: false, at: None, fee: None };
+impl FillFee {
+    /// The ordinary charge for a fill that is its own order.
+    pub const OWN: Self = Self { settled: None, order: None };
 }
 
 /// What one opening fill did.
@@ -1643,7 +1668,16 @@ impl EngineKernel {
         reason: ExitReason,
         at: Option<Timestamp>,
     ) -> Option<EngineEvent> {
-        match self.reduce_at(idx, bar, position_id, exit_price, reason, f64::INFINITY, at, None) {
+        match self.reduce_at(
+            idx,
+            bar,
+            position_id,
+            exit_price,
+            reason,
+            f64::INFINITY,
+            at,
+            FillFee::OWN,
+        ) {
             ReduceResult::Closed { event, .. } => Some(event),
             _ => None,
         }
@@ -1676,6 +1710,7 @@ impl EngineKernel {
         held: Direction,
         open_size: f64,
         taking: f64,
+        order: Option<u64>,
     ) -> (Option<f64>, f64, f64) {
         let flip = self.round_size((taking - open_size).max(0.0));
         if !(flip > 0.0) {
@@ -1684,13 +1719,48 @@ impl EngineKernel {
         let filled = open_size + flip;
         let exit_price = self.slippage_model.apply(price, held, false, Some(bar.volume));
         let fee_price = exit_price * self.multiplier();
-        let total =
-            self.quantize_money(match self.fee_model.breakdown(fee_price, filled, held, false) {
-                Some(b) => b.total(),
-                None => self.fee_model.calculate(fee_price, filled, held),
-            });
+        let total = match self.bill_fill(FillFee { settled: None, order }, fee_price, filled) {
+            Some((charge, _)) => charge,
+            None => self.quantize_money(
+                match self.fee_model.breakdown(fee_price, filled, held, false) {
+                    Some(b) => b.total(),
+                    None => self.fee_model.calculate(fee_price, filled, held),
+                },
+            ),
+        };
         let close = self.quantize_money(total * (open_size / filled));
         (Some(close), flip, total - close)
+    }
+
+    /// What a fill of an order pays under a schedule that bills the order,
+    /// and the billing the order holds once the fill stands.
+    ///
+    /// The fill pays the order's charge on everything filled so far, less
+    /// what its earlier fills paid -- so however many prints an order takes,
+    /// together they pay the schedule once on its whole size. A settled leg
+    /// pays what it was settled at and still advances the order's billing
+    /// by its own size. `None` for a fill with no order, or a schedule that
+    /// bills each fill; the caller charges the fill's own size.
+    fn bill_fill(&self, fee: FillFee, fee_price: f64, size: f64) -> Option<(f64, OrderBilling)> {
+        let prior = self.orders.get(fee.order?)?.billing;
+        let next = self.fee_model.accrue(&prior, fee_price, size)?;
+        let charge = match fee.settled {
+            Some(settled) => settled,
+            None => {
+                let total = self.quantize_money(self.fee_model.order_charge(&next));
+                self.quantize_money((total - prior.charged).max(0.0))
+            }
+        };
+        Some((charge, OrderBilling { charged: prior.charged + charge, ..next }))
+    }
+
+    /// Record what a fill that stood billed its order.
+    fn settle_billing(&mut self, fee: FillFee, billed: Option<(f64, OrderBilling)>) {
+        if let (Some(id), Some((_, billing))) = (fee.order, billed) {
+            if let Some(order) = self.orders.get_mut(id) {
+                order.billing = billing;
+            }
+        }
     }
 
     /// Take up to `cap` units off a position at a determined price.
@@ -1713,7 +1783,7 @@ impl EngineKernel {
         reason: ExitReason,
         cap: f64,
         at: Option<Timestamp>,
-        fee: Option<f64>,
+        fee: FillFee,
     ) -> ReduceResult {
         let Some(managed) = self.ledger.get(position_id) else { return ReduceResult::None };
         let direction = managed.position.direction;
@@ -1735,9 +1805,10 @@ impl EngineKernel {
         // per-contract schedules charge per contract, not per notional unit.
         let fee_price = exit_price * self.multiplier();
         let exit_breakdown = self.fee_model.breakdown(fee_price, size, direction, false);
-        let fees = match fee {
-            Some(settled) => settled,
-            None => self.quantize_money(match exit_breakdown {
+        let billed = self.bill_fill(fee, fee_price, size);
+        let fees = match (billed, fee.settled) {
+            (Some((charge, _)), _) | (None, Some(charge)) => charge,
+            (None, None) => self.quantize_money(match exit_breakdown {
                 Some(b) => b.total(),
                 None => self.fee_model.calculate(fee_price, size, direction),
             }),
@@ -1764,10 +1835,12 @@ impl EngineKernel {
         match outcome {
             ReduceOutcome::None => ReduceResult::None,
             ReduceOutcome::Reduced { size, gross_pnl, .. } => {
+                self.settle_billing(fee, billed);
                 self.credit_exit_fill(position_id, size, open_size, gross_pnl, fees, exit_price);
                 ReduceResult::Reduced { size, price: exit_price, fees, gross_realized: gross_pnl }
             }
             ReduceOutcome::Closed { size, trade, gross_pnl } => {
+                self.settle_billing(fee, billed);
                 self.credit_exit_fill(position_id, size, open_size, gross_pnl, fees, exit_price);
                 ReduceResult::Closed {
                     size,
@@ -2021,9 +2094,10 @@ impl EngineKernel {
         // Same per-contract price convention as the exit path: notional
         // scaling rides on the price, contract count stays raw.
         let entry_breakdown = self.fee_model.breakdown(contract_value, size, direction, true);
-        let entry_fees = match terms.fee {
-            Some(settled) => settled,
-            None => self.quantize_money(match entry_breakdown {
+        let billed = self.bill_fill(terms.fee, contract_value, size);
+        let entry_fees = match (billed, terms.fee.settled) {
+            (Some((charge, _)), _) | (None, Some(charge)) => charge,
+            (None, None) => self.quantize_money(match entry_breakdown {
                 Some(b) => b.total(),
                 None => self.fee_model.calculate(contract_value, size, direction),
             }),
@@ -2117,6 +2191,7 @@ impl EngineKernel {
                 self.book_cash(&[-entry_fees]);
             }
         }
+        self.settle_billing(terms.fee, billed);
         Some(OpenResult {
             event: EngineEvent::Entered { idx, price: adjusted_price, size, direction },
             requested,

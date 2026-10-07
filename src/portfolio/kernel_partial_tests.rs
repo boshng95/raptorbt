@@ -277,3 +277,105 @@ fn an_order_in_flight_cannot_fill_before_its_latency_elapses() {
     );
     assert!(kernel.is_in_position());
 }
+
+fn brokerage_kernel(fee_model: FeeModel) -> EngineKernel {
+    let config = BacktestConfig { partial_fills: true, ..BacktestConfig::default() };
+    let instrument =
+        InstrumentConfig { currency_precision: Some(2), ..InstrumentConfig::default() };
+    EngineKernel::new(
+        config,
+        fee_model,
+        SlippageModel::None,
+        FillPrice::Close,
+        "TEST".to_string(),
+        Direction::Long,
+        Some(&instrument),
+    )
+}
+
+fn commissions(events: &[EngineEvent]) -> Vec<f64> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            EngineEvent::OrderFilled { commission, .. } => Some(*commission),
+            _ => None,
+        })
+        .collect()
+}
+
+/// IB US equities: $0.005 a share, $1 an order, at most 1% of its value.
+fn ib_us() -> FeeModel {
+    FeeModel::brokerage(0.0, 0.005, 1.0, 0.01)
+}
+
+#[test]
+fn an_order_split_across_prints_pays_the_brokers_minimum_once() {
+    // 100 shares is 50 cents at $0.005, so IB bills the $1 minimum -- once,
+    // for the order. Billing each print would charge it twice.
+    let mut kernel = brokerage_kernel(ib_us());
+    submit(&mut kernel, OrderSide::Buy, QtySpec::Units(100.0), TimeInForce::Gtc, "o");
+    let first = kernel.step_trade(1, &print(1, 100.0, 40.0), StepInput::default());
+    let second = kernel.step_trade(2, &print(2, 110.0, 60.0), StepInput::default());
+
+    assert_eq!(commissions(&first), vec![1.0]);
+    assert_eq!(commissions(&second), vec![0.0]);
+    assert!((kernel.cash() - (100_000.0 - 4_000.0 - 6_600.0 - 1.0)).abs() < 1e-9);
+}
+
+#[test]
+fn the_fills_of_an_order_together_pay_what_the_whole_order_costs() {
+    // 300 shares cost $1.50 per share-rate: the first 100 pay the $1 floor
+    // and the next 200 the 50 cents the order owes past it.
+    let mut kernel = brokerage_kernel(ib_us());
+    submit(&mut kernel, OrderSide::Buy, QtySpec::Units(300.0), TimeInForce::Gtc, "o");
+    let first = kernel.step_trade(1, &print(1, 100.0, 100.0), StepInput::default());
+    let second = kernel.step_trade(2, &print(2, 100.0, 200.0), StepInput::default());
+
+    assert_eq!(commissions(&first), vec![1.0]);
+    assert_eq!(commissions(&second), vec![0.5]);
+    let whole = ib_us().calculate(100.0, 300.0, Direction::Long);
+    assert!((1.0 + 0.5 - whole).abs() < 1e-12, "{whole}");
+}
+
+#[test]
+fn a_percentage_schedule_with_a_floor_bills_the_order_on_its_whole_value() {
+    // IB Australia: 0.088% with an AUD 6.60 floor. 40 at 100 alone is 3.52,
+    // so the first print pays the floor; the order's 10,600 owes 9.33, and
+    // the second print pays the 2.73 left.
+    let asx = FeeModel::brokerage(0.00088, 0.0, 6.60, 0.0);
+    let mut kernel = brokerage_kernel(asx);
+    submit(&mut kernel, OrderSide::Buy, QtySpec::Units(100.0), TimeInForce::Gtc, "o");
+    let first = kernel.step_trade(1, &print(1, 100.0, 40.0), StepInput::default());
+    let second = kernel.step_trade(2, &print(2, 110.0, 60.0), StepInput::default());
+
+    assert_eq!(commissions(&first), vec![6.6]);
+    assert_eq!(commissions(&second), vec![2.73]);
+}
+
+#[test]
+fn a_closing_order_split_across_prints_pays_the_minimum_once() {
+    let mut kernel = brokerage_kernel(ib_us());
+    submit(&mut kernel, OrderSide::Buy, QtySpec::Units(100.0), TimeInForce::Gtc, "o");
+    kernel.step_trade(1, &print(1, 100.0, 100.0), StepInput::default());
+    submit(&mut kernel, OrderSide::Sell, QtySpec::Units(100.0), TimeInForce::Gtc, "c");
+    let first = kernel.step_trade(2, &print(2, 110.0, 40.0), StepInput::default());
+    let second = kernel.step_trade(3, &print(3, 110.0, 60.0), StepInput::default());
+
+    assert_eq!(commissions(&first), vec![1.0]);
+    assert_eq!(commissions(&second), vec![0.0]);
+    assert!(kernel.position_snapshot().is_none());
+    // Two orders, two minimums: one to buy, one to sell.
+    assert!((kernel.cash() - (100_000.0 + 1_000.0 - 2.0)).abs() < 1e-9);
+}
+
+#[test]
+fn separate_orders_each_pay_their_own_minimum() {
+    let mut kernel = brokerage_kernel(ib_us());
+    submit(&mut kernel, OrderSide::Buy, QtySpec::Units(40.0), TimeInForce::Gtc, "a");
+    let first = kernel.step_trade(1, &print(1, 100.0, 40.0), StepInput::default());
+    submit(&mut kernel, OrderSide::Sell, QtySpec::Units(40.0), TimeInForce::Gtc, "b");
+    let second = kernel.step_trade(2, &print(2, 100.0, 40.0), StepInput::default());
+
+    assert_eq!(commissions(&first), vec![1.0]);
+    assert_eq!(commissions(&second), vec![1.0]);
+}

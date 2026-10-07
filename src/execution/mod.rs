@@ -9,7 +9,7 @@ pub mod queue;
 pub mod slippage;
 
 pub use algos::{AlgoEngine, AlgoError, AlgoSchedule, ExecAlgorithm, PendingSlice};
-pub use fees::FeeModel;
+pub use fees::{FeeModel, OrderBilling};
 pub use fill::{
     BarLiquidity, BarTape, FillDepth, FillModel, FillPrice, NextPrint, StepKind, Tail, Tape,
 };
