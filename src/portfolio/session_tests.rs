@@ -330,13 +330,13 @@ fn a_walk_settles_one_instrument_without_consuming_its_schedule() {
     );
 
     let remaining = session.remaining();
-    let equity_points = session.equity_curve.len();
+    let equity_points = session.curve.len();
     let cash = session.cash();
 
     let events = session.walk_book(0, 12);
     assert_eq!(filled_size(&events), 250.0, "one bite of the book, not the order");
     assert_eq!(session.remaining(), remaining, "no schedule entry was consumed");
-    assert_eq!(session.equity_curve.len(), equity_points, "no market event, no equity point");
+    assert_eq!(session.curve.len(), equity_points, "no market event, no equity point");
     assert!((cash - session.cash() - 25_000.0).abs() < 1e-6, "the shared pool paid for it");
 
     // And again: the book does not deplete, so the next batch is worth
@@ -515,7 +515,8 @@ fn cash_mode_arithmetic_unchanged() {
     }
     // Exact equality, not approximate: these feed the golden metrics.
     assert_eq!(session.cash(), session.free_capital());
-    let curve = session.equity_curve.clone();
+    let curve = session.finish().result.equity_curve;
+    // One sample per instant: the two names never print together here.
     assert_eq!(curve.len(), 6);
     // Marked at full position value throughout, as the cash model does.
     assert_eq!(curve[0], 100_000.0);
@@ -1075,6 +1076,41 @@ fn remaining_counts_unapplied_events() {
         },
     );
     assert_eq!(session.remaining(), 1);
+}
+
+#[test]
+fn an_instant_is_sampled_once_every_name_has_printed_at_it() {
+    // Both names print at every instant. Sampled after each event, the
+    // curve would carry two points per instant, and the first would price
+    // BBB one print stale -- here a point no real book ever held, since AAA
+    // rallies and BBB falls in the same instant.
+    let config = BacktestConfig { fees: 0.0, ..BacktestConfig::default() };
+    let mut session = EventSession::new(config);
+    let a = session.add_instrument("AAA".into(), Direction::Long, None, None, PositionPolicy::Net);
+    let b = session.add_instrument("BBB".into(), Direction::Long, None, None, PositionPolicy::Net);
+    session.set_bars(a, bars(0, &[100.0, 120.0, 120.0]));
+    session.set_bars(b, bars(0, &[100.0, 60.0, 60.0]));
+    session.seal();
+    session.apply_current(StepInput { entry: true, size_mult: Some(0.5), ..StepInput::default() });
+    session.apply_current(StepInput { entry: true, ..StepInput::default() });
+    let held = |session: &EventSession, index: usize| {
+        session.kernel(index).position_snapshots().iter().map(|p| p.size).sum::<f64>()
+    };
+    let (qty_a, qty_b) = (held(&session, 0), held(&session, 1));
+    assert!(qty_a > 0.0 && qty_b > 0.0, "both legs are held");
+    let cash = session.cash();
+    while session.current().is_some() {
+        session.apply_current(StepInput::default());
+    }
+
+    let result = session.finish().result;
+    assert_eq!(result.timestamps, vec![0, 10, 20]);
+    // The instant at 10 is valued once both names are at their 10 close.
+    let at_ten = cash + qty_a * 120.0 + qty_b * 60.0;
+    assert!((result.equity_curve[1] - at_ten).abs() < 1e-6, "curve {:?}", result.equity_curve);
+    // AAA's print alone would have marked the book above anything it held.
+    let torn = cash + qty_a * 120.0 + qty_b * 100.0;
+    assert!(result.equity_curve.iter().all(|&v| v < torn - 1.0));
 }
 
 #[test]

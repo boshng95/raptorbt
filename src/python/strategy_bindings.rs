@@ -350,10 +350,13 @@ impl PyKernelSession {
     /// `entry`/`exit` carry the strategy's order intents for this bar;
     /// `stop_price`/`target_price` optionally pin explicit exit levels for an
     /// entry opened on this bar, overriding the configured stop/target models.
+    /// `clock_only` marks a bar the driver made up to advance the venue clock
+    /// through a data gap: it matches like any bar but, with no price traded,
+    /// opens no instant of the equity curve (see `SingleRunner::step_clock`).
     #[pyo3(signature = (
         idx, timestamp, open, high, low, close, volume,
         entry=false, exit=false, atr=0.0, size_mult=None,
-        stop_price=None, target_price=None,
+        stop_price=None, target_price=None, clock_only=false,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn step(
@@ -371,6 +374,7 @@ impl PyKernelSession {
         size_mult: Option<f64>,
         stop_price: Option<f64>,
         target_price: Option<f64>,
+        clock_only: bool,
     ) -> PyResult<Vec<PyEngineEvent>> {
         let runner = self
             .runner
@@ -390,7 +394,12 @@ impl PyKernelSession {
             entry_direction: None,
         };
 
-        Ok(runner.step(idx, &bar, input).into_iter().map(PyEngineEvent::from).collect())
+        let events = if clock_only {
+            runner.step_clock(idx, &bar, input)
+        } else {
+            runner.step(idx, &bar, input)
+        };
+        Ok(events.into_iter().map(PyEngineEvent::from).collect())
     }
 
     /// Step consecutive bars with no Python handlers, stopping at the first

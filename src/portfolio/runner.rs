@@ -15,6 +15,7 @@ use crate::execution::orders::OrderRecord;
 use crate::execution::{FeeModel, FillPrice, SlippageModel};
 use crate::instruments::InstrumentSpec;
 use crate::metrics::streaming::StreamingMetrics;
+use crate::portfolio::curve::InstantCurve;
 use crate::portfolio::engine::{compute_backtest_metrics_with_config, PortfolioEngine};
 use crate::portfolio::kernel::{EngineEvent, EngineKernel, KernelBar, StepInput};
 
@@ -27,17 +28,23 @@ use crate::portfolio::kernel::{EngineEvent, EngineKernel, KernelBar, StepInput};
 pub struct SingleRunner {
     kernel: EngineKernel,
     config: BacktestConfig,
-    equity_curve: Vec<f64>,
-    drawdown_curve: Vec<f64>,
-    returns: Vec<f64>,
-    timestamps: Vec<i64>,
+    /// One sample per bar instant, taken once the instant has settled; see
+    /// [`InstantCurve`].
+    curve: InstantCurve,
     trades: Vec<Trade>,
     /// What became of every order, keyed by id. A map because one order is
     /// mutated across several events (accepted, then triggered, then filled
     /// in slices); the book supplies submission order at `finish`.
     order_events: HashMap<u64, OrderRecord>,
     streaming: StreamingMetrics,
-    peak_equity: f64,
+    /// Equity marked at the most recent step's close: what the strategy and
+    /// the kill-switch see, before anything the strategy then does at that
+    /// instant.
+    marked_equity: f64,
+    /// High-water mark of `marked_equity`, which the kill-switch measures
+    /// its drawdown from.
+    risk_peak: f64,
+    steps: usize,
     last_bar: Option<(usize, KernelBar)>,
     daily_performance_transitions: Option<Vec<(i64, i64)>>,
 }
@@ -72,14 +79,13 @@ impl SingleRunner {
         Self {
             kernel,
             config,
-            equity_curve: Vec::new(),
-            drawdown_curve: Vec::new(),
-            returns: Vec::new(),
-            timestamps: Vec::new(),
+            curve: InstantCurve::new(initial_capital),
             trades: Vec::new(),
             order_events: HashMap::new(),
             streaming: StreamingMetrics::new(),
-            peak_equity: initial_capital,
+            marked_equity: initial_capital,
+            risk_peak: initial_capital,
+            steps: 0,
             last_bar: None,
             daily_performance_transitions,
         }
@@ -131,6 +137,45 @@ impl SingleRunner {
     /// The returned events are the same ones the kernel produced; completed
     /// trades have already been recorded internally.
     pub fn step(&mut self, idx: usize, bar: &KernelBar, input: StepInput) -> Vec<EngineEvent> {
+        self.advance(idx, bar, input, true)
+    }
+
+    /// Advance the venue clock to `bar` without a market print.
+    ///
+    /// A driver whose data has a gap still has to let the strategy act when
+    /// one of its own clocks fires inside it -- a composite window closing,
+    /// say -- and the venue matches what it submits against the standing
+    /// book. Such a driver steps a degenerate bar held at the last close.
+    /// The kernel treats it like any other bar, so orders match exactly as
+    /// they would on a stepped bar; but no price traded, so it is not an
+    /// instant of the equity curve. Whatever it fills belongs to the instant
+    /// of the last real bar, still settling until the next one arrives --
+    /// which is where the reference engine, whose timers fire between prints,
+    /// books it too.
+    pub fn step_clock(
+        &mut self,
+        idx: usize,
+        bar: &KernelBar,
+        input: StepInput,
+    ) -> Vec<EngineEvent> {
+        self.advance(idx, bar, input, false)
+    }
+
+    fn advance(
+        &mut self,
+        idx: usize,
+        bar: &KernelBar,
+        input: StepInput,
+        priced: bool,
+    ) -> Vec<EngineEvent> {
+        // A later priced bar means the previous one's instant has finished
+        // settling, fills the strategy provoked off-schedule (`walk_book`) or
+        // on a clock bar included.
+        if priced && self.curve.closes(bar.timestamp) {
+            if let Some((_, last)) = self.last_bar {
+                self.curve.close(self.kernel.equity(last.close));
+            }
+        }
         let events = self.kernel.step(idx, bar, input);
 
         for event in &events {
@@ -154,25 +199,20 @@ impl SingleRunner {
         }
 
         let equity = self.kernel.equity(bar.close);
-        let prev_equity = self.equity_curve.last().copied();
-        self.equity_curve.push(equity);
-
-        if equity > self.peak_equity {
-            self.peak_equity = equity;
+        self.marked_equity = equity;
+        if equity > self.risk_peak {
+            self.risk_peak = equity;
         }
-        self.drawdown_curve.push((self.peak_equity - equity) / self.peak_equity * 100.0);
 
         // Feed the kill-switch after this bar is marked to market, so the
         // halt takes effect from the next bar's entry check onward.
-        self.kernel.observe_equity(equity, self.peak_equity);
+        self.kernel.observe_equity(equity, self.risk_peak);
 
-        let ret = match prev_equity {
-            Some(prev) if prev != 0.0 => (equity - prev) / prev,
-            _ => 0.0,
-        };
-        self.returns.push(ret);
-        self.timestamps.push(bar.timestamp);
+        if priced {
+            self.curve.open_at(bar.timestamp);
+        }
         self.last_bar = Some((idx, *bar));
+        self.steps += 1;
 
         events
     }
@@ -188,8 +228,9 @@ impl SingleRunner {
     /// resting orders are matched, against the last bar this runner stepped,
     /// dated to the instant of the walk.
     ///
-    /// No equity point is sampled, because no bar arrived. The next `step`
-    /// marks the position these fills opened or closed.
+    /// No equity point is sampled here: these fills belong to the instant of
+    /// the last bar, which is sampled once it has settled -- when the next
+    /// bar arrives, or at `finish`.
     pub fn walk_book(&mut self, ts_now: i64) -> Vec<EngineEvent> {
         let Some((idx, last)) = self.last_bar else { return Vec::new() };
         let bar = KernelBar { timestamp: ts_now, ..last };
@@ -205,7 +246,6 @@ impl SingleRunner {
         events
     }
 
-    /// Force-close any open position and compute final metrics.
     /// Fold one fill slice onto the order's record.
     ///
     /// The record is seeded from the book here rather than at submission, so
@@ -268,6 +308,7 @@ impl SingleRunner {
             .collect()
     }
 
+    /// Force-close any open position and compute final metrics.
     pub fn finish(mut self) -> BacktestResult {
         if self.kernel.is_in_position() {
             if let Some((idx, bar)) = self.last_bar {
@@ -280,50 +321,46 @@ impl SingleRunner {
 
         // Built before the result takes ownership of the parts.
         let order_log = self.order_log();
+        // The last instant closes at the settled account: flat, so the
+        // end-of-data close above is already in the balance.
         let final_equity = self
             .last_bar
             .map_or(self.config.initial_capital, |(_, bar)| self.kernel.equity(bar.close));
+        self.curve.close(final_equity);
+        let mut curve = std::mem::replace(&mut self.curve, InstantCurve::new(0.0)).into_parts();
 
         let metrics = compute_backtest_metrics_with_config(
-            &self.equity_curve,
-            &self.drawdown_curve,
-            &self.returns,
+            &curve.equity,
+            &curve.drawdown,
+            &curve.returns,
             &self.trades,
-            &self.timestamps,
+            &curve.timestamps,
             &self.config,
         );
 
         let daily_performance = self.daily_performance_transitions.take().map(|transitions| {
             let mut collector = DailyPerformanceCollector::new(transitions);
-            for (&timestamp, &equity) in self.timestamps.iter().zip(&self.equity_curve) {
+            for (&timestamp, &equity) in curve.timestamps.iter().zip(&curve.equity) {
                 collector.observe(timestamp, equity);
             }
-            collector.reconcile_final(final_equity);
             collector.finish()
         });
 
         if !self.config.retain_curves {
-            self.equity_curve = Vec::new();
-            self.drawdown_curve = Vec::new();
-            self.returns = Vec::new();
+            curve = Default::default();
         }
 
-        BacktestResult::new(
-            metrics,
-            self.equity_curve,
-            self.drawdown_curve,
-            self.trades,
-            self.returns,
-        )
-        .with_orders(order_log)
-        .with_daily_performance(daily_performance)
+        BacktestResult::new(metrics, curve.equity, curve.drawdown, self.trades, curve.returns)
+            .with_timestamps(curve.timestamps)
+            .with_orders(order_log)
+            .with_daily_performance(daily_performance)
     }
 
     /// Mark-to-market equity after the most recent step, or initial capital
     /// before the first step.
     #[inline]
     pub fn equity(&self) -> f64 {
-        self.equity_curve.last().copied().unwrap_or(self.config.initial_capital)
+        self.marked_equity
     }
 
     /// Current uninvested cash.
@@ -341,7 +378,7 @@ impl SingleRunner {
     /// Number of bars stepped so far.
     #[inline]
     pub fn bars_seen(&self) -> usize {
-        self.equity_curve.len()
+        self.steps
     }
 
     /// Mutable access to the underlying kernel, for callers that adjust
@@ -355,5 +392,105 @@ impl SingleRunner {
     #[inline]
     pub fn kernel(&self) -> &EngineKernel {
         &self.kernel
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::execution::orders::{OrderKind, OrderSide, QtySpec, TimeInForce};
+
+    fn bar(timestamp: i64, close: f64) -> KernelBar {
+        KernelBar {
+            timestamp,
+            open: close,
+            high: close + 1.0,
+            low: close - 1.0,
+            close,
+            volume: 1e9,
+        }
+    }
+
+    #[test]
+    fn a_fill_from_a_book_walk_is_in_its_own_instants_sample() {
+        // The strategy answers bar 0's fills with an order the venue matches
+        // off-schedule, at the same instant. Sampled straight after the step,
+        // the curve would miss that fill; the instant is sampled once it has
+        // settled, so it is in.
+        let config = BacktestConfig { fees: 0.0, ..BacktestConfig::default() };
+        let mut runner = SingleRunner::from_config(config, "AAA".into(), Direction::Long, None);
+        runner.step(0, &bar(0, 100.0), StepInput::default());
+        let marked = runner.equity();
+        runner.kernel_mut().submit_order(
+            OrderSide::Buy,
+            QtySpec::Units(100.0),
+            OrderKind::Limit { price: 101.0 },
+            TimeInForce::Gtc,
+            0,
+            0,
+            "on-fill".to_string(),
+            None,
+            None,
+        );
+        runner.walk_book(0);
+        assert!(runner.is_in_position(), "the walk filled the order");
+        let settled = runner.kernel().equity(100.0);
+        assert_eq!(runner.equity(), marked, "sizing still sees the bar's own mark");
+
+        runner.step(1, &bar(10, 110.0), StepInput::default());
+        let result = runner.finish();
+
+        assert_eq!(result.timestamps, vec![0, 10]);
+        assert_eq!(result.equity_curve[0], settled);
+        assert!(result.equity_curve[1] > settled, "the position gained into the close");
+    }
+
+    #[test]
+    fn a_clock_bar_matches_but_is_not_an_instant() {
+        // A composite window closes inside a data gap: the driver steps a bar
+        // held at the last close so the strategy's order meets the standing
+        // book. The order fills there, but nothing traded at that time, so
+        // the fill is booked to the last real bar's instant and the curve has
+        // no sample of its own for the clock.
+        let config = BacktestConfig { fees: 0.001, ..BacktestConfig::default() };
+        let mut runner = SingleRunner::from_config(config, "AAA".into(), Direction::Long, None);
+        runner.step(0, &bar(0, 100.0), StepInput::default());
+        let before = runner.kernel().equity(100.0);
+        // Submitted on the timer, before the clock bar reaches the venue.
+        runner.kernel_mut().submit_order_full(
+            OrderSide::Buy,
+            QtySpec::Units(100.0),
+            OrderKind::Limit { price: 101.0 },
+            TimeInForce::Gtc,
+            1,
+            5,
+            "on-clock".to_string(),
+            None,
+            None,
+            false,
+            false,
+            true,
+            None,
+        );
+        let clock = KernelBar {
+            timestamp: 5,
+            open: 100.0,
+            high: 100.0,
+            low: 100.0,
+            close: 100.0,
+            volume: 0.0,
+        };
+        runner.step_clock(1, &clock, StepInput::default());
+        assert!(runner.is_in_position(), "the clock bar matched the order");
+        let settled = runner.kernel().equity(100.0);
+        assert!(settled < before, "the fill paid its fee");
+
+        runner.step(2, &bar(10, 110.0), StepInput::default());
+        assert_eq!(runner.bars_seen(), 3, "the kernel stepped every bar");
+        let result = runner.finish();
+
+        assert_eq!(result.timestamps, vec![0, 10]);
+        assert_eq!(result.equity_curve[0], settled);
+        assert!(result.equity_curve[1] > settled, "the position gained into the close");
     }
 }

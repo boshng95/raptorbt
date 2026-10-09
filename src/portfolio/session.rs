@@ -7,9 +7,11 @@
 //! the pool before stepping and drained back after, so capital committed to
 //! one instrument is unavailable to the others.
 //!
-//! Portfolio equity is sampled once per schedule event: the account balance
-//! plus every instrument's mark at its last known close — position value in
-//! cash mode, direction-aware unrealized PnL under margin.
+//! Portfolio equity is the account balance plus every instrument's mark at
+//! its last known close — position value in cash mode, direction-aware
+//! unrealized PnL under margin. The curve samples it once per instant, after
+//! the instant has settled (see [`InstantCurve`]); risk controls read it after
+//! every event.
 //!
 //! Capital lives in one [`SharedAccount`]. Cash mode reproduces the original
 //! single-pool arithmetic exactly. Margin mode additionally tracks locked
@@ -39,6 +41,7 @@ use crate::data::{
 };
 use crate::instruments::InstrumentSpec;
 use crate::metrics::streaming::StreamingMetrics;
+use crate::portfolio::curve::InstantCurve;
 use crate::portfolio::engine::compute_backtest_metrics_with_config;
 use crate::portfolio::kernel::{EngineEvent, EngineKernel, KernelBar, StepInput};
 use crate::portfolio::ledger::PositionPolicy;
@@ -156,12 +159,12 @@ pub struct EventSession {
     account: SharedAccount,
     last_close: Vec<Option<f64>>,
     last_seen: Vec<Option<(usize, KernelBar)>>,
-    equity_curve: Vec<f64>,
-    drawdown_curve: Vec<f64>,
-    returns: Vec<f64>,
-    timestamps: Vec<i64>,
+    /// One sample per instant, taken once every event of it has been applied.
+    curve: InstantCurve,
     trades: Vec<Trade>,
     streaming: StreamingMetrics,
+    /// High-water mark of the equity the risk controls are fed after every
+    /// event; the kill-switch measures its drawdown from here.
     peak_equity: f64,
     sealed: bool,
     daily_performance_transitions: Option<Vec<(i64, i64)>>,
@@ -198,10 +201,7 @@ impl EventSession {
             account: SharedAccount::new(mode, pool),
             last_close: Vec::new(),
             last_seen: Vec::new(),
-            equity_curve: Vec::new(),
-            drawdown_curve: Vec::new(),
-            returns: Vec::new(),
-            timestamps: Vec::new(),
+            curve: InstantCurve::new(pool),
             trades: Vec::new(),
             streaming: StreamingMetrics::new(),
             peak_equity: pool,
@@ -560,7 +560,7 @@ impl EventSession {
     /// pool with no fees, no fill, and no trade: debited from the balance in
     /// cash mode, locked as initial margin in a fully funded margin book.
     ///
-    /// Must be called before the first equity sample, and this is enforced:
+    /// Must be called before the first priced event, and this is enforced:
     /// adopting mid-run leaves the curve flat for the pre-adoption stretch,
     /// which holds the running peak down and makes the decline that follows
     /// measure against the wrong high-water mark. Max drawdown then reads
@@ -568,9 +568,9 @@ impl EventSession {
     /// The curve is written streaming, so this cannot be repaired later.
     ///
     /// The gate is the equity curve, not the event cursor: a quote or depth
-    /// snapshot advances the cursor without sampling equity, and a live feed
-    /// routinely delivers those before the first trade print. Adopting after
-    /// one corrupts nothing and stays allowed.
+    /// snapshot advances the cursor without opening an instant, and a live
+    /// feed routinely delivers those before the first trade print. Adopting
+    /// after one corrupts nothing and stays allowed.
     pub fn adopt_position(
         &mut self,
         instrument: usize,
@@ -581,7 +581,7 @@ impl EventSession {
         if instrument >= self.kernels.len() {
             return Err(format!("unknown instrument index {instrument}"));
         }
-        if !self.equity_curve.is_empty() {
+        if self.curve.has_started() {
             return Err("adopt_position must be called before the first applied event".to_string());
         }
         let kernel = &mut self.kernels[instrument];
@@ -669,6 +669,14 @@ impl EventSession {
         let Some(entry) = self.current() else { return Vec::new() };
         let instrument = entry.instrument;
 
+        // A print of a later instant means the previous one has settled:
+        // every instrument has printed at it, and everything the strategy did
+        // in answer has been walked. Sample it before this print moves a mark.
+        if entry.as_bar().is_some() && self.curve.closes(entry.timestamp()) {
+            let settled = self.equity();
+            self.curve.close(settled);
+        }
+
         // Portfolio-wide open count, skipped entirely when no limit is set.
         // Summing every kernel's ledger covers hedging policies, where one
         // instrument can hold several positions at once.
@@ -733,29 +741,24 @@ impl EventSession {
             self.last_seen[instrument] = Some((entry.local_idx, bar));
         }
 
-        // A quote does not sample equity. Marking on one would append a
-        // zero return per quote, inflating the period count and distorting
-        // annualized metrics purely from how chatty the feed is.
+        // A quote opens no instant and feeds no risk control. Sampling on
+        // one would append a zero return per quote, inflating the period
+        // count and distorting annualized metrics purely from how chatty the
+        // feed is.
         if matches!(entry.data, ScheduleData::Quote(_) | ScheduleData::Depth(_)) {
             self.advance();
             return events;
         }
+        self.curve.open_at(entry.timestamp());
 
-        // Sample the portfolio once per event; feed every kernel's
-        // kill-switch so a portfolio-level drawdown halts all entries.
+        // Risk reads the book after every event, not once per instant: a
+        // margin call or a drawdown halt must take effect before the next
+        // event is applied. Feed every kernel's kill-switch so a
+        // portfolio-level drawdown halts all entries.
         let equity = self.equity();
-        let prev = self.equity_curve.last().copied();
-        self.equity_curve.push(equity);
         if equity > self.peak_equity {
             self.peak_equity = equity;
         }
-        self.drawdown_curve.push((self.peak_equity - equity) / self.peak_equity * 100.0);
-        let ret = match prev {
-            Some(p) if p != 0.0 => (equity - p) / p,
-            _ => 0.0,
-        };
-        self.returns.push(ret);
-        self.timestamps.push(entry.timestamp());
 
         // Portfolio maintenance: the requirement is the sum of every
         // instrument's own requirement, so per-instrument `margin_maint`
@@ -855,10 +858,10 @@ impl EventSession {
     /// that could cross the standing book would have crossed it then.
     ///
     /// The account is shared exactly as it is on the step path: the kernel
-    /// is lent the portfolio's capital, walked, then drained back. Nothing
-    /// samples equity and the cursor does not move, because no market event
-    /// happened here -- the reference engine adds no data point for a
-    /// settlement either.
+    /// is lent the portfolio's capital, walked, then drained back. The cursor
+    /// does not move, because no market event happened here -- the reference
+    /// engine adds no data point for a settlement either. These fills belong
+    /// to the instant still settling, and are in its sample when it closes.
     ///
     /// An instrument that has not seen a bar yet has no book for its orders
     /// to meet, and yields nothing.
@@ -952,17 +955,18 @@ impl EventSession {
                 self.last_close[i] = None;
             }
         }
-        // Positions are flat; the final mark is the balance itself.
-        if let Some(last) = self.equity_curve.last_mut() {
-            *last = self.account.balance();
-        }
+        // Positions are flat, so the last instant closes at the balance the
+        // end-of-data close settled into.
+        let settled = self.equity();
+        self.curve.close(settled);
+        let mut curve = std::mem::replace(&mut self.curve, InstantCurve::new(0.0)).into_parts();
 
         let metrics = compute_backtest_metrics_with_config(
-            &self.equity_curve,
-            &self.drawdown_curve,
-            &self.returns,
+            &curve.equity,
+            &curve.drawdown,
+            &curve.returns,
             &self.trades,
-            &self.timestamps,
+            &curve.timestamps,
             &self.config,
         );
         let outcomes = self
@@ -983,27 +987,20 @@ impl EventSession {
 
         let daily_performance = self.daily_performance_transitions.take().map(|transitions| {
             let mut collector = DailyPerformanceCollector::new(transitions);
-            for (&timestamp, &equity) in self.timestamps.iter().zip(&self.equity_curve) {
+            for (&timestamp, &equity) in curve.timestamps.iter().zip(&curve.equity) {
                 collector.observe(timestamp, equity);
             }
-            collector.reconcile_final(self.account.balance());
             collector.finish()
         });
 
         if !self.config.retain_curves {
-            self.equity_curve = Vec::new();
-            self.drawdown_curve = Vec::new();
-            self.returns = Vec::new();
+            curve = Default::default();
         }
 
-        let result = BacktestResult::new(
-            metrics,
-            self.equity_curve,
-            self.drawdown_curve,
-            self.trades,
-            self.returns,
-        )
-        .with_daily_performance(daily_performance);
+        let result =
+            BacktestResult::new(metrics, curve.equity, curve.drawdown, self.trades, curve.returns)
+                .with_timestamps(curve.timestamps)
+                .with_daily_performance(daily_performance);
         SessionOutcome { result, instruments: outcomes, rejected_entries, halted, halted_at }
     }
 }

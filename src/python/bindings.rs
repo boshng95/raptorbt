@@ -1029,6 +1029,7 @@ pub struct PyBacktestResult {
     drawdown_curve: Vec<f64>,
     trades: Vec<PyTrade>,
     returns: Vec<f64>,
+    timestamps: Vec<i64>,
     orders: Vec<PyOrder>,
     daily_performance_timestamps: Vec<i64>,
     daily_performance_equity: Vec<f64>,
@@ -1049,6 +1050,13 @@ impl PyBacktestResult {
     /// Get returns as numpy array.
     fn returns<'py>(&self, py: Python<'py>) -> &'py PyArray1<f64> {
         vec_to_numpy_f64(py, self.returns.clone())
+    }
+
+    /// The instant each equity sample values, index-aligned with
+    /// `equity_curve()`. Empty when the run kept no curves or the driver
+    /// does not record instants.
+    fn timestamps<'py>(&self, py: Python<'py>) -> &'py PyArray1<i64> {
+        vec_to_numpy_i64(py, self.timestamps.clone())
     }
 
     /// UTC timestamps for compact exchange-local end-of-day marks.
@@ -2819,6 +2827,7 @@ pub(crate) fn convert_result(result: crate::core::types::BacktestResult) -> PyBa
         trades,
         orders,
         returns: result.returns,
+        timestamps: result.timestamps,
         daily_performance_timestamps,
         daily_performance_equity,
     }

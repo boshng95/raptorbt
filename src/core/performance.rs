@@ -89,14 +89,6 @@ impl DailyPerformanceCollector {
         }
     }
 
-    /// Reconcile the last retained point after end-of-data settlement.
-    #[inline]
-    pub fn reconcile_final(&mut self, equity: f64) {
-        if self.last_local_day.is_some() {
-            self.pending_equity = equity;
-        }
-    }
-
     pub fn finish(mut self) -> DailyPerformance {
         if self.last_local_day.is_some() {
             self.timestamps.push(self.pending_timestamp);
@@ -131,13 +123,5 @@ mod tests {
         let daily = collector.finish();
         assert_eq!(daily.timestamps, vec![16 * hour]);
         assert_eq!(daily.equity, vec![101.0]);
-    }
-
-    #[test]
-    fn final_reconciliation_updates_settled_value() {
-        let mut collector = DailyPerformanceCollector::new(Vec::new());
-        collector.observe(0, 100.0);
-        collector.reconcile_final(99.5);
-        assert_eq!(collector.finish().equity, vec![99.5]);
     }
 }

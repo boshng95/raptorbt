@@ -1077,6 +1077,12 @@ pub struct BacktestResult {
     pub trades: Vec<Trade>,
     /// Daily returns.
     pub returns: Vec<f64>,
+    /// When each equity sample was taken, index-aligned with `equity_curve`.
+    ///
+    /// Empty where the producing path does not date its samples -- the
+    /// array strategies sample once per input row, and their caller holds
+    /// those timestamps already -- or where curves were not retained.
+    pub timestamps: Vec<i64>,
     /// What became of every order the run placed, in submission order.
     ///
     /// A result reports the trades a strategy made; this reports the ones it
@@ -1106,9 +1112,18 @@ impl BacktestResult {
             drawdown_curve,
             trades,
             returns,
+            timestamps: Vec::new(),
             orders: Vec::new(),
             daily_performance: None,
         }
+    }
+
+    /// Date the equity samples. A builder for the same reason as
+    /// [`Self::with_orders`]: only the event-driven paths know when each
+    /// sample was taken.
+    pub fn with_timestamps(mut self, timestamps: Vec<i64>) -> Self {
+        self.timestamps = timestamps;
+        self
     }
 
     /// Attach the run's order log.
