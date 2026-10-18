@@ -443,6 +443,17 @@ pub enum FillTiming {
 pub struct BacktestConfig {
     /// Retain full curves in the completed result after exact metric computation.
     pub retain_curves: bool,
+    /// Compute the full metrics when the run finishes.
+    ///
+    /// On by default. Off, `metrics` carries only the run's start and end
+    /// value and its total return, every other field is left at its default,
+    /// and unless `retain_curves` asks for them the per-instant series are
+    /// never stored: a caller that reads only the closing equity, the trades
+    /// and the daily performance skips both the storage and the passes over
+    /// it. Honoured where `retain_curves` is: the single-instrument runner and
+    /// the portfolio session.
+    #[serde(default = "default_true")]
+    pub compute_metrics: bool,
     /// Retain one exchange-local end-of-day net-liquidation point.
     ///
     /// Disabled by default. Unlike `retain_curves`, memory grows with observed
@@ -660,10 +671,15 @@ fn default_one() -> f64 {
     1.0
 }
 
+fn default_true() -> bool {
+    true
+}
+
 impl Default for BacktestConfig {
     fn default() -> Self {
         Self {
             retain_curves: true,
+            compute_metrics: true,
             retain_daily_performance: false,
             performance_tz_transitions: Vec::new(),
             initial_capital: 100_000.0,
@@ -1053,6 +1069,20 @@ pub struct BacktestMetrics {
     /// diagnostic worth seeing. `None` when no measured winner exists.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mfe_capture_ratio: Option<f64>,
+}
+
+impl BacktestMetrics {
+    /// The metrics of a run that computed none: its start and end value and
+    /// the total return between them, every other field at its default. See
+    /// [`BacktestConfig::compute_metrics`].
+    pub fn unmeasured(start_value: f64, end_value: f64) -> Self {
+        Self {
+            total_return_pct: (end_value - start_value) / start_value * 100.0,
+            start_value,
+            end_value,
+            ..Self::default()
+        }
+    }
 }
 
 /// Compact daily performance data retained independently of full curves.

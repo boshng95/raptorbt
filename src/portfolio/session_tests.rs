@@ -1114,6 +1114,45 @@ fn an_instant_is_sampled_once_every_name_has_printed_at_it() {
 }
 
 #[test]
+fn a_session_that_computes_no_metrics_settles_the_same() {
+    let run = |compute_metrics: bool| {
+        let config = BacktestConfig {
+            fees: 0.001,
+            compute_metrics,
+            retain_curves: false,
+            retain_daily_performance: true,
+            ..BacktestConfig::default()
+        };
+        let mut session = EventSession::new(config);
+        let a =
+            session.add_instrument("AAA".into(), Direction::Long, None, None, PositionPolicy::Net);
+        let b =
+            session.add_instrument("BBB".into(), Direction::Long, None, None, PositionPolicy::Net);
+        session.set_bars(a, bars(0, &[100.0, 103.0, 101.0]));
+        session.set_bars(b, bars(5, &[50.0, 49.0, 52.0]));
+        session.seal();
+        session.apply_current(StepInput {
+            entry: true,
+            size_mult: Some(0.5),
+            ..StepInput::default()
+        });
+        session.apply_current(StepInput { entry: true, ..StepInput::default() });
+        while session.current().is_some() {
+            session.apply_current(StepInput::default());
+        }
+        session.finish().result
+    };
+    let (full, lean) = (run(true), run(false));
+    assert_eq!(full.metrics.total_trades, 2);
+    assert_eq!(lean.metrics.total_trades, 0, "nothing else is measured");
+    assert_eq!(lean.metrics.end_value, full.metrics.end_value);
+    assert_eq!(lean.metrics.total_return_pct, full.metrics.total_return_pct);
+    assert_eq!(format!("{:?}", lean.trades), format!("{:?}", full.trades));
+    assert_eq!(format!("{:?}", lean.daily_performance), format!("{:?}", full.daily_performance));
+    assert!(full.daily_performance.is_some_and(|d| d.equity.len() == 1));
+}
+
+#[test]
 fn adoption_after_an_applied_event_is_refused() {
     // Adopting mid-run understates max drawdown and understates it in the
     // flattering direction: the equity curve is written streaming, so the

@@ -9,8 +9,9 @@
 
 use std::collections::HashMap;
 
-use crate::core::performance::DailyPerformanceCollector;
-use crate::core::types::{BacktestConfig, BacktestResult, Direction, InstrumentConfig, Trade};
+use crate::core::types::{
+    BacktestConfig, BacktestMetrics, BacktestResult, Direction, InstrumentConfig, Trade,
+};
 use crate::execution::orders::OrderRecord;
 use crate::execution::{FeeModel, FillPrice, SlippageModel};
 use crate::instruments::InstrumentSpec;
@@ -46,7 +47,6 @@ pub struct SingleRunner {
     risk_peak: f64,
     steps: usize,
     last_bar: Option<(usize, KernelBar)>,
-    daily_performance_transitions: Option<Vec<(i64, i64)>>,
 }
 
 impl SingleRunner {
@@ -74,12 +74,15 @@ impl SingleRunner {
         )
         .with_risk_gate(risk);
 
-        let daily_performance_transitions =
-            config.retain_daily_performance.then(|| config.performance_tz_transitions.clone());
+        let curve = InstantCurve::new(initial_capital)
+            .recording(config.retain_curves || config.compute_metrics)
+            .with_daily_performance(
+                config.retain_daily_performance.then(|| config.performance_tz_transitions.clone()),
+            );
         Self {
             kernel,
             config,
-            curve: InstantCurve::new(initial_capital),
+            curve,
             trades: Vec::new(),
             order_events: HashMap::new(),
             streaming: StreamingMetrics::new(),
@@ -87,7 +90,6 @@ impl SingleRunner {
             risk_peak: initial_capital,
             steps: 0,
             last_bar: None,
-            daily_performance_transitions,
         }
     }
 
@@ -327,24 +329,23 @@ impl SingleRunner {
             .last_bar
             .map_or(self.config.initial_capital, |(_, bar)| self.kernel.equity(bar.close));
         self.curve.close(final_equity);
-        let mut curve = std::mem::replace(&mut self.curve, InstantCurve::new(0.0)).into_parts();
+        let mut curve = std::mem::replace(&mut self.curve, InstantCurve::new(0.0));
+        let daily_performance = curve.take_daily_performance();
+        let end_value = curve.last().unwrap_or(self.config.initial_capital);
+        let mut curve = curve.into_parts();
 
-        let metrics = compute_backtest_metrics_with_config(
-            &curve.equity,
-            &curve.drawdown,
-            &curve.returns,
-            &self.trades,
-            &curve.timestamps,
-            &self.config,
-        );
-
-        let daily_performance = self.daily_performance_transitions.take().map(|transitions| {
-            let mut collector = DailyPerformanceCollector::new(transitions);
-            for (&timestamp, &equity) in curve.timestamps.iter().zip(&curve.equity) {
-                collector.observe(timestamp, equity);
-            }
-            collector.finish()
-        });
+        let metrics = if self.config.compute_metrics {
+            compute_backtest_metrics_with_config(
+                &curve.equity,
+                &curve.drawdown,
+                &curve.returns,
+                &self.trades,
+                &curve.timestamps,
+                &self.config,
+            )
+        } else {
+            BacktestMetrics::unmeasured(self.config.initial_capital, end_value)
+        };
 
         if !self.config.retain_curves {
             curve = Default::default();
@@ -492,5 +493,53 @@ mod tests {
         assert_eq!(result.timestamps, vec![0, 10]);
         assert_eq!(result.equity_curve[0], settled);
         assert!(result.equity_curve[1] > settled, "the position gained into the close");
+    }
+
+    /// Bought on the first of five bars twelve hours apart and held, so the
+    /// run crosses two day boundaries and ends in the end-of-data close.
+    fn held_across_days(config: BacktestConfig) -> BacktestResult {
+        const HALF_DAY: i64 = 43_200_000_000_000;
+        let mut runner = SingleRunner::from_config(config, "AAA".into(), Direction::Long, None);
+        for (i, close) in [100.0, 104.0, 98.0, 101.0, 107.0].into_iter().enumerate() {
+            let input = StepInput { entry: i == 0, ..StepInput::default() };
+            runner.step(i, &bar(i as i64 * HALF_DAY, close), input);
+        }
+        runner.finish()
+    }
+
+    #[test]
+    fn a_run_that_computes_no_metrics_settles_the_same() {
+        let measured = BacktestConfig {
+            fees: 0.001,
+            retain_daily_performance: true,
+            ..BacktestConfig::default()
+        };
+        let full = held_across_days(measured.clone());
+        assert_eq!(full.metrics.total_trades, 1);
+        assert_eq!(full.daily_performance.as_ref().map(|d| d.timestamps.len()), Some(3));
+        for retain_curves in [false, true] {
+            let lean = held_across_days(BacktestConfig {
+                compute_metrics: false,
+                retain_curves,
+                ..measured.clone()
+            });
+            assert_eq!(lean.metrics.start_value, full.metrics.start_value);
+            assert_eq!(lean.metrics.end_value, full.metrics.end_value);
+            assert_eq!(lean.metrics.total_return_pct, full.metrics.total_return_pct);
+            assert_eq!(lean.metrics.total_trades, 0, "nothing else is measured");
+            assert_eq!(format!("{:?}", lean.trades), format!("{:?}", full.trades));
+            assert_eq!(
+                format!("{:?}", lean.daily_performance),
+                format!("{:?}", full.daily_performance)
+            );
+            if retain_curves {
+                assert_eq!(lean.equity_curve, full.equity_curve);
+                assert_eq!(lean.drawdown_curve, full.drawdown_curve);
+                assert_eq!(lean.returns, full.returns);
+                assert_eq!(lean.timestamps, full.timestamps);
+            } else {
+                assert!(lean.equity_curve.is_empty() && lean.timestamps.is_empty());
+            }
+        }
     }
 }

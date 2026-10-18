@@ -29,11 +29,10 @@
 use std::collections::{HashMap, VecDeque};
 
 use crate::accounts::{AccountMode, SharedAccount};
-use crate::core::performance::DailyPerformanceCollector;
 use crate::core::types::OhlcvBar;
 use crate::core::types::TickData;
 use crate::core::types::{
-    BacktestConfig, BacktestResult, Direction, InstrumentConfig, Timestamp, Trade,
+    BacktestConfig, BacktestMetrics, BacktestResult, Direction, InstrumentConfig, Timestamp, Trade,
 };
 use crate::data::{
     tick_data_to_events, DepthRef, DepthTick, EventFeed, EventPayload, MarketEvent, QuoteTick,
@@ -167,7 +166,6 @@ pub struct EventSession {
     /// event; the kill-switch measures its drawdown from here.
     peak_equity: f64,
     sealed: bool,
-    daily_performance_transitions: Option<Vec<(i64, i64)>>,
 }
 
 impl EventSession {
@@ -181,8 +179,11 @@ impl EventSession {
     /// margin mode, one pool of locked initial margin.
     pub fn with_account(config: BacktestConfig, mode: AccountMode) -> Self {
         let pool = config.initial_capital;
-        let daily_performance_transitions =
-            config.retain_daily_performance.then(|| config.performance_tz_transitions.clone());
+        let curve = InstantCurve::new(pool)
+            .recording(config.retain_curves || config.compute_metrics)
+            .with_daily_performance(
+                config.retain_daily_performance.then(|| config.performance_tz_transitions.clone()),
+            );
         Self {
             config,
             kernels: Vec::new(),
@@ -201,12 +202,11 @@ impl EventSession {
             account: SharedAccount::new(mode, pool),
             last_close: Vec::new(),
             last_seen: Vec::new(),
-            curve: InstantCurve::new(pool),
+            curve,
             trades: Vec::new(),
             streaming: StreamingMetrics::new(),
             peak_equity: pool,
             sealed: false,
-            daily_performance_transitions,
         }
     }
 
@@ -959,16 +959,23 @@ impl EventSession {
         // end-of-data close settled into.
         let settled = self.equity();
         self.curve.close(settled);
-        let mut curve = std::mem::replace(&mut self.curve, InstantCurve::new(0.0)).into_parts();
+        let mut curve = std::mem::replace(&mut self.curve, InstantCurve::new(0.0));
+        let daily_performance = curve.take_daily_performance();
+        let end_value = curve.last().unwrap_or(self.config.initial_capital);
+        let mut curve = curve.into_parts();
 
-        let metrics = compute_backtest_metrics_with_config(
-            &curve.equity,
-            &curve.drawdown,
-            &curve.returns,
-            &self.trades,
-            &curve.timestamps,
-            &self.config,
-        );
+        let metrics = if self.config.compute_metrics {
+            compute_backtest_metrics_with_config(
+                &curve.equity,
+                &curve.drawdown,
+                &curve.returns,
+                &self.trades,
+                &curve.timestamps,
+                &self.config,
+            )
+        } else {
+            BacktestMetrics::unmeasured(self.config.initial_capital, end_value)
+        };
         let outcomes = self
             .symbols
             .iter()
@@ -984,14 +991,6 @@ impl EventSession {
         let rejected_entries: usize = self.kernels.iter().map(|k| k.rejected_entries()).sum();
         let halted = self.account.is_halted() || self.kernels.iter().any(|k| k.risk_halted());
         let halted_at = self.account.halted_at();
-
-        let daily_performance = self.daily_performance_transitions.take().map(|transitions| {
-            let mut collector = DailyPerformanceCollector::new(transitions);
-            for (&timestamp, &equity) in curve.timestamps.iter().zip(&curve.equity) {
-                collector.observe(timestamp, equity);
-            }
-            collector.finish()
-        });
 
         if !self.config.retain_curves {
             curve = Default::default();

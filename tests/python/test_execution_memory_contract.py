@@ -78,3 +78,33 @@ def test_daily_performance_is_opt_in_and_retains_one_settled_mark_per_day():
     )
     assert retained.daily_performance_equity().size == 2
     assert retained.daily_performance_equity()[-1] == retained.metrics.end_value
+
+
+def test_a_run_that_computes_no_metrics_keeps_its_end_value_trades_and_days():
+    day = 86_400_000_000_000
+    data = _bars([100.0, 110.0, 105.0, 106.0])
+    data["timestamps"] = np.array([0, 1, day, day + 1], dtype=np.int64)
+    kept = dict(
+        retain_curves=False,
+        retain_daily_performance=True,
+        performance_tz_transitions=[(-1, 0)],
+    )
+    measured = run_strategy_backtest(RoundTrip(), **data, config=BacktestConfig(**kept))
+    lean = run_strategy_backtest(
+        RoundTrip(), **data, config=BacktestConfig(**kept, compute_metrics=False)
+    )
+    assert BacktestConfig().compute_metrics
+    assert lean.metrics.end_value == measured.metrics.end_value
+    assert lean.metrics.total_return_pct == measured.metrics.total_return_pct
+    assert measured.metrics.total_trades == 1
+    assert lean.metrics.total_trades == 0  # nothing else is measured
+    assert len(lean.trades()) == 1
+    for field in ('entry_price', 'exit_price', 'pnl', 'fees', 'entry_time', 'exit_time'):
+        assert getattr(lean.trades()[0], field) == getattr(measured.trades()[0], field)
+    np.testing.assert_array_equal(
+        lean.daily_performance_timestamps(), measured.daily_performance_timestamps()
+    )
+    np.testing.assert_array_equal(
+        lean.daily_performance_equity(), measured.daily_performance_equity()
+    )
+    assert len(lean.equity_curve()) == 0

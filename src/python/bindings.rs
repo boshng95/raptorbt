@@ -74,6 +74,9 @@ use super::numpy_bridge::*;
 pub struct PyBacktestConfig {
     #[pyo3(get, set)]
     pub retain_curves: bool,
+    /// Compute the full metrics when the run finishes.
+    #[pyo3(get, set)]
+    pub compute_metrics: bool,
     /// Retain one exchange-local end-of-day net-liquidation point.
     #[pyo3(get, set)]
     pub retain_daily_performance: bool,
@@ -220,6 +223,7 @@ impl PyBacktestConfig {
         retain_curves=true,
         retain_daily_performance=false,
         performance_tz_transitions=Vec::new(),
+        compute_metrics=true,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -255,11 +259,13 @@ impl PyBacktestConfig {
         retain_curves: bool,
         retain_daily_performance: bool,
         performance_tz_transitions: Vec<(i64, i64)>,
+        compute_metrics: bool,
     ) -> PyResult<Self> {
         let squareoff_time_minutes = parse_squareoff_time(squareoff_time.as_deref())?;
         let fill_timing = parse_fill_timing(fill_timing.as_deref())?;
         Ok(Self {
             retain_curves,
+            compute_metrics,
             retain_daily_performance,
             performance_tz_transitions,
             initial_capital,
@@ -398,6 +404,7 @@ impl From<&PyBacktestConfig> for BacktestConfig {
     fn from(py_config: &PyBacktestConfig) -> Self {
         BacktestConfig {
             retain_curves: py_config.retain_curves,
+            compute_metrics: py_config.compute_metrics,
             retain_daily_performance: py_config.retain_daily_performance,
             performance_tz_transitions: py_config.performance_tz_transitions.clone(),
             initial_capital: py_config.initial_capital,

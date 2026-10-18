@@ -28,6 +28,9 @@ _Instrument = tuple[_I64, _F64, _F64, _F64, _F64, _F64, _Bool, _Bool, int, float
 
 class BacktestConfig:
     retain_curves: bool
+    # Off: metrics carry only start_value, end_value and total_return_pct, and
+    # the per-instant curves are not stored unless retain_curves asks for them.
+    compute_metrics: bool
     retain_daily_performance: bool
     performance_tz_transitions: list[tuple[int, int]]
     initial_capital: float
@@ -102,6 +105,7 @@ class BacktestConfig:
         retain_curves: bool = ...,
         retain_daily_performance: bool = ...,
         performance_tz_transitions: Sequence[tuple[int, int]] = ...,
+        compute_metrics: bool = ...,
     ) -> None: ...
     def set_fixed_stop(self, percent: float) -> None: ...
     def set_atr_stop(self, multiplier: float, period: int) -> None: ...
