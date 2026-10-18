@@ -302,10 +302,68 @@ def run_strategy_backtest(
         while apply_commands(i):
             dispatch_events(strategy, ctx, session.walk_book(ts_now))
 
+    # A strategy whose callback the kernel can run itself names it here: a
+    # zero-argument hook answering, whenever the run is quiet, with the rule
+    # session to step and the state that session needs (see
+    # `KernelSession.step_rules_until`), or None while it must be called.
+    fast_forward_rules = (
+        getattr(strategy, "fast_forward_rules", None)
+        if bar_callback_mask is not None and hasattr(session, "step_rules_until")
+        else None
+    )
+    rule_mask = (
+        np.ascontiguousarray(bar_callback_mask) if fast_forward_rules is not None else None
+    )
+    # The bar a rule session handed back, which the loop below runs itself.
+    python_bar = -1
+
     idle_until = 0
     for i in range(n):
         if i < idle_until:
             continue
+        if (
+            fast_forward_rules is not None
+            and i != python_bar
+            and not getattr(strategy, "bar_callback_required", False)
+            and not has_stream_handlers
+            and not strategy.clock._alerts
+            and not strategy.clock._timers
+            and not strategy._pending_commands
+            and not strategy._pending_orders
+        ):
+            plan = fast_forward_rules()
+            if plan is not None:
+                rules, halted, pending_target, quiet = plan
+                kind, last, events = session.step_rules_until(
+                    i,
+                    n,
+                    timestamps,
+                    open_,
+                    high,
+                    low,
+                    close,
+                    volume,
+                    atr_values,
+                    rule_mask,
+                    rules,
+                    halted,
+                    pending_target,
+                    quiet,
+                )
+                if kind == 2:
+                    # Bar `last` is the strategy's own; nothing before it
+                    # produced an event or asked for a callback.
+                    python_bar = last
+                    if last > i:
+                        idle_until = last
+                        continue
+                else:
+                    ctx.idx = last
+                    strategy.clock._now = int(timestamps[last])
+                    dispatch_events(strategy, ctx, events)
+                    settle(last)
+                    idle_until = last + 1
+                    continue
         if (
             callback_indexes is not None
             and not bar_callback_mask[i]

@@ -1104,6 +1104,80 @@ class PositionSnapshot:
     stop_price: float | None
     target_price: float | None
 
+# A crossover strategy's decision cursor, in Rust: the deferred, repeat-safe
+# lane of algotrade-nautilus's native runtime, answer for answer. Operands
+# are (clock, fast key or -1, fast constant, slow key or -1, slow constant,
+# crosses above).
+class CrossoverRuleSession:
+    def __init__(
+        self,
+        reg_slots: list[int],
+        reg_stream_index: list[int],
+        reg_rank: list[int],
+        reg_timestamps: list[_I64],
+        reg_labels: list[_I64 | None],
+        slot_close: list[_F64],
+        slot_admits: list[_Bool | None],
+        slot_decision: list[bool],
+        key_slot: list[int],
+        key_values: list[_F64],
+        key_init: list[_Bool],
+        exits: list[tuple[int, int, float, int, float, bool]],
+        entries: list[tuple[int, int, float, int, float, bool]],
+        n_clocks: int,
+        legacy: bool,
+        dispatch_timestamps: _I64,
+        dispatch_positions: _I64,
+        primary_close: _F64,
+        dust: bool,
+        position_required: bool,
+        has_instrument: bool,
+        size_increment: float,
+        minimum_notional: float,
+    ) -> None: ...
+    # (processed, None or (side, reference price, None or (is exit, rule),
+    # policies after fill)).
+    def advance(
+        self,
+        now: int,
+        idx: int,
+        has_position: bool,
+        net_position: float,
+        pending_target: float | None = ...,
+    ) -> tuple[bool, tuple[int, float | None, tuple[bool, int] | None, bool] | None]: ...
+    def reopens_exits_before_dispatch(
+        self,
+        idx: int,
+        has_position: bool,
+        net_position: float,
+        pending_target: float | None = ...,
+    ) -> bool: ...
+    # Whether the kernel would step this masked bar itself; asked on a copy.
+    def probe_quiet_bar(
+        self,
+        idx: int,
+        now: int,
+        close: float,
+        has_position: bool,
+        net_position: float,
+        cash: float,
+        halted: bool,
+        pending_target: float | None,
+        quiet: tuple[int, float, float, float, float, float, float, float],
+    ) -> bool: ...
+    def on_fill(self) -> None: ...
+    @property
+    def visit_primary_after_fill(self) -> bool: ...
+    @property
+    def next_dispatch_index(self) -> int: ...
+    @property
+    def last_position(self) -> int: ...
+    @property
+    def last_reached(self) -> bool: ...
+    @property
+    def last_ready(self) -> bool: ...
+    def snapshot(self) -> tuple[tuple, tuple, tuple]: ...
+
 class KernelSession:
     def __init__(
         self,
@@ -1145,6 +1219,28 @@ class KernelSession:
         volume: _F64,
         atr: _F64 | None = ...,
     ) -> tuple[int, list[EngineEvent]]: ...
+    # Steps from `start` while each masked bar stays quiet for `rules` (see
+    # CrossoverRuleSession): (0, idx, events) at the first bar with events,
+    # (1, end - 1, []) at the end, (2, idx, []) at the first masked bar the
+    # strategy must see. `quiet` is the cash halt's bound: (currency
+    # precision, fraction, cap, units, markup, slack, fee, need at highest).
+    def step_rules_until(
+        self,
+        start: int,
+        end: int,
+        timestamps: _I64,
+        open: _F64,
+        high: _F64,
+        low: _F64,
+        close: _F64,
+        volume: _F64,
+        atr: _F64 | None,
+        mask: _Bool,
+        rules: CrossoverRuleSession,
+        halted: bool,
+        pending_target: float | None,
+        quiet: tuple[int, float, float, float, float, float, float, float],
+    ) -> tuple[int, int, list[EngineEvent]]: ...
     def walk_book(self, ts_now: int) -> list[EngineEvent]: ...
     def submit_order(
         self,

@@ -19,6 +19,19 @@ use super::bindings::{
     convert_result, convert_trade, PyBacktestConfig, PyBacktestResult, PyInstrumentConfig, PyTrade,
 };
 use super::instrument_bindings::PyInstrumentSpec;
+use super::rule_session::{PyCrossoverRuleSession, QuietBar, QuietParams, QuietTuple};
+
+/// `ctx.position is not None` and `ctx.net_position`, as the Python context
+/// reads them: a left-to-right sum of signed sizes over the open positions.
+fn held_position(runner: &SingleRunner) -> (bool, f64) {
+    let kernel = runner.kernel();
+    let has_position = kernel.position_snapshot().is_some();
+    let net = kernel
+        .position_snapshots()
+        .into_iter()
+        .fold(0.0, |total, p| total + p.size * f64::from(p.direction as i32));
+    (has_position, net)
+}
 
 /// Fold the `units` / `size_frac` kwargs into a quantity spec.
 ///
@@ -466,6 +479,119 @@ impl PyKernelSession {
             }
         }
         Ok((end - 1, Vec::new()))
+    }
+
+    /// Step bars for a crossover rule set the kernel can run on its own.
+    ///
+    /// Like [`Self::step_until_event`], but a bar in `mask` -- one the
+    /// strategy's callback runs on -- is taken by `rules` on the strategy's
+    /// behalf when the strategy would have done nothing on it (see
+    /// `CrossoverRuleSession`), instead of ending the range. Returns
+    /// `(kind, idx, events)`:
+    ///
+    /// - `0`: bar `idx` was stepped and produced `events`, to dispatch now;
+    /// - `1`: every bar through `idx == end - 1` was stepped, with no events;
+    /// - `2`: bar `idx` is the strategy's to run; it has not been stepped and
+    ///   `rules` stands as it did before that bar.
+    ///
+    /// `pending_target` and `halted` are the strategy's own state, which no
+    /// quiet bar changes. `quiet` is the halt bound a flat bar is checked
+    /// against: `(currency_precision, fraction, cap, units, markup, slack,
+    /// fee, need_at_highest)`.
+    #[pyo3(signature = (
+        start, end, timestamps, open, high, low, close, volume, atr, mask, rules,
+        halted, pending_target, quiet,
+    ))]
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    fn step_rules_until(
+        &mut self,
+        py: Python<'_>,
+        start: usize,
+        end: usize,
+        timestamps: PyReadonlyArray1<'_, i64>,
+        open: PyReadonlyArray1<'_, f64>,
+        high: PyReadonlyArray1<'_, f64>,
+        low: PyReadonlyArray1<'_, f64>,
+        close: PyReadonlyArray1<'_, f64>,
+        volume: PyReadonlyArray1<'_, f64>,
+        atr: Option<PyReadonlyArray1<'_, f64>>,
+        mask: PyReadonlyArray1<'_, bool>,
+        mut rules: PyRefMut<'_, PyCrossoverRuleSession>,
+        halted: bool,
+        pending_target: Option<f64>,
+        quiet: QuietTuple,
+    ) -> PyResult<(u8, usize, Vec<PyEngineEvent>)> {
+        let ts = timestamps
+            .as_slice()
+            .map_err(|_| PyValueError::new_err("timestamps must be contiguous"))?;
+        let o = open.as_slice().map_err(|_| PyValueError::new_err("open must be contiguous"))?;
+        let h = high.as_slice().map_err(|_| PyValueError::new_err("high must be contiguous"))?;
+        let l = low.as_slice().map_err(|_| PyValueError::new_err("low must be contiguous"))?;
+        let c = close.as_slice().map_err(|_| PyValueError::new_err("close must be contiguous"))?;
+        let v =
+            volume.as_slice().map_err(|_| PyValueError::new_err("volume must be contiguous"))?;
+        let m = mask.as_slice().map_err(|_| PyValueError::new_err("mask must be contiguous"))?;
+        let atr_values = atr
+            .as_ref()
+            .map(|array| array.as_slice())
+            .transpose()
+            .map_err(|_| PyValueError::new_err("atr must be contiguous"))?;
+        let n = ts.len();
+        if start >= end
+            || end > n
+            || [o.len(), h.len(), l.len(), c.len(), v.len(), m.len()]
+                .iter()
+                .any(|&length| length != n)
+            || atr_values.is_some_and(|values| values.len() != n)
+        {
+            return Err(PyValueError::new_err("invalid rule bar range or array lengths"));
+        }
+        let quiet = QuietParams::from(quiet);
+        let runner = self
+            .runner
+            .as_mut()
+            .ok_or_else(|| PyValueError::new_err("session is finished; create a new one"))?;
+        if start != runner.bars_seen() {
+            return Err(PyValueError::new_err("rule range must start at the next bar"));
+        }
+        let mut stepper = rules.split(py)?;
+        for idx in start..end {
+            if m[idx] {
+                // The callback runs before the bar steps, against the account
+                // the previous bar left.
+                let (has_position, net_position) = held_position(runner);
+                let bar = QuietBar {
+                    idx,
+                    now: ts[idx],
+                    close: c[idx],
+                    has_position,
+                    net_position,
+                    cash: runner.cash(),
+                    halted,
+                    pending: pending_target,
+                };
+                if !stepper.quiet_bar(&bar, &quiet) {
+                    return Ok((2, idx, Vec::new()));
+                }
+            }
+            let bar = KernelBar {
+                timestamp: ts[idx],
+                open: o[idx],
+                high: h[idx],
+                low: l[idx],
+                close: c[idx],
+                volume: v[idx],
+            };
+            let input = StepInput {
+                atr: atr_values.map_or(0.0, |values| values[idx]),
+                ..StepInput::default()
+            };
+            let events = runner.step(idx, &bar, input);
+            if !events.is_empty() {
+                return Ok((0, idx, events.into_iter().map(PyEngineEvent::from).collect()));
+            }
+        }
+        Ok((1, end - 1, Vec::new()))
     }
 
     /// Settle resting orders off-schedule, at `ts_now`.

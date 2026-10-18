@@ -99,6 +99,7 @@ from raptorbt._raptorbt import (
     bars_from_ticks,
     # Per-bar strategy session (class-based strategy contract)
     KernelSession,
+    CrossoverRuleSession,
     PortfolioSession,
     EngineEvent,
     PositionSnapshot,
@@ -216,6 +217,7 @@ __all__ = [
     "aggregate_bars",
     "bars_from_ticks",
     "KernelSession",
+    "CrossoverRuleSession",
     "PortfolioSession",
     "EngineEvent",
     "PositionSnapshot",
