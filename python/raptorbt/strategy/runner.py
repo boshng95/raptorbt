@@ -317,10 +317,16 @@ def run_strategy_backtest(
     # The bar a rule session handed back, which the loop below runs itself.
     python_bar = -1
 
+    # Bars before `idle_until` were stepped by the kernel itself, so the loop
+    # resumes at it rather than walking past each of them in Python.
     idle_until = 0
-    for i in range(n):
+    i = -1
+    while True:
+        i += 1
         if i < idle_until:
-            continue
+            i = idle_until
+        if i >= n:
+            break
         if (
             fast_forward_rules is not None
             and i != python_bar
