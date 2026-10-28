@@ -323,6 +323,42 @@ impl BarLiquidity {
         }
     }
 
+    /// The last of `volumes` without a finite share, as `rposition` over
+    /// [`Self::has_finite_share`] finds it.
+    ///
+    /// Clean data has no such bar, so the search walks every volume it is
+    /// given: it does so a block at a time and without branching inside a
+    /// block, which a per-volume early exit prevents.
+    pub(crate) fn last_without_finite_share(
+        &self,
+        volumes: &[f64],
+        grid: LotGrid,
+    ) -> Option<usize> {
+        match self.finite_share(grid) {
+            FiniteShare::NonNegative => {
+                last_failing(volumes, |volume| (0.0..f64::INFINITY).contains(&volume))
+            }
+            FiniteShare::Positive => {
+                last_failing(volumes, |volume| (volume > 0.0) & (volume < f64::INFINITY))
+            }
+            FiniteShare::Never => volumes.len().checked_sub(1),
+        }
+    }
+
+    /// Which volumes [`Self::has_finite_share`] passes on `grid`.
+    pub(crate) fn finite_share(&self, grid: LotGrid) -> FiniteShare {
+        match *self {
+            Self::VolumeShare { slices } if slices > 0.0 => {
+                if grid.lot() > 0.0 && grid.lot().is_finite() {
+                    FiniteShare::NonNegative
+                } else {
+                    FiniteShare::Positive
+                }
+            }
+            _ => FiniteShare::Never,
+        }
+    }
+
     /// Size every print but the bar's last shows, on the `quantum` size grid.
     ///
     /// Returns [`f64::INFINITY`] when no bound applies, so callers can clamp
@@ -399,6 +435,34 @@ impl BarLiquidity {
             _ => share,
         }
     }
+}
+
+/// The volumes a [`BarLiquidity`] finds a finite share in, on one grid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FiniteShare {
+    /// `0 <= volume < inf`: a lot grid floors any print at one lot.
+    NonNegative,
+    /// `0 < volume < inf`: without a lot grid an empty bar shows nothing.
+    Positive,
+    /// No volume: the model bounds no fill by its bar.
+    Never,
+}
+
+/// The last index of `values` that `passes` fails, searched from the end a
+/// block at a time; see [`BarLiquidity::last_without_finite_share`].
+#[inline]
+fn last_failing(values: &[f64], passes: impl Fn(f64) -> bool) -> Option<usize> {
+    const BLOCK: usize = 64;
+    let mut end = values.len();
+    while end > 0 {
+        let start = end.saturating_sub(BLOCK);
+        let block = &values[start..end];
+        if !block.iter().fold(true, |all, &value| all & passes(value)) {
+            return block.iter().rposition(|&value| !passes(value)).map(|at| start + at);
+        }
+        end = start;
+    }
+    None
 }
 
 /// The prints one step put on the tape, in the order they traded.
@@ -885,6 +949,45 @@ mod tests {
     }
 
     const BAR: [Price; PRINTS_PER_BAR] = [100.0, 110.0, 90.0, 105.0];
+
+    #[test]
+    fn the_block_search_finds_the_bar_a_rescan_would() {
+        let odd = [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1.0, -0.0, 0.0, 5e-324];
+        let models = [
+            BarLiquidity::NAUTILUS,
+            BarLiquidity::VolumeShare { slices: 0.0 },
+            BarLiquidity::VolumeShare { slices: f64::NAN },
+            BarLiquidity::Unlimited,
+        ];
+        let grids = [LotGrid::new(0.001), LotGrid::new(0.0), LotGrid::new(f64::NAN)];
+        // Across and on either side of the block boundaries.
+        for len in [0usize, 1, 2, 63, 64, 65, 127, 128, 129, 300] {
+            for at in
+                [None, Some(0), Some(1), Some(63), Some(64), Some(len / 2), len.checked_sub(1)]
+            {
+                for &bad in &odd {
+                    let mut volumes: Vec<f64> = (0..len).map(|idx| 1.0 + idx as f64).collect();
+                    if let Some(at) = at.filter(|&at| at < len) {
+                        volumes[at] = bad;
+                        // A second, older one the search must not stop at.
+                        volumes[at / 3] = bad;
+                    }
+                    for liquidity in models {
+                        for grid in grids {
+                            let rescan = volumes
+                                .iter()
+                                .rposition(|&volume| !liquidity.has_finite_share(volume, grid));
+                            assert_eq!(
+                                liquidity.last_without_finite_share(&volumes, grid),
+                                rescan,
+                                "{liquidity:?} {grid:?} len {len} at {at:?} = {bad}",
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn unlimited_liquidity_never_bounds_a_fill() {

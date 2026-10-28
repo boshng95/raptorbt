@@ -1407,3 +1407,32 @@ fn a_wing_bought_by_a_book_walk_regroups_the_sold_leg_it_covers() {
     let locked = 400_000.0 - session.free_capital();
     assert!((per_kernel - locked).abs() < 1e-6, "kernels {per_kernel} vs account {locked}");
 }
+
+#[test]
+fn a_book_open_at_the_end_closes_the_curve_at_its_mark() {
+    // As `SingleRunner::finish`: the end-of-data close books 250.93 for a
+    // lot the mark holds 250.9275 up, and the run ends at the mark.
+    let config = BacktestConfig { fees: 0.0, ..BacktestConfig::default() };
+    let cents = InstrumentConfig { currency_precision: Some(2), ..InstrumentConfig::default() };
+    let mut session = EventSession::with_account(config, AccountMode::Margin { leverage: 1.0 });
+    let a = session.add_instrument(
+        "AAA".into(),
+        Direction::Long,
+        None,
+        Some(&cents),
+        PositionPolicy::Net,
+    );
+    session.set_bars(a, bars(0, &[100.0, 101.00371]));
+    session.seal();
+    session.apply_current(StepInput { entry: true, size_mult: Some(0.25), ..StepInput::default() });
+    while session.current().is_some() {
+        session.apply_current(StepInput::default());
+    }
+    let marked = session.equity();
+    assert_ne!(marked, (marked * 100.0).round() / 100.0, "the mark is not whole cents");
+
+    let outcome = session.finish();
+    assert_eq!(outcome.result.trades.len(), 1, "the lot was closed at the end of data");
+    assert_eq!(outcome.result.equity_curve.last(), Some(&marked));
+    assert_eq!(outcome.result.metrics.end_value, marked);
+}

@@ -101,6 +101,12 @@ impl RiskGate {
         self.halted
     }
 
+    /// Whether [`Self::on_equity`] can still trip the kill-switch.
+    #[inline]
+    pub fn watches_drawdown(&self) -> bool {
+        !self.halted && self.max_drawdown_pct.is_some()
+    }
+
     /// How many entries have been refused.
     #[inline]
     pub fn rejected_entries(&self) -> usize {

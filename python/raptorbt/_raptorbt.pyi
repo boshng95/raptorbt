@@ -5,7 +5,7 @@ backtest runners. Indicator and tick helpers are declared with their array
 signatures at the bottom.
 """
 
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 import numpy as np
 import numpy.typing as npt
@@ -1112,7 +1112,74 @@ class PositionSnapshot:
 # lane of algotrade-nautilus's native runtime, answer for answer. Operands
 # are (clock, fast key or -1, fast constant, slow key or -1, slow constant,
 # crosses above).
+class ReplayDeclined(RuntimeError): ...
+
+# A replay's money rules -- sizer, cost model and price grid -- answered in
+# the kernel: each method is the replay's money function of the same name,
+# or None where only that function can answer. Decimals arrive as their str.
+class MoneyModel:
+    def __init__(
+        self,
+        *,
+        sizer: str,
+        percent: float,
+        budget: float,
+        quantity: str,
+        lot: str,
+        cash_precision: int,
+        taker_fee: str,
+        minimum: str,
+        per_share: str,
+        max_pct: str,
+        limit_entries: bool,
+        market_markup: float,
+        buffer: float,
+        tiers: list[tuple[str | None, str]],
+        increment_precision: int,
+        price_precision: int,
+    ) -> None: ...
+    def sized(self, cash: float, close: float, reference: float) -> float | None: ...
+    def snap(self, reference: float, buy: bool) -> float | None: ...
+    def affordable(self, cash: float, units: float, price: float) -> bool | None: ...
+    def exhausted(self, cash: float, price: float) -> bool | None: ...
+
+# A replay's log booked the way the caller's FillBook books it, returned by
+# KernelSession.replay_rules given its book. Strings an execution and its
+# report row share are one object wherever they appear. Until `booked`
+# reads false -- a fill the caller's booking would raise on -- the columns
+# answer; then only `log()` does, for the caller to book itself.
+class ReplayLedger:
+    submitted: int
+    filled: int
+    booked: bool
+    balance: float
+    def log(self) -> list[tuple[Any, ...]]: ...
+    # Per fill: (order index, ts_event, last_qty, last_px, leaves_qty,
+    # gross_realized, commission, balance after, reduces exposure).
+    def fills(
+        self,
+    ) -> tuple[_I64, _I64, _F64, _F64, _F64, _F64, _F64, _F64, _Bool]: ...
+    # Per order: (client_order_id, side, order_type, time_in_force,
+    # quantity, price, expire_time_ns, is_reduce_only, ts_init).
+    def orders(
+        self,
+    ) -> list[
+        tuple[str, str, str, str, float, float | None, int | None, bool, int]
+    ]: ...
+    # Per fill: (venue_order_id, trade_id).
+    def fill_ids(self) -> list[tuple[str, str]]: ...
+    # (opened_ns, peak units) per position.
+    def peaks(self) -> tuple[_I64, _F64]: ...
+    # (order index, status, ts_event) per order the venue ended, in order.
+    def ends(self) -> list[tuple[int, str, int]]: ...
+    # The order fills report's per-row columns by name, numbers and flags as
+    # arrays, status as codes (0 FILLED, 1 CANCELED, 2 EXPIRED, 3
+    # PARTIALLY_FILLED); None when nothing filled.
+    def report(self) -> dict[str, list[Any] | np.ndarray] | None: ...
+
 class CrossoverRuleSession:
+    # Whether this build takes condition trees and level rules.
+    LEVEL_RULES: bool
     def __init__(
         self,
         reg_slots: list[int],
@@ -1138,6 +1205,16 @@ class CrossoverRuleSession:
         has_instrument: bool,
         size_increment: float,
         minimum_notional: float,
+        *,
+        # (kind, children, a_key, a_value, b_key, b_value, code, lower, upper)
+        conditions: list[
+            tuple[int, list[int], int, float, int, float, int, float, float]
+        ]
+        | None = ...,
+        exit_roots: list[int] | None = ...,
+        entry_roots: list[int] | None = ...,
+        # (two_sided, size_increment, minimum_notional) of the contract.
+        level: tuple[bool, float, float] | None = ...,
     ) -> None: ...
     # (processed, None or (side, reference price, None or (is exit, rule),
     # policies after fill)).
@@ -1245,6 +1322,45 @@ class KernelSession:
         pending_target: float | None,
         quiet: tuple[int, float, float, float, float, float, float, float],
     ) -> tuple[int, int, list[EngineEvent]]: ...
+    # Runs every bar of this fresh session as the crossover replay whose
+    # rules these are would, calling back into the money functions where it
+    # sizes, prices, admits or halts: units(cash, close, reference),
+    # snap(reference, buy), affordable(cash, units, price) and
+    # exhausted(cash, price). `venue` is (bar ns, venue takes IOC, market
+    # entry, market exit, market markup, size increment, minimum quantity,
+    # minimum notional, lowest close, order id tag, first order seq, max
+    # actions per timestamp). Returns what the strategy booked, in order:
+    # ("submit", client_id, side, order_type, time_in_force, quantity, price,
+    # expire_ns, reduce_only, decided_ns, arrived_on_ns, policies_after_fill),
+    # ("fill", client_id, now_ns, order_id, size, price, leaves,
+    # gross_realized, commission) and ("end", client_id, status, now_ns).
+    # Raises ReplayDeclined where the strategy would take a branch the replay
+    # does not transcribe, leaving the session spent. Given `book` --
+    # (balance, currency precision, size increment, size precision, price
+    # precision, currency) -- it returns that record booked, a ReplayLedger.
+    def replay_rules(
+        self,
+        timestamps: _I64,
+        open: _F64,
+        high: _F64,
+        low: _F64,
+        close: _F64,
+        volume: _F64,
+        atr: _F64 | None,
+        mask: _Bool,
+        rules: CrossoverRuleSession,
+        quiet: tuple[int, float, float, float, float, float, float, float],
+        venue: tuple[
+            int, bool, bool, bool, float, float, float, float, float, str, int, int
+        ],
+        units: Callable[[float, float, float], float],
+        snap: Callable[[float, bool], float],
+        affordable: Callable[[float, float, float], bool],
+        exhausted: Callable[[float, float], bool],
+        gate: _Bool | None = ...,
+        money: MoneyModel | None = ...,
+        book: tuple[float, int, float, int, int, str] | None = ...,
+    ) -> list[tuple[Any, ...]] | ReplayLedger: ...
     def walk_book(self, ts_now: int) -> list[EngineEvent]: ...
     def submit_order(
         self,

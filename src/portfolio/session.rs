@@ -933,6 +933,15 @@ impl EventSession {
     /// Force-close every instrument at its last seen bar and compute
     /// portfolio metrics.
     pub fn finish(mut self) -> SessionOutcome {
+        // The last instant closes at the book's mark, taken before the
+        // end-of-data close below. The close is a mark too -- no exit fees --
+        // but it books each lot's PnL as money, in whole currency units,
+        // while a mark carries the raw `(close - entry) * size`. A lot built
+        // over several fills has an entry that is a repeating decimal, and
+        // the difference is a fraction of a unit that a financed run's
+        // fractional borrow can carry across a cent. Nautilus's sampler
+        // values the book it finishes with at the mark.
+        let marked = self.equity();
         for i in 0..self.kernels.len() {
             if let Some((idx, bar)) = self.last_seen[i] {
                 let kernel = &mut self.kernels[i];
@@ -955,10 +964,7 @@ impl EventSession {
                 self.last_close[i] = None;
             }
         }
-        // Positions are flat, so the last instant closes at the balance the
-        // end-of-data close settled into.
-        let settled = self.equity();
-        self.curve.close(settled);
+        self.curve.close(marked);
         let mut curve = std::mem::replace(&mut self.curve, InstantCurve::new(0.0));
         let daily_performance = curve.take_daily_performance();
         let end_value = curve.last().unwrap_or(self.config.initial_capital);

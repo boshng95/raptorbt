@@ -82,6 +82,26 @@ pub(crate) fn decimal_product(factors: &[f64]) -> Option<f64> {
     Some(mantissa as f64 / 10f64.powi(total_scale as i32))
 }
 
+/// The sum of two decimals, as the `f64` nearest to it.
+///
+/// A venue steps a price by its increment in fixed point, so one level
+/// below `295.04` on a cent grid is exactly `295.03`; the binary
+/// `295.04 - 0.01` is `295.03000000000003`, and a realized PnL formed from
+/// it can settle a cent away. Both terms are recovered at a common scale,
+/// added as integers and converted once. Returns `None` when either is not
+/// a short decimal; the caller then falls back to the plain float sum.
+pub(crate) fn decimal_sum(a: f64, b: f64) -> Option<f64> {
+    let (a_scaled, a_scale) = decimal_scale(a)?;
+    let (b_scaled, b_scale) = decimal_scale(b)?;
+    let scale = a_scale.max(b_scale);
+    let lift = |scaled: i128, from: u32| scaled.checked_mul(10i128.pow(scale - from));
+    let total = lift(a_scaled, a_scale)?.checked_add(lift(b_scaled, b_scale)?)?;
+    if total.abs() >= MAX_EXACT_INT {
+        return None;
+    }
+    Some(total as f64 / 10f64.powi(scale as i32))
+}
+
 /// Round a settlement-currency amount to the currency's own precision.
 ///
 /// Money is counted in whole units of the smallest one the currency has, so
@@ -137,6 +157,21 @@ mod tests {
         assert_eq!(decimal_product(&[std::f64::consts::PI, 2.0]), None);
         assert_eq!(decimal_product(&[1.0, f64::INFINITY]), None);
         assert_eq!(decimal_product(&[1e300, 1e300]), None);
+    }
+
+    #[test]
+    fn a_step_down_the_grid_lands_on_the_level_the_venue_quotes() {
+        assert_ne!(295.04_f64 - 0.01, 295.03);
+        assert_eq!(decimal_sum(295.04, -0.01), Some(295.03));
+        assert_eq!(decimal_sum(0.1, 0.2), Some(0.3));
+        assert_eq!(decimal_sum(92104.5, 0.01), Some(92104.51));
+        assert_eq!(decimal_sum(1.2345, -0.0001), Some(1.2344));
+    }
+
+    #[test]
+    fn a_sum_that_is_not_of_short_decimals_is_not_claimed() {
+        assert_eq!(decimal_sum(std::f64::consts::PI, 0.01), None);
+        assert_eq!(decimal_sum(f64::NAN, 0.01), None);
     }
 
     #[test]

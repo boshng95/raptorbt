@@ -202,11 +202,6 @@ def run_strategy_backtest(
     # client order id -> engine order id, for cancel/modify routing.
     id_map: dict[str, int] = {}
     budget = limits.budget()
-    callback_indexes = (
-        np.flatnonzero(bar_callback_mask)
-        if bar_callback_mask is not None and hasattr(session, "step_until_event")
-        else None
-    )
 
     def apply_commands(i: int) -> bool:
         """Route one batch of queued commands into the engine.
@@ -314,6 +309,78 @@ def run_strategy_backtest(
     rule_mask = (
         np.ascontiguousarray(bar_callback_mask) if fast_forward_rules is not None else None
     )
+    # A strategy whose whole run the kernel can drive names it here: a
+    # zero-argument hook answering with the rule session it executes, the
+    # quiet bound, its venue terms, its money functions, its order gate and,
+    # optionally, a `MoneyModel` of the same functions and the terms of the
+    # strategy's book (see `KernelSession.replay_rules`), or None while its
+    # run is one the kernel does not transcribe. The kernel then runs every
+    # bar and hands the strategy what it booked, in order, through
+    # `on_replay` -- as a `ReplayLedger` that booked it too, given the book's
+    # terms; a branch the kernel does not transcribe raises `ReplayDeclined`
+    # with the session spent, for the caller to run a fresh strategy in its
+    # stead.
+    replay_rules = (
+        getattr(strategy, "replay_rules", None)
+        if fast_forward_rules is not None and hasattr(session, "replay_rules")
+        else None
+    )
+    replay = (
+        replay_rules()
+        if replay_rules is not None
+        and not has_stream_handlers
+        and not strategy.clock._alerts
+        and not strategy.clock._timers
+        and not strategy._pending_commands
+        and not strategy._pending_orders
+        else None
+    )
+    if replay is not None:
+        rules, quiet, venue, units, snap, affordable, exhausted, gate = replay[:8]
+        money = replay[8] if len(replay) > 8 else None
+        book = replay[9] if len(replay) > 9 else None
+        tag = getattr(strategy.config, "order_id_tag", None) or "O"
+        log = session.replay_rules(
+            timestamps,
+            open_,
+            high,
+            low,
+            close,
+            volume,
+            atr_values,
+            rule_mask,
+            rules,
+            quiet,
+            (
+                *venue,
+                tag,
+                strategy._order_seq,
+                limits.max_actions_per_timestamp,
+            ),
+            units,
+            snap,
+            affordable,
+            exhausted,
+            gate,
+            money,
+            book,
+        )
+        strategy._order_seq += (
+            sum(1 for entry in log if entry[0] == "submit")
+            if isinstance(log, list)
+            else log.submitted
+        )
+        strategy.on_replay(ctx, log)
+        strategy.on_stop(ctx)
+        return session.finish()
+
+    # Asked of the loop below alone: a replay never reaches it.
+    callback_indexes = (
+        np.flatnonzero(bar_callback_mask)
+        if bar_callback_mask is not None and hasattr(session, "step_until_event")
+        else None
+    )
+
     # The bar a rule session handed back, which the loop below runs itself.
     python_bar = -1
 

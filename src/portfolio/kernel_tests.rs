@@ -743,6 +743,35 @@ fn a_sweep_pays_one_increment_worse_than_the_book_it_emptied() {
 }
 
 #[test]
+fn a_sweep_lands_on_the_next_level_of_a_cent_grid_exactly() {
+    // 295.04 - 0.01 in binary is 295.03000000000003; the venue steps its
+    // fixed-point price and fills the remainder at 295.03 itself, and a
+    // realized PnL formed from the drifted price settles a cent away.
+    let mut kernel = bounded_kernel_on_a_grid(PositionPolicy::Net, 0.01);
+    let id = kernel.submit_order(
+        OrderSide::Sell,
+        QtySpec::Units(100.0),
+        OrderKind::Market,
+        TimeInForce::Gtc,
+        1,
+        1,
+        "sweep".to_string(),
+        None,
+        None,
+    );
+    let events = kernel.step(1, &bar_with_volume(1, 295.04, 40.0), StepInput::default());
+    assert_eq!(order_status(&kernel, id), OrderStatus::Filled);
+    let prices: Vec<Price> = events
+        .iter()
+        .filter_map(|event| match event {
+            EngineEvent::OrderFilled { price, .. } => Some(*price),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(prices, vec![295.04, 295.03]);
+}
+
+#[test]
 fn the_closing_print_of_a_bar_carries_the_rounding_remainder() {
     // A quarter of 41 is 10.25, off a whole-unit lot grid, so the first
     // three prints show 10 and the close shows the 11 they left behind --

@@ -7,8 +7,6 @@
 //! session exposed to Python) loop this type, so the accounting has exactly one
 //! implementation.
 
-use std::collections::HashMap;
-
 use crate::core::types::{
     BacktestConfig, BacktestMetrics, BacktestResult, Direction, InstrumentConfig, Trade,
 };
@@ -18,7 +16,9 @@ use crate::instruments::InstrumentSpec;
 use crate::metrics::streaming::StreamingMetrics;
 use crate::portfolio::curve::InstantCurve;
 use crate::portfolio::engine::{compute_backtest_metrics_with_config, PortfolioEngine};
-use crate::portfolio::kernel::{EngineEvent, EngineKernel, KernelBar, StepInput};
+use crate::portfolio::kernel::{
+    BarColumns, EngineEvent, EngineKernel, IdleRun, KernelBar, StepInput,
+};
 
 /// Drives one instrument bar-by-bar and accumulates result curves.
 ///
@@ -33,10 +33,11 @@ pub struct SingleRunner {
     /// [`InstantCurve`].
     curve: InstantCurve,
     trades: Vec<Trade>,
-    /// What became of every order, keyed by id. A map because one order is
-    /// mutated across several events (accepted, then triggered, then filled
-    /// in slices); the book supplies submission order at `finish`.
-    order_events: HashMap<u64, OrderRecord>,
+    /// What became of every order, at its id. Kept apart from the book
+    /// because one order is mutated across several events (accepted, then
+    /// triggered, then filled in slices); the book supplies submission order
+    /// at `finish`.
+    order_events: Vec<Option<OrderRecord>>,
     streaming: StreamingMetrics,
     /// Equity marked at the most recent step's close: what the strategy and
     /// the kill-switch see, before anything the strategy then does at that
@@ -84,7 +85,7 @@ impl SingleRunner {
             config,
             curve,
             trades: Vec::new(),
-            order_events: HashMap::new(),
+            order_events: Vec::new(),
             streaming: StreamingMetrics::new(),
             marked_equity: initial_capital,
             risk_peak: initial_capital,
@@ -140,6 +141,78 @@ impl SingleRunner {
     /// trades have already been recorded internally.
     pub fn step(&mut self, idx: usize, bar: &KernelBar, input: StepInput) -> Vec<EngineEvent> {
         self.advance(idx, bar, input, true)
+    }
+
+    /// Step bars from `start` for as long as the kernel stays idle on them,
+    /// up to `end`, and return the first bar not stepped.
+    ///
+    /// Each bar stepped is stepped as [`Self::step`] would have, with its
+    /// input built by [`BarColumns::input`], and produced no event. An idle
+    /// bar changes nothing the account is worth bar to bar but the close
+    /// it is marked at, so after the first -- which closes whatever instant
+    /// the account last moved in -- a run whose timestamps rise and whose
+    /// closes [`EngineKernel::idle_run`] can bound is taken in one piece:
+    /// its book and extremes from its newest bars, its peak from its best
+    /// close, and its samples only at the day boundaries the daily marks
+    /// keep. A run that cannot be bounded is stepped bar by bar.
+    pub fn step_idle_run(&mut self, bars: &BarColumns<'_>, start: usize, end: usize) -> usize {
+        if start >= end || !self.kernel.idle_state() {
+            return start;
+        }
+        let bar = bars.bar(start);
+        if !self.kernel.idle_at(&bar) {
+            return start;
+        }
+        self.advance(start, &bar, bars.input(start), true);
+        let first = start + 1;
+        if first == end {
+            return end;
+        }
+        let rising = match bars.index {
+            Some(index) => index.rising(start, end),
+            None => bars.timestamp[start..end].windows(2).all(|pair| pair[0] < pair[1]),
+        };
+        if rising
+            && !self.curve.records()
+            && self.curve.open_instant() == Some(bars.timestamp[start])
+            && !self.kernel.watches_drawdown()
+        {
+            let live = self.kernel.live_until(bars.timestamp, first, end);
+            if live > first {
+                if let Some(run) = self.kernel.idle_run(bars, first, live) {
+                    self.take_idle_run(bars, first, live, &run);
+                    return live;
+                }
+            }
+        }
+        for idx in first..end {
+            let bar = bars.bar(idx);
+            if !self.kernel.idle_at(&bar) {
+                return idx;
+            }
+            self.advance(idx, &bar, bars.input(idx), true);
+        }
+        end
+    }
+
+    /// Step bars `first..end` idle in one piece; see [`Self::step_idle_run`].
+    fn take_idle_run(&mut self, bars: &BarColumns<'_>, first: usize, end: usize, run: &IdleRun) {
+        // Each bar closes the instant before it at the account the bar
+        // before it left, which no bar of the run changes.
+        let kernel = &self.kernel;
+        self.curve
+            .close_run(bars.timestamp, first - 1, end - 1, |idx| kernel.equity(bars.close[idx]));
+        self.kernel.step_idle_bars(bars, first, end, run);
+        let last = bars.bar(end - 1);
+        self.marked_equity = self.kernel.equity(last.close);
+        if let Some(peak) = run.peak_equity {
+            if peak > self.risk_peak {
+                self.risk_peak = peak;
+            }
+        }
+        // `observe_equity` is idle too: no drawdown is watched.
+        self.last_bar = Some((end - 1, last));
+        self.steps += end - first;
     }
 
     /// Advance the venue clock to `bar` without a market print.
@@ -248,43 +321,58 @@ impl SingleRunner {
         events
     }
 
+    /// The order with engine id `order_id`, which is its place in the book.
+    fn order(&self, order_id: u64) -> Option<&crate::execution::orders::Order> {
+        let order = self.kernel.order_book().get(order_id as usize)?;
+        debug_assert_eq!(order.id, order_id);
+        Some(order)
+    }
+
     /// Fold one fill slice onto the order's record.
     ///
     /// The record is seeded from the book here rather than at submission, so
     /// an order is only materialised once something happened to it; the
     /// remaining orders are picked up wholesale at `finish`.
     fn order_fill(&mut self, order_id: u64, idx: usize, price: f64, size: f64) {
-        let seed = self
-            .kernel
-            .order_book()
-            .iter()
-            .find(|o| o.id == order_id)
-            .map(|o| OrderRecord::from_order(o, self.kernel.symbol()));
-        if let Some(mut seed) = seed {
-            // Zero the seed ONCE, as it is created: `record_fill` folds each
-            // slice in, and the book's own `filled_qty` already holds the
-            // total. Resetting on every slice instead would keep only the
-            // last fill, which is exactly the partial-fill case this record
-            // exists to describe.
-            seed.filled_qty = 0.0;
-            seed.avg_fill_price = None;
-            let record = self.order_events.entry(order_id).or_insert(seed);
+        // Zero the seed ONCE, as it is created: `record_fill` folds each
+        // slice in, and the book's own `filled_qty` already holds the
+        // total. Resetting on every slice instead would keep only the
+        // last fill, which is exactly the partial-fill case this record
+        // exists to describe.
+        let seed = |record: &mut OrderRecord| {
+            record.filled_qty = 0.0;
+            record.avg_fill_price = None;
+        };
+        if let Some(record) = self.order_event(order_id, seed) {
             record.record_fill(idx, price, size);
         }
     }
 
     /// Record why an order was refused. The reason lives only in the event.
     fn order_reject(&mut self, order_id: u64, reason: &str) {
-        let seed = self
-            .kernel
-            .order_book()
-            .iter()
-            .find(|o| o.id == order_id)
-            .map(|o| OrderRecord::from_order(o, self.kernel.symbol()));
-        if let Some(seed) = seed {
-            let record = self.order_events.entry(order_id).or_insert(seed);
+        if let Some(record) = self.order_event(order_id, |_| {}) {
             record.reject_reason = Some(reason.to_string());
         }
+    }
+
+    /// The order's record, seeded from the book by `seed` the first time
+    /// something happens to it. Order ids are book positions, so the records
+    /// sit at the same positions.
+    fn order_event(
+        &mut self,
+        order_id: u64,
+        seed: impl FnOnce(&mut OrderRecord),
+    ) -> Option<&mut OrderRecord> {
+        let slot = usize::try_from(order_id).ok()?;
+        if !self.order_events.get(slot).is_some_and(Option::is_some) {
+            let mut record = OrderRecord::from_order(self.order(order_id)?, self.kernel.symbol());
+            seed(&mut record);
+            if self.order_events.len() <= slot {
+                self.order_events.resize_with(slot + 1, || None);
+            }
+            self.order_events[slot] = Some(record);
+        }
+        self.order_events[slot].as_mut()
     }
 
     /// Every order the run placed, in submission order.
@@ -293,25 +381,32 @@ impl SingleRunner {
     /// that rested and expired emits no fill and no rejection, and omitting
     /// it would report "nothing happened" for exactly the case a user is
     /// asking about. Fill and reject detail is layered on where it exists.
-    fn order_log(&self) -> Vec<OrderRecord> {
+    fn order_log(&mut self) -> Vec<OrderRecord> {
+        let mut events = std::mem::take(&mut self.order_events);
+        let symbol = self.kernel.symbol();
         self.kernel
             .order_book()
             .iter()
-            .map(|order| match self.order_events.get(&order.id) {
-                Some(seen) => {
-                    let mut record = seen.clone();
-                    // The book holds the final status; the event map holds
+            .map(|order| match events.get_mut(order.id as usize).and_then(Option::take) {
+                Some(mut record) => {
+                    // The book holds the final status; the events hold
                     // what happened along the way.
                     record.status = order.status.as_str();
                     record
                 }
-                None => OrderRecord::from_order(order, self.kernel.symbol()),
+                None => OrderRecord::from_order(order, symbol),
             })
             .collect()
     }
 
     /// Force-close any open position and compute final metrics.
     pub fn finish(mut self) -> BacktestResult {
+        // The last instant closes at the account's mark before the
+        // end-of-data close, which books the lot's PnL in whole currency
+        // units where the mark keeps it raw; see `EventSession::finish`.
+        let final_equity = self
+            .last_bar
+            .map_or(self.config.initial_capital, |(_, bar)| self.kernel.equity(bar.close));
         if self.kernel.is_in_position() {
             if let Some((idx, bar)) = self.last_bar {
                 for trade in self.kernel.finalize_all(idx, &bar) {
@@ -323,11 +418,6 @@ impl SingleRunner {
 
         // Built before the result takes ownership of the parts.
         let order_log = self.order_log();
-        // The last instant closes at the settled account: flat, so the
-        // end-of-data close above is already in the balance.
-        let final_equity = self
-            .last_bar
-            .map_or(self.config.initial_capital, |(_, bar)| self.kernel.equity(bar.close));
         self.curve.close(final_equity);
         let mut curve = std::mem::replace(&mut self.curve, InstantCurve::new(0.0));
         let daily_performance = curve.take_daily_performance();
@@ -493,6 +583,30 @@ mod tests {
         assert_eq!(result.timestamps, vec![0, 10]);
         assert_eq!(result.equity_curve[0], settled);
         assert!(result.equity_curve[1] > settled, "the position gained into the close");
+    }
+
+    #[test]
+    fn a_lot_open_at_the_end_closes_the_curve_at_its_mark() {
+        // The end-of-data close books the lot's PnL as money, in whole
+        // cents, where the mark keeps it raw: 250 units bought at 100.00
+        // and marked at 101.00371 are 250.9275 up, which the close books as
+        // 250.93. The run ends at the mark, as Nautilus's sampler values
+        // the book it finishes with.
+        let config = BacktestConfig { fees: 0.0, ..BacktestConfig::default() };
+        let cents = InstrumentConfig { currency_precision: Some(2), ..InstrumentConfig::default() };
+        let mut runner =
+            SingleRunner::from_config(config, "AAA".into(), Direction::Long, Some(&cents))
+                .with_account_mode(crate::accounts::AccountMode::Margin { leverage: 1.0 });
+        let entry = StepInput { entry: true, size_mult: Some(0.25), ..StepInput::default() };
+        runner.step(0, &bar(0, 100.0), entry);
+        runner.step(1, &bar(10, 101.00371), StepInput::default());
+        let marked = runner.kernel().equity(101.00371);
+        assert_ne!(marked, (marked * 100.0).round() / 100.0, "the mark is not whole cents");
+
+        let result = runner.finish();
+        assert_eq!(result.trades.len(), 1, "the lot was closed at the end of data");
+        assert_eq!(result.equity_curve.last(), Some(&marked));
+        assert_eq!(result.metrics.end_value, marked);
     }
 
     /// Bought on the first of five bars twelve hours apart and held, so the

@@ -4,6 +4,7 @@
 //! Split out of `kernel.rs` to keep that file reviewable; this is the same
 //! `impl EngineKernel`, not a separate type.
 
+use crate::core::decimals::decimal_sum;
 use crate::core::lots::snap_to_lot_grid;
 use crate::core::types::{Direction, ExitReason, Price, Timestamp};
 use crate::execution::algos::{AlgoError, ExecAlgorithm};
@@ -451,8 +452,8 @@ impl EngineKernel {
         {
             match &self.spec {
                 Some(spec) if spec.price_increment > 0.0 => match side {
-                    OrderSide::Buy => matched_price + spec.price_increment,
-                    OrderSide::Sell => matched_price - spec.price_increment,
+                    OrderSide::Buy => price_step(matched_price, spec.price_increment),
+                    OrderSide::Sell => price_step(matched_price, -spec.price_increment),
                 },
                 _ => matched_price,
             }
@@ -985,8 +986,8 @@ impl EngineKernel {
             Some(NextPrint::Sweep) => {
                 let increment = self.price_increment();
                 let swept = match self.orders.get(id).map(|order| order.side) {
-                    Some(OrderSide::Buy) => price + increment,
-                    Some(OrderSide::Sell) => price - increment,
+                    Some(OrderSide::Buy) => price_step(price, increment),
+                    Some(OrderSide::Sell) => price_step(price, -increment),
                     None => return,
                 };
                 (swept, FillDepth::UNLIMITED)
@@ -1038,13 +1039,16 @@ impl EngineKernel {
     /// Contingency consequences of a fill: activate held one-triggers-other
     /// children, then cancel one-cancels-other siblings.
     fn after_fill(&mut self, idx: usize, filled_id: u64, events: &mut Vec<EngineEvent>) {
-        let children: Vec<(u64, String)> = self
-            .orders
-            .all()
-            .iter()
-            .filter(|o| o.parent_id == Some(filled_id) && o.status == OrderStatus::Submitted)
-            .map(|o| (o.id, o.client_id.clone()))
-            .collect();
+        let children: Vec<(u64, String)> = if self.orders.has_children() {
+            self.orders
+                .all()
+                .iter()
+                .filter(|o| o.parent_id == Some(filled_id) && o.status == OrderStatus::Submitted)
+                .map(|o| (o.id, o.client_id.clone()))
+                .collect()
+        } else {
+            Vec::new()
+        };
         for (child_id, client_id) in children {
             if let Some(order) = self.orders.get_mut(child_id) {
                 let _ = order.transition(OrderStatus::Accepted);
@@ -1074,4 +1078,15 @@ impl EngineKernel {
             }
         }
     }
+}
+
+/// `price` moved by `step` along its grid, in the venue's fixed point.
+///
+/// A zero step (no grid) is the price itself; a price or step that is not a
+/// short decimal falls back to the float sum it always was.
+fn price_step(price: Price, step: f64) -> Price {
+    if step == 0.0 {
+        return price;
+    }
+    decimal_sum(price, step).unwrap_or(price + step)
 }

@@ -48,6 +48,18 @@ impl DailyPerformanceCollector {
         }
     }
 
+    /// The instant before which a mark only overwrites the one standing:
+    /// marks before it fall on the current local day, under the current
+    /// offset. `i64::MIN` while no day is open.
+    #[inline]
+    pub fn same_day_until(&self) -> i64 {
+        if self.last_local_day.is_some() {
+            self.next_local_boundary_utc.min(self.next_transition_utc)
+        } else {
+            i64::MIN
+        }
+    }
+
     /// Record a mark, overwriting the current local day's prior mark.
     #[inline]
     pub fn observe(&mut self, timestamp: i64, equity: f64) {

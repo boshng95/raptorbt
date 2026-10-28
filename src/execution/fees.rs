@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::core::decimals::decimal_product;
+use crate::core::decimals::{decimal_product, decimal_sum};
 use crate::core::types::{Direction, Price};
 use crate::execution::indian_costs::{self, FeeBreakdown, Segment};
 
@@ -149,7 +149,11 @@ impl FeeModel {
             return None;
         }
         let (base, cap) = self.brokerage_parts(price, size);
-        Some(OrderBilling { base: billed.base + base, cap: billed.cap + cap, ..*billed })
+        // The fills' parts are decimals and so is their total: 2 and 1129
+        // shares at $0.005 add in binary to 5.654999999999999, which settles
+        // a cent below the $5.66 the 1131-share order owes.
+        let add = |a: f64, b: f64| decimal_sum(a, b).unwrap_or(a + b);
+        Some(OrderBilling { base: add(billed.base, base), cap: add(billed.cap, cap), ..*billed })
     }
 
     /// What the schedule charges an order with this billing, unsettled.
@@ -354,6 +358,16 @@ mod tests {
         let tiny = fee.accrue(&OrderBilling::default(), 1.0, 4.0).expect("per order");
         let tiny = fee.accrue(&tiny, 1.0, 6.0).expect("per order");
         assert!((fee.order_charge(&tiny) - 0.10).abs() < 1e-12);
+    }
+
+    #[test]
+    fn an_order_billed_in_pieces_settles_to_the_cent_it_owes_whole() {
+        let fee = FeeModel::brokerage(0.0, 0.005, 1.0, 0.01);
+        let first = fee.accrue(&OrderBilling::default(), 83.66, 2.0).expect("per order");
+        let whole = fee.accrue(&first, 83.67, 1_129.0).expect("per order");
+        assert_ne!(0.01 + 5.645, 5.655);
+        assert_eq!(fee.order_charge(&whole), 5.655);
+        assert_eq!(crate::core::decimals::quantize_money(fee.order_charge(&whole), Some(2)), 5.66);
     }
 
     #[test]

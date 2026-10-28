@@ -28,6 +28,7 @@ use crate::execution::orders::OrderSide;
 use crate::execution::queue::QueueTracker;
 use crate::execution::{BarLiquidity, FeeModel, FillModel, FillPrice, OrderBilling, SlippageModel};
 use crate::instruments::{InstrumentKind, InstrumentSpec};
+use crate::portfolio::bar_index::{BarIndex, Extremes};
 use crate::portfolio::ledger::{PositionLedger, PositionPolicy, ReduceOutcome};
 use crate::portfolio::option_groups::OptionLeg;
 use crate::portfolio::position::ExitDetails;
@@ -56,6 +57,54 @@ pub struct KernelBar {
     pub low: Price,
     pub close: Price,
     pub volume: f64,
+}
+
+/// A bar series held as columns, which a driver steps bar by bar.
+#[derive(Debug, Clone, Copy)]
+pub struct BarColumns<'a> {
+    pub timestamp: &'a [i64],
+    pub open: &'a [Price],
+    pub high: &'a [Price],
+    pub low: &'a [Price],
+    pub close: &'a [Price],
+    pub volume: &'a [f64],
+    /// ATR per bar; `0.0` throughout when absent.
+    pub atr: Option<&'a [f64]>,
+    /// Summaries of these same columns, when the driver holds them.
+    pub index: Option<&'a BarIndex>,
+}
+
+impl BarColumns<'_> {
+    /// Bar `idx`.
+    #[inline]
+    pub fn bar(&self, idx: usize) -> KernelBar {
+        KernelBar {
+            timestamp: self.timestamp[idx],
+            open: self.open[idx],
+            high: self.high[idx],
+            low: self.low[idx],
+            close: self.close[idx],
+            volume: self.volume[idx],
+        }
+    }
+
+    /// The input bar `idx` steps with when nothing but the market drives it.
+    #[inline]
+    pub fn input(&self, idx: usize) -> StepInput {
+        StepInput { atr: self.atr.map_or(0.0, |values| values[idx]), ..StepInput::default() }
+    }
+}
+
+/// What a run of bars an idle kernel can take whole spans; see
+/// [`EngineKernel::idle_run`].
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct IdleRun {
+    /// The highest high and lowest low, which the open positions' running
+    /// extremes meet; `None` for a flat book, which has none to mark.
+    pub range: Option<(Price, Price)>,
+    /// The run's highest equity, or `None` when no bar is marked to a
+    /// number.
+    pub peak_equity: Option<f64>,
 }
 
 impl KernelBar {
@@ -1063,6 +1112,13 @@ impl EngineKernel {
         self.risk.is_halted()
     }
 
+    /// Whether the drawdown kill-switch is armed and untripped, so each
+    /// marked equity can still trip it.
+    #[inline]
+    pub(crate) fn watches_drawdown(&self) -> bool {
+        self.risk.watches_drawdown()
+    }
+
     /// Whether this kernel's margin-call kill-switch has tripped.
     #[inline]
     pub fn is_margin_halted(&self) -> bool {
@@ -1075,7 +1131,235 @@ impl EngineKernel {
     /// update extremes, then exits (stop > target > signal), then entries.
     /// An exit and a re-entry may both occur on the same bar.
     pub fn step(&mut self, idx: usize, bar: &KernelBar, input: StepInput) -> Vec<EngineEvent> {
+        if self.idle_on(bar, &input) {
+            self.step_idle(bar, input);
+            return Vec::new();
+        }
         self.step_inner(idx, bar, input, StepMode::Bar)
+    }
+
+    /// Whether a bar step can do nothing but follow the market.
+    ///
+    /// Most bars of a run are like this: no order working, no intent
+    /// waiting, no signal, no protective level or expiry that the bar's
+    /// prices could reach, and no margin call due at its close. Every phase
+    /// of [`Self::step_inner`] is then a no-op but two -- the running
+    /// extremes and the standing book -- which [`Self::step_idle`] advances
+    /// alone. Anything else, however unlikely to act, takes the full step.
+    #[inline]
+    fn idle_on(&self, bar: &KernelBar, input: &StepInput) -> bool {
+        !input.entry && !input.exit && self.idle_state() && self.idle_at(bar)
+    }
+
+    /// What [`Self::idle_on`] asks of the kernel's own state, which no idle
+    /// step changes.
+    #[inline]
+    pub(crate) fn idle_state(&self) -> bool {
+        let positions = self.ledger.positions();
+        self.pending_events.is_empty()
+            && self.deferred.is_none()
+            && self.pending_closes.is_empty()
+            && self.algos.is_empty()
+            && self.orders.working().next().is_none()
+            && (positions.is_empty()
+                || (!matches!(self.effective_stop, StopConfig::Trailing { .. })
+                    && positions.iter().all(|managed| {
+                        managed.position.stop_price.is_none()
+                            && managed.position.target_price.is_none()
+                    })))
+    }
+
+    /// What [`Self::idle_on`] asks of the bar itself, once
+    /// [`Self::idle_state`] holds.
+    #[inline]
+    pub(crate) fn idle_at(&self, bar: &KernelBar) -> bool {
+        self.spec.as_ref().is_none_or(|spec| !spec.is_expired_at(bar.timestamp))
+            && self.margin_call_due(bar.close).is_none()
+    }
+
+    /// Whether [`Self::idle_at`] admits every bar, whatever its stamp and
+    /// close: the instrument never expires, and no close can call margin --
+    /// a halted margin calls none, and an account with no maintenance rate
+    /// and no deposit-modelled short requires nothing to maintain.
+    pub(crate) fn idle_at_every_bar(&self) -> bool {
+        self.never_expires()
+            && (self.margin.is_halted()
+                || (self.maint_rate().is_none() && !self.short_option_margin_modelled()))
+    }
+
+    /// Whether the instrument has no expiry for a bar to reach.
+    pub(crate) fn never_expires(&self) -> bool {
+        self.spec.as_ref().is_none_or(|spec| spec.expiration_ns.is_none())
+    }
+
+    /// Whether a close can bear on [`Self::margin_clears`]: `false` when
+    /// it clears whatever the closes.
+    pub(crate) fn margin_reads_closes(&self) -> bool {
+        self.ledger.is_in_position() && !self.margin.is_halted()
+    }
+
+    /// Whether no bar whose closes `extremes` folds can call margin, while
+    /// the kernel stands idle and its positions stand: the bound
+    /// [`Self::idle_run`] settles a run with. `false` where the bound does
+    /// not settle it, which does not say a bar would.
+    pub(crate) fn margin_clears(&self, extremes: &Extremes) -> bool {
+        if !self.ledger.is_in_position() || self.margin.is_halted() {
+            return true;
+        }
+        if self.short_option_margin_modelled() {
+            return false;
+        }
+        let Extremes { lowest_close: lowest, highest_close: highest, .. } = *extremes;
+        // No close is a number: none calls margin.
+        if lowest > highest {
+            return true;
+        }
+        let rising = match self.account {
+            AccountMode::Cash => self.ledger.value_trend(false),
+            AccountMode::Margin { .. } => self.ledger.value_trend(true),
+        };
+        let Some(rising) = rising else {
+            return false;
+        };
+        let floor = self.equity(if rising { lowest } else { highest });
+        let required = self.maintenance_requirement(highest);
+        floor.is_finite() && floor >= required
+    }
+
+    /// The first bar of `start..end` the instrument has expired by, or
+    /// `end`; the timestamps rise.
+    pub(crate) fn live_until(&self, timestamps: &[i64], start: usize, end: usize) -> usize {
+        match self.spec.as_ref().and_then(|spec| spec.expiration_ns) {
+            Some(expiry) => start + timestamps[start..end].partition_point(|&ts| ts < expiry),
+            None => end,
+        }
+    }
+
+    /// Whether every bar of `start..end` steps idle and can be stepped in
+    /// one [`Self::step_idle_bars`], and what that needs; the kernel stands
+    /// idle ([`Self::idle_state`]) and none of the bars has expired it.
+    ///
+    /// Two things an idle step asks depend on each bar's close: the margin
+    /// call, and the equity the runner marks. While the positions stand,
+    /// equity follows the close one way -- cash plus each position's
+    /// value, every operation monotone in the price as rounded, and a
+    /// short's sign flip exact -- and the maintenance requirement rises
+    /// with it. So equity at the run's worst close clearing the
+    /// requirement at its highest clears every bar, and the run's best
+    /// close marks its peak. A run the bound does not settle, or one whose
+    /// positions pull equity both ways, is stepped bar by bar.
+    pub(crate) fn idle_run(
+        &self,
+        bars: &BarColumns<'_>,
+        start: usize,
+        end: usize,
+    ) -> Option<IdleRun> {
+        if !self.ledger.is_in_position() {
+            // Flat, the account is its cash at any close, and no position
+            // reads the run's highs and lows: of the extremes, all a flat run
+            // needs is whether a single close is a number to mark.
+            if !bars.close[start..end].iter().any(|close| !close.is_nan()) {
+                return Some(IdleRun { range: None, peak_equity: None });
+            }
+            let peak = self.equity(bars.close[end - 1]);
+            if !peak.is_finite() || peak == 0.0 {
+                return None;
+            }
+            return Some(IdleRun { range: None, peak_equity: Some(peak) });
+        }
+        // Comparisons pass over a NaN, as the per-bar steps do: such a
+        // close marks no peak and calls no margin.
+        let extremes = match bars.index {
+            Some(index) => index.extremes(bars.close, bars.high, bars.low, start, end),
+            None => {
+                let mut extremes = Extremes::EMPTY;
+                for idx in start..end {
+                    extremes.push(bars.close[idx], bars.high[idx], bars.low[idx]);
+                }
+                extremes
+            }
+        };
+        let Extremes { lowest_close: lowest, highest_close: highest, high, low } = extremes;
+        if lowest > highest {
+            return Some(IdleRun { range: Some((high, low)), peak_equity: None });
+        }
+        let rising = match self.account {
+            AccountMode::Cash => self.ledger.value_trend(false)?,
+            AccountMode::Margin { .. } => self.ledger.value_trend(true)?,
+        };
+        let (worst, best) = if rising { (lowest, highest) } else { (highest, lowest) };
+        let peak = self.equity(best);
+        // A zero peak could tie a zero of the other sign on an earlier bar.
+        if !peak.is_finite() || peak == 0.0 {
+            return None;
+        }
+        if !self.margin.is_halted() {
+            if self.short_option_margin_modelled() {
+                return None;
+            }
+            // Rates are positive, so the requirement peaks at the highest
+            // close.
+            let floor = self.equity(worst);
+            let required = self.maintenance_requirement(highest);
+            if !floor.is_finite() || !(floor >= required) {
+                return None;
+            }
+        }
+        Some(IdleRun { range: Some((high, low)), peak_equity: Some(peak) })
+    }
+
+    /// [`Self::step_idle`] over bars `start..end` in turn, as
+    /// [`Self::idle_run`] found them.
+    pub(crate) fn step_idle_bars(
+        &mut self,
+        bars: &BarColumns<'_>,
+        start: usize,
+        end: usize,
+        run: &IdleRun,
+    ) {
+        self.stepping_trade = false;
+        self.last_atr = bars.input(end - 1).atr;
+        if let Some((high, low)) = run.range {
+            self.ledger.update_price(high, low);
+        }
+        self.orders.advance_idle_bars(
+            |idx| bars.bar(idx).to_ohlcv_bar(),
+            bars.volume,
+            bars.index,
+            start,
+            end,
+            &self.fill_model,
+        );
+    }
+
+    /// The margin call this bar's close makes, as `(equity, required)`.
+    ///
+    /// Maintenance marks against the close and nothing else a bar step
+    /// changes before it, so [`Self::idle_on`] can ask ahead of the step
+    /// what [`Self::step_inner`] will find.
+    #[inline]
+    fn margin_call_due(&self, close: Price) -> Option<(f64, f64)> {
+        if !self.ledger.is_in_position() || self.margin.is_halted() {
+            return None;
+        }
+        let required = self.maintenance_requirement(close);
+        if required > 0.0 {
+            let equity = self.equity(close);
+            if equity < required {
+                return Some((equity, required));
+            }
+        }
+        None
+    }
+
+    /// The bar step of an idle kernel ([`Self::idle_on`]): exactly the state
+    /// [`Self::step_inner`] changes on such a bar, and no events.
+    #[inline]
+    fn step_idle(&mut self, bar: &KernelBar, input: StepInput) {
+        self.stepping_trade = false;
+        self.last_atr = input.atr;
+        self.ledger.update_price(bar.high, bar.low);
+        self.orders.advance_idle_bar(&bar.to_ohlcv_bar(), &self.fill_model);
     }
 
     /// Advance the simulation by one trade print.
@@ -1365,17 +1649,11 @@ impl EngineKernel {
 
         // Margin maintenance: mark against this bar's close; a breach halts
         // new entries (latching) but does not force-liquidate.
-        if self.ledger.is_in_position() && !self.margin.is_halted() {
-            let required = self.maintenance_requirement(bar.close);
-            if required > 0.0 {
-                let equity = self.equity(bar.close);
-                if equity < required {
-                    self.margin.halt();
-                    events.push(EngineEvent::MarginCall { idx, equity, required });
-                    if self.config.liquidate_on_margin_call {
-                        events.extend(self.liquidate_all(idx, bar));
-                    }
-                }
+        if let Some((equity, required)) = self.margin_call_due(bar.close) {
+            self.margin.halt();
+            events.push(EngineEvent::MarginCall { idx, equity, required });
+            if self.config.liquidate_on_margin_call {
+                events.extend(self.liquidate_all(idx, bar));
             }
         }
 

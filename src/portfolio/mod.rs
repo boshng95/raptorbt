@@ -1,6 +1,7 @@
 //! Portfolio simulation engine for RaptorBT.
 
 pub mod allocation;
+pub mod bar_index;
 pub mod covariance;
 mod curve;
 pub mod engine;

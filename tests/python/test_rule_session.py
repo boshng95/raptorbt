@@ -128,8 +128,48 @@ def test_a_callback_that_asks_for_the_next_bar_gets_it() -> None:
             "reads no primary-stream indicator",
         ),
         ({"dispatch_positions": np.zeros(1, np.int64)}, "dispatch positions do not match"),
+        (
+            {"conditions": [(0, [], -1, 0.0, -1, 0.0, 0, 0.0, 0.0)], "exit_roots": []},
+            "conditions with both root lists",
+        ),
+        (
+            {
+                "exits": [(0, -1, 1.0, -1, 2.0, True)],
+                "n_clocks": 1,
+                "conditions": [],
+                "exit_roots": [],
+                "entry_roots": [],
+            },
+            "conditions with both root lists",
+        ),
+        (
+            {"conditions": [], "exit_roots": [0], "entry_roots": []},
+            "names an unknown condition",
+        ),
+        (
+            {
+                "conditions": [(2, [], -1, 0.0, -1, 0.0, 0, 0.0, 0.0)],
+                "exit_roots": [],
+                "entry_roots": [0],
+            },
+            "NOT takes one child",
+        ),
     ],
 )
 def test_an_inconsistent_layout_is_refused(changes, message) -> None:
     with pytest.raises(ValueError, match=message):
         _rules(**changes)
+
+
+def test_a_condition_tree_is_taken_as_level_rules() -> None:
+    assert CrossoverRuleSession.LEVEL_RULES
+    # NOT (1 > 2): one entry rule over constants, as a one-sided level rule.
+    _rules(
+        conditions=[
+            (4, [], -1, 1.0, -1, 2.0, 0, 0.0, 0.0),
+            (2, [0], -1, 0.0, -1, 0.0, 0, 0.0, 0.0),
+        ],
+        exit_roots=[],
+        entry_roots=[1],
+        level=(False, 1.0, 0.0),
+    )

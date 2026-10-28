@@ -567,6 +567,27 @@ impl PositionLedger {
     pub fn position_value(&self, price: Price) -> f64 {
         self.open.iter().map(|p| price * p.position.size * self.contract_multiplier).sum()
     }
+
+    /// Which way the open positions' value moves with the price, as
+    /// [`Self::unrealized_total`] (`signed`) or [`Self::position_value`]
+    /// computes it: `Some(true)` when a higher price never values them
+    /// lower, `Some(false)` when it never values them higher, `None` when
+    /// they pull both ways. Flat counts as rising.
+    pub fn value_trend(&self, signed: bool) -> Option<bool> {
+        let mut rising = None;
+        for managed in &self.open {
+            let position = &managed.position;
+            if !(position.size >= 0.0) {
+                return None;
+            }
+            let up = !signed || position.direction == Direction::Long;
+            if rising.is_some_and(|other| other != up) {
+                return None;
+            }
+            rising = Some(up);
+        }
+        Some(rising.unwrap_or(true))
+    }
 }
 
 #[cfg(test)]

@@ -27,7 +27,7 @@ pub mod strategies;
 
 /// Python module entry point
 #[pymodule]
-fn _raptorbt(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
+fn _raptorbt(py: Python<'_>, m: &PyModule) -> PyResult<()> {
     // Session lengths in minutes, for BacktestConfig(session_minutes=...).
     // Intraday annualization scales with session length, so using the NSE
     // default on MCX data understates Sharpe by ~1.5x.
@@ -80,6 +80,9 @@ fn _raptorbt(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
     m.add_class::<python::strategy_bindings::PyEngineEvent>()?;
     m.add_class::<python::strategy_bindings::PyPositionSnapshot>()?;
     m.add_class::<python::rule_session::PyCrossoverRuleSession>()?;
+    m.add_class::<python::money::PyMoneyModel>()?;
+    m.add_class::<python::fill_ledger::PyReplayLedger>()?;
+    m.add("ReplayDeclined", py.get_type::<python::replay_session::ReplayDeclined>())?;
     m.add_function(wrap_pyfunction!(python::strategy_bindings::resolve_atr_period, m)?)?;
 
     // Register batch spread backtest

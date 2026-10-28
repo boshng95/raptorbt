@@ -6,24 +6,31 @@
 //! strategy hooks. Result accounting is shared with the array-based runners,
 //! so both paths produce identical metrics for identical decisions.
 
+use std::sync::Arc;
+
 use numpy::PyReadonlyArray1;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
 use crate::core::types::{BacktestConfig, Direction, InstrumentConfig, StopConfig, TargetConfig};
 use crate::execution::orders::{OrderKind, OrderSide, QtySpec, TimeInForce, TrailOffset};
-use crate::portfolio::kernel::{EngineEvent, KernelBar, StepInput};
+use crate::portfolio::bar_index::{BarIndex, Extremes};
+use crate::portfolio::kernel::{BarColumns, EngineEvent, KernelBar, StepInput};
 use crate::portfolio::runner::SingleRunner;
 
+use super::bar_index_cache::{self, Stream};
 use super::bindings::{
     convert_result, convert_trade, PyBacktestConfig, PyBacktestResult, PyInstrumentConfig, PyTrade,
 };
+use super::fill_ledger::{BookTerms, Ledger, PyReplayLedger};
 use super::instrument_bindings::PyInstrumentSpec;
-use super::rule_session::{PyCrossoverRuleSession, QuietBar, QuietParams, QuietTuple};
+use super::money::PyMoneyModel;
+use super::replay_session::{replay, Money, Venue};
+use super::rule_session::{PyCrossoverRuleSession, QuietBar, QuietParams, QuietTuple, RuleStepper};
 
 /// `ctx.position is not None` and `ctx.net_position`, as the Python context
 /// reads them: a left-to-right sum of signed sizes over the open positions.
-fn held_position(runner: &SingleRunner) -> (bool, f64) {
+pub(crate) fn held_position(runner: &SingleRunner) -> (bool, f64) {
     let kernel = runner.kernel();
     let has_position = kernel.position_snapshot().is_some();
     let net = kernel
@@ -421,6 +428,7 @@ impl PyKernelSession {
     #[allow(clippy::too_many_arguments)]
     fn step_until_event(
         &mut self,
+        py: Python<'_>,
         start: usize,
         end: usize,
         timestamps: PyReadonlyArray1<'_, i64>,
@@ -431,26 +439,9 @@ impl PyKernelSession {
         volume: PyReadonlyArray1<'_, f64>,
         atr: Option<PyReadonlyArray1<'_, f64>>,
     ) -> PyResult<(usize, Vec<PyEngineEvent>)> {
-        let ts = timestamps
-            .as_slice()
-            .map_err(|_| PyValueError::new_err("timestamps must be contiguous"))?;
-        let o = open.as_slice().map_err(|_| PyValueError::new_err("open must be contiguous"))?;
-        let h = high.as_slice().map_err(|_| PyValueError::new_err("high must be contiguous"))?;
-        let l = low.as_slice().map_err(|_| PyValueError::new_err("low must be contiguous"))?;
-        let c = close.as_slice().map_err(|_| PyValueError::new_err("close must be contiguous"))?;
-        let v =
-            volume.as_slice().map_err(|_| PyValueError::new_err("volume must be contiguous"))?;
-        let atr_values = atr
-            .as_ref()
-            .map(|array| array.as_slice())
-            .transpose()
-            .map_err(|_| PyValueError::new_err("atr must be contiguous"))?;
-        let n = ts.len();
-        if start >= end
-            || end > n
-            || [o.len(), h.len(), l.len(), c.len(), v.len()].iter().any(|&length| length != n)
-            || atr_values.is_some_and(|values| values.len() != n)
-        {
+        let bars =
+            BarArrays::new(py, &timestamps, &open, &high, &low, &close, &volume, atr.as_ref())?;
+        if start >= end || end > bars.len() {
             return Err(PyValueError::new_err("invalid idle bar range or array lengths"));
         }
         let runner = self
@@ -460,25 +451,8 @@ impl PyKernelSession {
         if start != runner.bars_seen() {
             return Err(PyValueError::new_err("idle range must start at the next bar"));
         }
-        for idx in start..end {
-            let bar = KernelBar {
-                timestamp: ts[idx],
-                open: o[idx],
-                high: h[idx],
-                low: l[idx],
-                close: c[idx],
-                volume: v[idx],
-            };
-            let input = StepInput {
-                atr: atr_values.map_or(0.0, |values| values[idx]),
-                ..StepInput::default()
-            };
-            let events = runner.step(idx, &bar, input);
-            if !events.is_empty() {
-                return Ok((idx, events.into_iter().map(PyEngineEvent::from).collect()));
-            }
-        }
-        Ok((end - 1, Vec::new()))
+        let (last, events) = step_until_event(runner, &bars, start, end);
+        Ok((last, events.into_iter().map(PyEngineEvent::from).collect()))
     }
 
     /// Step bars for a crossover rule set the kernel can run on its own.
@@ -521,29 +495,10 @@ impl PyKernelSession {
         pending_target: Option<f64>,
         quiet: QuietTuple,
     ) -> PyResult<(u8, usize, Vec<PyEngineEvent>)> {
-        let ts = timestamps
-            .as_slice()
-            .map_err(|_| PyValueError::new_err("timestamps must be contiguous"))?;
-        let o = open.as_slice().map_err(|_| PyValueError::new_err("open must be contiguous"))?;
-        let h = high.as_slice().map_err(|_| PyValueError::new_err("high must be contiguous"))?;
-        let l = low.as_slice().map_err(|_| PyValueError::new_err("low must be contiguous"))?;
-        let c = close.as_slice().map_err(|_| PyValueError::new_err("close must be contiguous"))?;
-        let v =
-            volume.as_slice().map_err(|_| PyValueError::new_err("volume must be contiguous"))?;
+        let bars =
+            BarArrays::new(py, &timestamps, &open, &high, &low, &close, &volume, atr.as_ref())?;
         let m = mask.as_slice().map_err(|_| PyValueError::new_err("mask must be contiguous"))?;
-        let atr_values = atr
-            .as_ref()
-            .map(|array| array.as_slice())
-            .transpose()
-            .map_err(|_| PyValueError::new_err("atr must be contiguous"))?;
-        let n = ts.len();
-        if start >= end
-            || end > n
-            || [o.len(), h.len(), l.len(), c.len(), v.len(), m.len()]
-                .iter()
-                .any(|&length| length != n)
-            || atr_values.is_some_and(|values| values.len() != n)
-        {
+        if start >= end || end > bars.len() || m.len() != bars.len() {
             return Err(PyValueError::new_err("invalid rule bar range or array lengths"));
         }
         let quiet = QuietParams::from(quiet);
@@ -555,43 +510,125 @@ impl PyKernelSession {
             return Err(PyValueError::new_err("rule range must start at the next bar"));
         }
         let mut stepper = rules.split(py)?;
-        for idx in start..end {
-            if m[idx] {
-                // The callback runs before the bar steps, against the account
-                // the previous bar left.
-                let (has_position, net_position) = held_position(runner);
-                let bar = QuietBar {
-                    idx,
-                    now: ts[idx],
-                    close: c[idx],
-                    has_position,
-                    net_position,
-                    cash: runner.cash(),
-                    halted,
-                    pending: pending_target,
-                };
-                if !stepper.quiet_bar(&bar, &quiet) {
-                    return Ok((2, idx, Vec::new()));
-                }
-            }
-            let bar = KernelBar {
-                timestamp: ts[idx],
-                open: o[idx],
-                high: h[idx],
-                low: l[idx],
-                close: c[idx],
-                volume: v[idx],
-            };
-            let input = StepInput {
-                atr: atr_values.map_or(0.0, |values| values[idx]),
-                ..StepInput::default()
-            };
-            let events = runner.step(idx, &bar, input);
-            if !events.is_empty() {
-                return Ok((0, idx, events.into_iter().map(PyEngineEvent::from).collect()));
-            }
+        let (kind, last, events) = step_rules_until(
+            runner,
+            &bars,
+            m,
+            &mut stepper,
+            halted,
+            pending_target,
+            &quiet,
+            start,
+            end,
+        );
+        Ok((kind, last, events.into_iter().map(PyEngineEvent::from).collect()))
+    }
+
+    /// Run every bar of this fresh session as a crossover replay would.
+    ///
+    /// `run_strategy_backtest` with a strategy whose `replay_rules` hook
+    /// names its rule session, venue terms and money functions; see
+    /// `replay_session`. Returns the ordered log of what the strategy booked,
+    /// or raises `ReplayDeclined` where it would take a branch the replay
+    /// does not transcribe, leaving the session spent. Given `book`, the
+    /// terms of the strategy's own book, it returns that log booked instead,
+    /// as a `ReplayLedger`.
+    ///
+    /// `venue` is `(bar_ns, venue_ioc, entry_market, exit_market,
+    /// market_markup, size_increment, minimum_quantity, minimum_notional,
+    /// lowest_close, order_tag, first_order_seq, max_actions_per_timestamp)`.
+    /// `money`, a `MoneyModel` of the same functions, answers them without
+    /// calling back wherever it can. `book` is `(balance,
+    /// currency_precision, size_increment, size_precision, price_precision,
+    /// currency)`.
+    #[pyo3(signature = (
+        timestamps, open, high, low, close, volume, atr, mask, rules, quiet, venue,
+        units, snap, affordable, exhausted, gate=None, money=None, book=None,
+    ))]
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    fn replay_rules(
+        &mut self,
+        py: Python<'_>,
+        timestamps: PyReadonlyArray1<'_, i64>,
+        open: PyReadonlyArray1<'_, f64>,
+        high: PyReadonlyArray1<'_, f64>,
+        low: PyReadonlyArray1<'_, f64>,
+        close: PyReadonlyArray1<'_, f64>,
+        volume: PyReadonlyArray1<'_, f64>,
+        atr: Option<PyReadonlyArray1<'_, f64>>,
+        mask: PyReadonlyArray1<'_, bool>,
+        mut rules: PyRefMut<'_, PyCrossoverRuleSession>,
+        quiet: QuietTuple,
+        venue: (i64, bool, bool, bool, f64, f64, f64, f64, f64, String, u64, usize),
+        units: &PyAny,
+        snap: &PyAny,
+        affordable: &PyAny,
+        exhausted: &PyAny,
+        gate: Option<PyReadonlyArray1<'_, bool>>,
+        money: Option<PyRef<'_, PyMoneyModel>>,
+        book: Option<(f64, u32, f64, usize, usize, String)>,
+    ) -> PyResult<PyObject> {
+        let bars =
+            BarArrays::new(py, &timestamps, &open, &high, &low, &close, &volume, atr.as_ref())?;
+        let m = mask.as_slice().map_err(|_| PyValueError::new_err("mask must be contiguous"))?;
+        let g = gate
+            .as_ref()
+            .map(|array| array.as_slice())
+            .transpose()
+            .map_err(|_| PyValueError::new_err("gate must be contiguous"))?;
+        if bars.len() == 0 || m.len() != bars.len() || g.is_some_and(|g| g.len() != bars.len()) {
+            return Err(PyValueError::new_err("invalid replay array lengths"));
         }
-        Ok((1, end - 1, Vec::new()))
+        let runner = self
+            .runner
+            .as_mut()
+            .ok_or_else(|| PyValueError::new_err("session is finished; create a new one"))?;
+        if runner.bars_seen() != 0 {
+            return Err(PyValueError::new_err("a replay must start on a fresh session"));
+        }
+        let venue = Venue {
+            bar_ns: venue.0,
+            venue_ioc: venue.1,
+            entry_market: venue.2,
+            exit_market: venue.3,
+            market_markup: venue.4,
+            size_increment: venue.5,
+            minimum_quantity: venue.6,
+            minimum_notional: venue.7,
+            lowest_close: venue.8,
+            order_tag: venue.9,
+            first_order_seq: venue.10,
+            max_actions_per_timestamp: venue.11,
+        };
+        let money = Money { units, snap, affordable, exhausted, model: money.as_deref() };
+        let stepper = rules.split(py)?;
+        let booked = book.is_some();
+        let ledger = Ledger::new(book.map(
+            |(
+                balance,
+                currency_precision,
+                size_increment,
+                size_precision,
+                price_precision,
+                currency,
+            )| {
+                BookTerms {
+                    balance,
+                    currency_precision,
+                    size_increment,
+                    size_precision,
+                    price_precision,
+                    currency,
+                }
+            },
+        ));
+        let ledger =
+            replay(runner, bars, m, g, stepper, QuietParams::from(quiet), venue, money, ledger)?;
+        if booked {
+            Ok(Py::new(py, PyReplayLedger::new(ledger))?.into_py(py))
+        } else {
+            Ok(ledger.log(py).into_py(py))
+        }
     }
 
     /// Settle resting orders off-schedule, at `ts_now`.
@@ -865,7 +902,7 @@ impl PyKernelSession {
             .ok_or_else(|| PyValueError::new_err("session is finished; create a new one"))
     }
 
-    fn runner_mut(&mut self) -> PyResult<&mut SingleRunner> {
+    pub(crate) fn runner_mut(&mut self) -> PyResult<&mut SingleRunner> {
         self.runner
             .as_mut()
             .ok_or_else(|| PyValueError::new_err("session is finished; create a new one"))
@@ -897,6 +934,335 @@ pub fn resolve_atr_period(
         (_, TargetConfig::Atr { period, .. }) => Some(period),
         _ => None,
     }
+}
+
+/// One run's primary bars, borrowed for the length of a stepping call.
+pub(crate) struct BarArrays<'a> {
+    pub ts: &'a [i64],
+    pub open: &'a [f64],
+    pub high: &'a [f64],
+    pub low: &'a [f64],
+    pub close: &'a [f64],
+    pub volume: &'a [f64],
+    pub atr: Option<&'a [f64]>,
+    /// Their summaries, shared by every call stepping these same arrays.
+    pub index: Option<Arc<BarIndex>>,
+}
+
+impl<'a> BarArrays<'a> {
+    /// Borrow the driver's arrays, which must be contiguous and of one length.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        py: Python<'_>,
+        timestamps: &'a PyReadonlyArray1<'_, i64>,
+        open: &'a PyReadonlyArray1<'_, f64>,
+        high: &'a PyReadonlyArray1<'_, f64>,
+        low: &'a PyReadonlyArray1<'_, f64>,
+        close: &'a PyReadonlyArray1<'_, f64>,
+        volume: &'a PyReadonlyArray1<'_, f64>,
+        atr: Option<&'a PyReadonlyArray1<'_, f64>>,
+    ) -> PyResult<Self> {
+        let mut bars = Self {
+            ts: timestamps
+                .as_slice()
+                .map_err(|_| PyValueError::new_err("timestamps must be contiguous"))?,
+            open: open.as_slice().map_err(|_| PyValueError::new_err("open must be contiguous"))?,
+            high: high.as_slice().map_err(|_| PyValueError::new_err("high must be contiguous"))?,
+            low: low.as_slice().map_err(|_| PyValueError::new_err("low must be contiguous"))?,
+            close: close
+                .as_slice()
+                .map_err(|_| PyValueError::new_err("close must be contiguous"))?,
+            volume: volume
+                .as_slice()
+                .map_err(|_| PyValueError::new_err("volume must be contiguous"))?,
+            atr: atr
+                .map(|array| array.as_slice())
+                .transpose()
+                .map_err(|_| PyValueError::new_err("atr must be contiguous"))?,
+            index: None,
+        };
+        let n = bars.ts.len();
+        if [bars.open.len(), bars.high.len(), bars.low.len(), bars.close.len(), bars.volume.len()]
+            .iter()
+            .any(|&length| length != n)
+            || bars.atr.is_some_and(|values| values.len() != n)
+        {
+            return Err(PyValueError::new_err("bar arrays must all have one length"));
+        }
+        let stream = Stream {
+            objects: [
+                timestamps.as_ref(),
+                high.as_ref(),
+                low.as_ref(),
+                close.as_ref(),
+                volume.as_ref(),
+            ],
+            timestamp: bars.ts,
+            high: bars.high,
+            low: bars.low,
+            close: bars.close,
+            volume: bars.volume,
+        };
+        bars.index = bar_index_cache::shared(py, &stream)?;
+        Ok(bars)
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.ts.len()
+    }
+
+    /// The same arrays, for the kernel's own runs of bars.
+    pub(crate) fn columns(&self) -> BarColumns<'_> {
+        BarColumns {
+            timestamp: self.ts,
+            open: self.open,
+            high: self.high,
+            low: self.low,
+            close: self.close,
+            volume: self.volume,
+            atr: self.atr,
+            index: self.index.as_deref(),
+        }
+    }
+
+    /// Bar `idx`, and the inputs the Python driver steps it with.
+    pub(crate) fn bar(&self, idx: usize) -> (KernelBar, StepInput) {
+        let bar = KernelBar {
+            timestamp: self.ts[idx],
+            open: self.open[idx],
+            high: self.high[idx],
+            low: self.low[idx],
+            close: self.close[idx],
+            volume: self.volume[idx],
+        };
+        let input =
+            StepInput { atr: self.atr.map_or(0.0, |values| values[idx]), ..StepInput::default() };
+        (bar, input)
+    }
+}
+
+/// Step `start..end` until a bar produces events; see
+/// [`PyKernelSession::step_until_event`].
+pub(crate) fn step_until_event(
+    runner: &mut SingleRunner,
+    bars: &BarArrays<'_>,
+    start: usize,
+    end: usize,
+) -> (usize, Vec<EngineEvent>) {
+    let columns = bars.columns();
+    let mut idx = start;
+    while idx < end {
+        idx = runner.step_idle_run(&columns, idx, end);
+        if idx == end {
+            break;
+        }
+        let (bar, input) = bars.bar(idx);
+        let events = runner.step(idx, &bar, input);
+        if !events.is_empty() {
+            return (idx, events);
+        }
+        idx += 1;
+    }
+    (end - 1, Vec::new())
+}
+
+/// The bars ahead of a callback whose closes the margin bound is first tried
+/// over, in [`step_rules_until`]: doubled each time the bound holds, halved
+/// each time it does not.
+const MARGIN_SPAN: usize = 4096;
+
+/// The first callback bar in `mask[from..end]`, sixty-four flags to a read.
+fn next_due(mask: &[bool], from: usize, end: usize) -> Option<usize> {
+    let flags = &mask[from..end];
+    // SAFETY: a `bool` is one byte holding 0 or 1, each a valid `u8`.
+    let bytes: &[u8] = unsafe { std::slice::from_raw_parts(flags.as_ptr().cast(), flags.len()) };
+    let (chunks, remainder) = bytes.as_chunks::<64>();
+    let mut offset = from;
+    for chunk in chunks {
+        // One vector OR across the chunk; most of a sparse mask is zero.
+        if chunk.iter().fold(0, |any, &flag| any | flag) != 0 {
+            return chunk.iter().position(|&flag| flag != 0).map(|at| offset + at);
+        }
+        offset += 64;
+    }
+    remainder.iter().position(|&flag| flag != 0).map(|at| offset + at)
+}
+
+/// Step `start..end`, taking quiet callback bars for the strategy; see
+/// [`PyKernelSession::step_rules_until`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn step_rules_until(
+    runner: &mut SingleRunner,
+    bars: &BarArrays<'_>,
+    mask: &[bool],
+    stepper: &mut RuleStepper<'_>,
+    halted: bool,
+    pending_target: Option<f64>,
+    quiet: &QuietParams,
+    start: usize,
+    end: usize,
+) -> (u8, usize, Vec<EngineEvent>) {
+    let columns = bars.columns();
+    let kernel = runner.kernel();
+    if start < end && kernel.idle_state() && kernel.idle_at_every_bar() {
+        // Every bar from here steps idle, and an idle bar moves neither cash
+        // nor the position: each callback reads the account as it stands
+        // now, and its rules need no bar stepped to be asked. So the
+        // callbacks are asked first, in order, up to the first that would
+        // act, and the bars before it are stepped in one run -- the run
+        // `step_until_event` takes across bars no callback interrupts.
+        let (has_position, net_position) = held_position(runner);
+        let cash = runner.cash();
+        let mut stop = end;
+        let mut at = start;
+        while let Some(idx) = next_due(mask, at, end) {
+            let bar = QuietBar {
+                idx,
+                now: bars.ts[idx],
+                close: bars.close[idx],
+                has_position,
+                net_position,
+                cash,
+                halted,
+                pending: pending_target,
+            };
+            if !stepper.quiet_bar(&bar, quiet) {
+                stop = idx;
+                break;
+            }
+            at = idx + 1;
+        }
+        let reached = runner.step_idle_run(&columns, start, stop);
+        debug_assert_eq!(reached, stop, "an idle kernel stopped standing idle");
+        return if stop < end { (2, stop, Vec::new()) } else { (1, end - 1, Vec::new()) };
+    }
+    let mut idx = start;
+    if let Some(index) =
+        columns.index.filter(|_| start < end && kernel.idle_state() && kernel.never_expires())
+    {
+        // The same, where a close could call margin: a callback is asked
+        // once the bars before it are bound to have called none, the bound
+        // `idle_run` steps a run on. A stretch the bound does not settle
+        // ends at the callback it failed at, unasked, and the next starts
+        // there; a bar the kernel then does not step idle leaves the rest
+        // to the walk below.
+        let (has_position, net_position) = held_position(runner);
+        let cash = runner.cash();
+        // Whether a close can call margin at all; when none can, the bound
+        // is never read and its closes are not folded.
+        let reads_closes = runner.kernel().margin_reads_closes();
+        let mut from = start;
+        loop {
+            let mut extremes = Extremes::EMPTY;
+            let mut covered = from;
+            // Every callback up to this bar is bound to call no margin: the
+            // closes of a run that reaches past it do not, and the bound
+            // over fewer closes is the looser one.
+            let mut cleared = from;
+            let mut span = MARGIN_SPAN;
+            let mut at = from;
+            let mut stop = end;
+            let mut acts = false;
+            while let Some(callback) = next_due(mask, at, end) {
+                if reads_closes && callback > cleared {
+                    let ahead = end.min(callback.saturating_add(span));
+                    let mut wider = extremes;
+                    wider.merge(&index.extremes(bars.close, bars.high, bars.low, covered, ahead));
+                    if runner.kernel().margin_clears(&wider) {
+                        (extremes, covered, cleared) = (wider, ahead, ahead);
+                        span = span.saturating_mul(2);
+                    } else {
+                        // Settled at this callback alone, as `idle_run` would.
+                        extremes.merge(
+                            &index.extremes(bars.close, bars.high, bars.low, covered, callback),
+                        );
+                        covered = callback;
+                        span = (span / 2).max(1);
+                        if !runner.kernel().margin_clears(&extremes) {
+                            stop = callback;
+                            break;
+                        }
+                    }
+                }
+                let bar = QuietBar {
+                    idx: callback,
+                    now: bars.ts[callback],
+                    close: bars.close[callback],
+                    has_position,
+                    net_position,
+                    cash,
+                    halted,
+                    pending: pending_target,
+                };
+                if !stepper.quiet_bar(&bar, quiet) {
+                    stop = callback;
+                    acts = true;
+                    break;
+                }
+                at = callback + 1;
+            }
+            let reached = runner.step_idle_run(&columns, from, stop);
+            if reached < stop {
+                // Every callback asked sits at or before this bar.
+                let (bar, input) = bars.bar(reached);
+                let events = runner.step(reached, &bar, input);
+                if !events.is_empty() {
+                    return (0, reached, events);
+                }
+                idx = reached + 1;
+                break;
+            }
+            if acts {
+                return (2, stop, Vec::new());
+            }
+            if stop == end {
+                return (1, end - 1, Vec::new());
+            }
+            if stop == from {
+                idx = from;
+                break;
+            }
+            from = stop;
+        }
+    }
+    // The first callback bar after `idx`, once found.
+    let mut callback = start;
+    while idx < end {
+        if mask[idx] {
+            // The callback runs before the bar steps, against the account
+            // the previous bar left.
+            let (has_position, net_position) = held_position(runner);
+            let bar = QuietBar {
+                idx,
+                now: bars.ts[idx],
+                close: bars.close[idx],
+                has_position,
+                net_position,
+                cash: runner.cash(),
+                halted,
+                pending: pending_target,
+            };
+            if !stepper.quiet_bar(&bar, quiet) {
+                return (2, idx, Vec::new());
+            }
+        }
+        // This bar and those up to the next callback are the kernel's.
+        if callback <= idx {
+            callback = next_due(mask, idx + 1, end).unwrap_or(end);
+        }
+        let reached = runner.step_idle_run(&columns, idx, callback);
+        if reached == callback {
+            idx = callback;
+            continue;
+        }
+        let (bar, input) = bars.bar(reached);
+        let events = runner.step(reached, &bar, input);
+        if !events.is_empty() {
+            return (0, reached, events);
+        }
+        idx = reached + 1;
+    }
+    (1, end - 1, Vec::new())
 }
 
 /// Parse Python order arguments and submit onto a kernel — shared by the
@@ -1026,4 +1392,36 @@ pub(crate) fn submit_order_on(
         arrives_before_bar,
         parent_id,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::next_due;
+
+    #[test]
+    fn the_next_due_bar_is_the_first_flag_set() {
+        // Masks either side of a chunk, flags at every offset of one.
+        for len in [0, 1, 7, 63, 64, 65, 127, 128, 129, 300] {
+            for set in [None, Some(0), Some(1), Some(62), Some(63), Some(64), Some(65), Some(200)] {
+                let mut mask = vec![false; len];
+                if let Some(at) = set.filter(|&at| at < len) {
+                    mask[at] = true;
+                    if at + 70 < len {
+                        mask[at + 70] = true;
+                    }
+                }
+                for from in 0..=len {
+                    for end in from..=len {
+                        let want =
+                            mask[from..end].iter().position(|&flag| flag).map(|at| from + at);
+                        assert_eq!(
+                            next_due(&mask, from, end),
+                            want,
+                            "len {len} from {from} end {end}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 }

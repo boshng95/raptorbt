@@ -13,6 +13,7 @@ use crate::core::types::{Direction, OhlcvBar, Price, Timestamp};
 use crate::execution::fill::{BarLiquidity, BarTape, FillDepth, FillModel, StepKind};
 use crate::execution::orders::order::{Order, OrderKind, OrderStatus, TimeInForce};
 use crate::execution::orders::OrderSide;
+use crate::portfolio::bar_index::BarIndex;
 
 const NS_PER_DAY: i64 = 86_400_000_000_000;
 
@@ -127,6 +128,10 @@ pub struct OrderEngine {
     /// Last traded book left by a step with no matching orders. Its depth is
     /// resolved only if a later order asks to see it.
     deferred_book: Option<DeferredBook>,
+    /// Whether any order was submitted as another's child. An order's
+    /// parent is fixed when it is submitted, so until one is, a fill has
+    /// no held child to release.
+    has_children: bool,
 }
 
 impl OrderEngine {
@@ -183,6 +188,7 @@ impl OrderEngine {
     pub fn submit(&mut self, mut order: Order) -> u64 {
         let id = self.orders.len() as u64;
         order.id = id;
+        self.has_children |= order.parent_id.is_some();
         self.orders.push(order);
         self.working.push(id);
         id
@@ -212,6 +218,12 @@ impl OrderEngine {
     /// Every order ever submitted, in submission order.
     pub fn all(&self) -> &[Order] {
         &self.orders
+    }
+
+    /// Whether any order has been submitted with a parent.
+    #[inline]
+    pub fn has_children(&self) -> bool {
+        self.has_children
     }
 
     /// Cancel a working order. Returns `false` for unknown or finished ids.
@@ -424,6 +436,41 @@ impl OrderEngine {
         }
     }
 
+    /// Step a book that has no order working on it past one bar.
+    ///
+    /// [`Self::match_bar`] with nothing to match: only the standing book
+    /// moves. The kernel's idle step ([`EngineKernel::step`]) comes here
+    /// directly, having already found no order working.
+    ///
+    /// [`EngineKernel::step`]: crate::portfolio::kernel::EngineKernel::step
+    pub(crate) fn advance_idle_bar(&mut self, bar: &OhlcvBar, fill_model: &FillModel) {
+        let ledger = &self.orders;
+        self.working.retain(|&id| !ledger[id as usize].status.is_terminal());
+        debug_assert!(self.working.is_empty(), "an idle step with an order working");
+        self.advance_idle_book(bar, fill_model, StepKind::Bar);
+    }
+
+    #[inline]
+    fn advance_idle_book(&mut self, bar: &OhlcvBar, fill_model: &FillModel, kind: StepKind) {
+        if fill_model.bar_liquidity == BarLiquidity::Unlimited {
+            self.deferred_book = None;
+            self.tape.set_book(Some((bar.close, f64::INFINITY)));
+            return;
+        }
+        self.sync_size_grid(fill_model);
+        self.advance_without_orders(bar, fill_model.bar_liquidity, self.size_grid, kind);
+    }
+
+    /// `FillModel::size_quantum` remains public, so tolerate a caller
+    /// changing it between steps while keeping its expensive decimal scale
+    /// cached for the normal immutable-instrument case.
+    #[inline]
+    fn sync_size_grid(&mut self, fill_model: &FillModel) {
+        if self.size_grid.lot().to_bits() != fill_model.size_quantum.to_bits() {
+            self.size_grid = LotGrid::new(fill_model.size_quantum);
+        }
+    }
+
     #[inline]
     fn advance_without_orders(
         &mut self,
@@ -448,10 +495,26 @@ impl OrderEngine {
             return;
         }
 
-        let previous = self
-            .deferred_book
+        if let Some((price, closing)) = Self::last_print(self.book_price(), bar) {
+            self.deferred_book =
+                Some(DeferredBook { price, volume: bar.volume, liquidity, grid, closing });
+        }
+    }
+
+    /// The price the standing book was last printed at, if it ever was.
+    #[inline]
+    fn book_price(&self) -> Option<Price> {
+        self.deferred_book
             .map(|book| book.price)
-            .or_else(|| self.tape.book().map(|(price, _)| price));
+            .or_else(|| self.tape.book().map(|(price, _)| price))
+    }
+
+    /// The last print a bar puts up after `previous`, and whether it is
+    /// the close; `None` when the bar never leaves `previous`.
+    ///
+    /// Whatever it prints, a bar leaves the price at its close.
+    #[inline]
+    fn last_print(previous: Option<Price>, bar: &OhlcvBar) -> Option<(Price, bool)> {
         let mut here = previous.unwrap_or(bar.open);
         let mut last = None;
         if previous.is_none() || here != bar.open {
@@ -469,9 +532,69 @@ impl OrderEngine {
         if bar.close != here {
             last = Some((bar.close, true));
         }
-        if let Some((price, closing)) = last {
+        last
+    }
+
+    /// [`Self::advance_idle_bar`] over bars `start..end` in turn, `bar_at`
+    /// giving each.
+    ///
+    /// An idle bar leaves the book it alone prints -- its last print, or
+    /// its close where it carries no finite share -- and the previous
+    /// bar's book only when it never leaves the price that book stands at.
+    /// Each bar after the first starts from the close of the one before,
+    /// where every bar leaves the price, so the book a run of bars leaves
+    /// is read off its newest bars instead of stepping them all.
+    pub(crate) fn advance_idle_bars(
+        &mut self,
+        bar_at: impl Fn(usize) -> OhlcvBar,
+        volume: &[f64],
+        index: Option<&BarIndex>,
+        start: usize,
+        end: usize,
+        fill_model: &FillModel,
+    ) {
+        let ledger = &self.orders;
+        self.working.retain(|&id| !ledger[id as usize].status.is_terminal());
+        debug_assert!(self.working.is_empty(), "an idle step with an order working");
+        if start >= end {
+            return;
+        }
+        if fill_model.bar_liquidity == BarLiquidity::Unlimited {
+            self.deferred_book = None;
+            self.tape.set_book(Some((bar_at(end - 1).close, f64::INFINITY)));
+            return;
+        }
+        self.sync_size_grid(fill_model);
+        let (liquidity, grid) = (fill_model.bar_liquidity, self.size_grid);
+        // The newest bar with no finite share: walking back, the run ends
+        // there if no newer bar prints, and otherwise it is the bar before
+        // the printing one that printed the tape last.
+        let unbounded = match index {
+            Some(index) => {
+                index.last_without_finite_share(liquidity.finite_share(grid), start, end)
+            }
+            None => {
+                liquidity.last_without_finite_share(&volume[start..end], grid).map(|at| start + at)
+            }
+        };
+        for idx in (start..end).rev() {
+            let bar = bar_at(idx);
+            if unbounded == Some(idx) {
+                self.deferred_book = None;
+                self.tape.set_book(Some((bar.close, f64::INFINITY)));
+                return;
+            }
+            let previous =
+                if idx == start { self.book_price() } else { Some(bar_at(idx - 1).close) };
+            let Some((price, closing)) = Self::last_print(previous, &bar) else { continue };
+            // A bar before it with no finite share printed the tape, which
+            // the deferred book leaves standing.
+            if let Some(unbounded) = unbounded {
+                self.tape.set_book(Some((bar_at(unbounded).close, f64::INFINITY)));
+            }
             self.deferred_book =
                 Some(DeferredBook { price, volume: bar.volume, liquidity, grid, closing });
+            return;
         }
     }
 
@@ -524,23 +647,12 @@ impl OrderEngine {
             MatchMode::Bar => StepKind::Bar,
             MatchMode::Trade => StepKind::Print,
         };
-        if self.working.is_empty() && fill_model.bar_liquidity == BarLiquidity::Unlimited {
-            self.deferred_book = None;
-            self.tape.set_book(Some((bar.close, f64::INFINITY)));
-            return Vec::new();
-        }
-
-        // `FillModel::size_quantum` remains public, so tolerate a caller
-        // changing it between steps while keeping its expensive decimal
-        // scale cached for the normal immutable-instrument case.
-        if self.size_grid.lot().to_bits() != fill_model.size_quantum.to_bits() {
-            self.size_grid = LotGrid::new(fill_model.size_quantum);
-        }
-        let size_grid = self.size_grid;
         if self.working.is_empty() {
-            self.advance_without_orders(bar, fill_model.bar_liquidity, size_grid, step_kind);
+            self.advance_idle_book(bar, fill_model, step_kind);
             return Vec::new();
         }
+        self.sync_size_grid(fill_model);
+        let size_grid = self.size_grid;
         self.materialize_book();
         // The book as it stood before this step, for an order that reached
         // the venue ahead of the bar it was submitted on.

@@ -115,6 +115,66 @@ impl InstantCurve {
         self.open = Some(self.open.map_or(timestamp, |open| open.max(timestamp)));
     }
 
+    /// The instant still settling, if any.
+    #[inline]
+    pub(crate) fn open_instant(&self) -> Option<i64> {
+        self.open
+    }
+
+    /// Whether the series are stored.
+    #[inline]
+    pub(crate) fn records(&self) -> bool {
+        self.record
+    }
+
+    /// [`Self::close`] each of the instants `timestamps[first..last]` at
+    /// `equity(idx)`, as the bar after each arrives, and leave
+    /// `timestamps[last]` open.
+    ///
+    /// For a curve that does not record, standing open at
+    /// `timestamps[first]`, over rising timestamps. Of a day's samples the
+    /// daily marks keep only the last, so only the samples either side of
+    /// each day boundary are taken.
+    pub(crate) fn close_run(
+        &mut self,
+        timestamps: &[i64],
+        first: usize,
+        last: usize,
+        equity: impl Fn(usize) -> f64,
+    ) {
+        debug_assert!(!self.record && self.open == Some(timestamps[first]) && first < last);
+        if let Some(daily) = &mut self.daily {
+            let mut idx = first;
+            // Where the day being walked began, and how many bars the one
+            // before it held: evenly spaced bars put the next day's first bar
+            // that far on, so each day of a long run is found a probe or two
+            // from there rather than by a search across the rest of the run.
+            let (mut day_start, mut span) = (first, 0);
+            while idx < last {
+                let until = daily.same_day_until();
+                // Most runs end inside the day they started, which their
+                // newest bar settles without a search.
+                let next = if timestamps[last - 1] < until {
+                    last
+                } else {
+                    first_at_or_after(timestamps, idx, last, day_start + span, until)
+                };
+                if next > idx {
+                    daily.observe(timestamps[next - 1], equity(next - 1));
+                }
+                if next == last {
+                    break;
+                }
+                daily.observe(timestamps[next], equity(next));
+                span = next - day_start;
+                day_start = next;
+                idx = next + 1;
+            }
+        }
+        self.last = Some(equity(last - 1));
+        self.open = Some(timestamps[last]);
+    }
+
     /// Whether any priced event has been applied yet.
     #[inline]
     pub(crate) fn has_started(&self) -> bool {
@@ -167,9 +227,82 @@ impl InstantCurve {
     }
 }
 
+/// The first of `timestamps[lo..hi]` at or after `until`, `hi` when none is:
+/// `lo + timestamps[lo..hi].partition_point(|&ts| ts < until)` over rising
+/// timestamps, searched outward from `guess` -- galloping away from it until
+/// the answer is bracketed, then bisecting the bracket. A guess a few bars
+/// off costs a few probes near it; any guess gives the same answer.
+fn first_at_or_after(timestamps: &[i64], lo: usize, hi: usize, guess: usize, until: i64) -> usize {
+    let guess = guess.clamp(lo, hi);
+    // The answer lies in `from..=to`.
+    let (mut from, mut to) = (lo, hi);
+    if guess < hi && timestamps[guess] < until {
+        from = guess + 1;
+        let mut step = 1;
+        while guess + step < hi {
+            let probe = guess + step;
+            if timestamps[probe] >= until {
+                to = probe;
+                break;
+            }
+            from = probe + 1;
+            step *= 2;
+        }
+    } else {
+        to = guess;
+        let mut step = 1;
+        while step <= guess - lo {
+            let probe = guess - step;
+            if timestamps[probe] < until {
+                from = probe + 1;
+                break;
+            }
+            to = probe;
+            step *= 2;
+        }
+    }
+    from + timestamps[from..to].partition_point(|&ts| ts < until)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_guided_search_finds_what_bisection_finds() {
+        // A small xorshift: rising timestamps with repeats and gaps, every
+        // bound and every guess, against the plain bisection.
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..80 {
+            let len = (next() % 24) as usize;
+            let mut timestamps = Vec::with_capacity(len);
+            let mut ts = (next() % 7) as i64 - 3;
+            for _ in 0..len {
+                ts += [0, 1, 1, 2, 5, 60][(next() % 6) as usize];
+                timestamps.push(ts);
+            }
+            for lo in 0..=len {
+                for hi in lo..=len {
+                    for until in [i64::MIN, -5, 0, 3, 7, 20, 60, 200, i64::MAX] {
+                        let want = lo + timestamps[lo..hi].partition_point(|&t| t < until);
+                        for guess in 0..=len + 2 {
+                            assert_eq!(
+                                first_at_or_after(&timestamps, lo, hi, guess, until),
+                                want,
+                                "{timestamps:?} lo {lo} hi {hi} guess {guess} until {until}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     /// Drive `curve` the way both drivers do for one priced event.
     fn priced(curve: &mut InstantCurve, timestamp: i64, equity_before: f64) {
