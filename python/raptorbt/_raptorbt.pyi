@@ -923,6 +923,20 @@ def bars_from_ticks(
     brick_size: float = ...,
 ) -> _BarArrays: ...
 
+class BarStore:
+    """Bar arrays as one native series, shared by every session over them."""
+
+    def __init__(
+        self,
+        timestamps: _I64,
+        open: _F64,
+        high: _F64,
+        low: _F64,
+        close: _F64,
+        volume: _F64,
+    ) -> None: ...
+    def __len__(self) -> int: ...
+
 class PortfolioSession:
     def __init__(
         self,
@@ -948,6 +962,7 @@ class PortfolioSession:
         close: _F64,
         volume: _F64,
     ) -> None: ...
+    def set_bar_store(self, instrument: int, store: BarStore) -> None: ...
     def set_ticks(
         self,
         instrument: int,

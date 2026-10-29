@@ -1017,6 +1017,14 @@ impl EngineKernel {
         self.ledger.unrealized_total(close)
     }
 
+    /// Whether `maintenance_requirement` can ever be positive: a margin
+    /// account with a maintenance rate above zero, or sold options its spec
+    /// margins. An unfunded margin venue -- infinite leverage, nothing locked
+    /// -- has neither.
+    pub fn can_require_maintenance(&self) -> bool {
+        self.maint_rate().is_some_and(|rate| rate > 0.0) || self.short_option_margin_modelled()
+    }
+
     /// Maintenance margin required by this kernel's open positions; 0.0 in
     /// cash mode or when flat.
     ///

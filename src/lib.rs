@@ -77,6 +77,7 @@ fn _raptorbt(py: Python<'_>, m: &PyModule) -> PyResult<()> {
     // Register the per-bar strategy session (class-based strategy contract)
     m.add_class::<python::strategy_bindings::PyKernelSession>()?;
     m.add_class::<python::session_bindings::PyPortfolioSession>()?;
+    m.add_class::<python::session_bindings::PyBarStore>()?;
     m.add_class::<python::strategy_bindings::PyEngineEvent>()?;
     m.add_class::<python::strategy_bindings::PyPositionSnapshot>()?;
     m.add_class::<python::rule_session::PyCrossoverRuleSession>()?;

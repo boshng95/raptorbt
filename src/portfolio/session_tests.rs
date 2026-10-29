@@ -1436,3 +1436,104 @@ fn a_book_open_at_the_end_closes_the_curve_at_its_mark() {
     assert_eq!(outcome.result.equity_curve.last(), Some(&marked));
     assert_eq!(outcome.result.metrics.end_value, marked);
 }
+
+/// Two names that trade in and out on a fixed pattern, on *mode*'s account
+/// and *config*, with the bars handed over by *attach*.
+fn traded_session(
+    config: BacktestConfig,
+    mode: AccountMode,
+    mut attach: impl FnMut(&mut EventSession, usize, Vec<KernelBar>),
+) -> EventSession {
+    let mut session = EventSession::with_account(config, mode);
+    let a = session.add_instrument("AAA".into(), Direction::Long, None, None, PositionPolicy::Net);
+    let b = session.add_instrument("BBB".into(), Direction::Long, None, None, PositionPolicy::Net);
+    let closes = [100.0, 104.0, 97.0, 91.0, 99.0, 108.0, 102.0, 95.0, 101.0, 110.0];
+    attach(&mut session, a, bars(0, &closes));
+    attach(&mut session, b, bars(5, &closes.map(|c| c / 2.0)));
+    session.seal();
+    session
+}
+
+/// Every engine event and the outcome of stepping *session* to its end, ten
+/// units bought ahead of every fourth event and sold ahead of the third after.
+fn trade_out(mut session: EventSession) -> (Vec<String>, String) {
+    use crate::execution::orders::{OrderKind, OrderSide, QtySpec, TimeInForce};
+
+    let mut events = Vec::new();
+    let mut step = 0;
+    while let Some(entry) = session.current() {
+        let side = match step % 4 {
+            0 => Some(OrderSide::Buy),
+            2 => Some(OrderSide::Sell),
+            _ => None,
+        };
+        if let Some(side) = side {
+            session.kernel_mut(entry.instrument).submit_order(
+                side,
+                QtySpec::Units(10.0),
+                OrderKind::Market,
+                TimeInForce::Gtc,
+                entry.local_idx,
+                entry.timestamp(),
+                format!("O-{step}"),
+                None,
+                None,
+            );
+        }
+        events.extend(
+            session.apply_current(StepInput::default()).iter().map(|event| format!("{event:?}")),
+        );
+        step += 1;
+    }
+    let outcome = session.finish();
+    assert!(!outcome.result.trades.is_empty(), "the pattern never closed a trade");
+    (events, format!("{outcome:?}"))
+}
+
+#[test]
+fn an_unwatched_event_steps_as_a_watched_one() {
+    // Nothing reads the equity an event leaves without a drawdown limit or a
+    // maintenance rate, so the session skips valuing it; a limit too wide to
+    // trip makes the session value it, and nothing else may change.
+    let fees = BacktestConfig { fees: 0.001, ..BacktestConfig::default() };
+    let watched = BacktestConfig { max_drawdown_pct: Some(1e9), ..fees.clone() };
+    let attach = |session: &mut EventSession, i: usize, bars: Vec<KernelBar>| {
+        session.set_bars(i, bars);
+    };
+    for mode in [AccountMode::Cash, AccountMode::Margin { leverage: f64::INFINITY }] {
+        let skipped = traded_session(fees.clone(), mode, attach);
+        let valued = traded_session(watched.clone(), mode, attach);
+        assert!(!skipped.watches_event_equity(), "{mode:?}");
+        assert!(valued.watches_event_equity(), "{mode:?}");
+        let (skipped_events, skipped_outcome) = trade_out(skipped);
+        let (valued_events, valued_outcome) = trade_out(valued);
+        assert_eq!(skipped_events, valued_events, "{mode:?}");
+        assert_eq!(skipped_outcome, valued_outcome, "{mode:?}");
+    }
+    // A maintenance rate is read after every event, limit or none.
+    let levered = traded_session(fees, AccountMode::Margin { leverage: 2.0 }, attach);
+    assert!(levered.watches_event_equity());
+}
+
+#[test]
+fn shared_bars_run_as_owned_bars() {
+    let config = BacktestConfig { fees: 0.001, ..BacktestConfig::default() };
+    let owned = traded_session(config.clone(), AccountMode::Cash, |session, i, bars| {
+        session.set_bars(i, bars);
+    });
+    let expected = trade_out(owned);
+
+    // One copy of each series, read by every session handed it.
+    let mut stores = Vec::new();
+    for run in 0..2 {
+        let session = traded_session(config.clone(), AccountMode::Cash, |session, i, bars| {
+            if run == 0 {
+                stores.push(Arc::new(bars));
+            }
+            session.set_shared_bars(i, Arc::clone(&stores[i]));
+        });
+        assert_eq!(trade_out(session), expected, "run {run}");
+        assert!(stores.iter().all(|store| Arc::strong_count(store) == 1), "run {run}");
+        assert!(stores.iter().all(|store| store.len() == 10), "run {run}");
+    }
+}

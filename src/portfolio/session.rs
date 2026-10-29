@@ -27,6 +27,7 @@
 //! `EqualWeight` budget has no counterpart here yet.
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 
 use crate::accounts::{AccountMode, SharedAccount};
 use crate::core::types::OhlcvBar;
@@ -140,7 +141,8 @@ pub struct EventSession {
     config: BacktestConfig,
     kernels: Vec<EngineKernel>,
     symbols: Vec<String>,
-    bars: Vec<Vec<KernelBar>>,
+    /// Shared, so a series several sessions run over is held once.
+    bars: Vec<Arc<Vec<KernelBar>>>,
     ticks: Vec<Option<TickData>>,
     /// Depth snapshots, referenced by slot from the schedule.
     depth: Vec<DepthTick>,
@@ -239,7 +241,7 @@ impl EventSession {
         kernel.set_cash(0.0);
         self.kernels.push(kernel);
         self.symbols.push(symbol);
-        self.bars.push(Vec::new());
+        self.bars.push(Arc::default());
         self.ticks.push(None);
         self.depth_input.push(Vec::new());
         self.local_idx_next.push(0);
@@ -251,6 +253,15 @@ impl EventSession {
 
     /// Attach an instrument's bar series (ascending timestamps).
     pub fn set_bars(&mut self, instrument: usize, bars: Vec<KernelBar>) {
+        self.bars[instrument] = Arc::new(bars);
+    }
+
+    /// Attach a bar series other sessions may share (ascending timestamps).
+    ///
+    /// The schedule only ever reads a series, so every run of a sweep over
+    /// one can read the same copy instead of each building its own -- which
+    /// on a minute book is hundreds of megabytes, freshly faulted in.
+    pub fn set_shared_bars(&mut self, instrument: usize, bars: Arc<Vec<KernelBar>>) {
         self.bars[instrument] = bars;
     }
 
@@ -292,17 +303,20 @@ impl EventSession {
             next_stream += 1;
             let bars = std::mem::take(bars);
             self.local_idx_next[i] += bars.len();
-            let events = bars.into_iter().map(move |b| MarketEvent {
-                instrument: i as u32,
-                stream,
-                payload: EventPayload::Bar(OhlcvBar {
-                    timestamp: b.timestamp,
-                    open: b.open,
-                    high: b.high,
-                    low: b.low,
-                    close: b.close,
-                    volume: b.volume,
-                }),
+            let events = (0..bars.len()).map(move |j| {
+                let b = bars[j];
+                MarketEvent {
+                    instrument: i as u32,
+                    stream,
+                    payload: EventPayload::Bar(OhlcvBar {
+                        timestamp: b.timestamp,
+                        open: b.open,
+                        high: b.high,
+                        low: b.low,
+                        close: b.close,
+                        volume: b.volume,
+                    }),
+                }
             });
             feed.add_iter(events);
         }
@@ -750,6 +764,10 @@ impl EventSession {
             return events;
         }
         self.curve.open_at(entry.timestamp());
+        if !self.watches_event_equity() {
+            self.advance();
+            return events;
+        }
 
         // Risk reads the book after every event, not once per instant: a
         // margin call or a drawdown halt must take effect before the next
@@ -818,6 +836,20 @@ impl EventSession {
 
         self.advance();
         events
+    }
+
+    /// Whether anything reads the equity an event leaves.
+    ///
+    /// Two controls do, after every event: the drawdown kill-switch, and a
+    /// margin account's maintenance check. Without either the read is dead --
+    /// the high-water mark exists only to feed the kill-switch, and a
+    /// requirement that cannot be positive never calls -- yet it values every
+    /// book on every event, which on a wide universe costs more than the step
+    /// itself. The curve's own sample is taken when an instant closes.
+    fn watches_event_equity(&self) -> bool {
+        self.config.max_drawdown_pct.is_some()
+            || (matches!(self.account.mode(), AccountMode::Margin { .. })
+                && self.kernels.iter().any(|k| k.can_require_maintenance()))
     }
 
     /// Apply quiet schedule entries strictly before `ts_ns`.

@@ -1,5 +1,7 @@
 //! Python bindings for the multi-instrument event session.
 
+use std::sync::Arc;
+
 use numpy::{PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -26,6 +28,69 @@ fn book_levels(book: &DepthTick, side: BookSide) -> &[BookLevel] {
         BookSide::Bid => &book.bids[..book.bid_len as usize],
         BookSide::Ask => &book.asks[..book.ask_len as usize],
     }
+}
+
+/// Bar arrays as one native series, built once for every session over them.
+///
+/// `PortfolioSession.set_bars` builds the native series anew for each
+/// session. A sweep runs thousands over the same bars, so it builds this
+/// once and hands each session the same series with `set_bar_store`.
+#[pyclass(name = "BarStore", frozen)]
+pub struct PyBarStore {
+    bars: Arc<Vec<KernelBar>>,
+}
+
+#[pymethods]
+impl PyBarStore {
+    #[new]
+    fn new(
+        timestamps: PyReadonlyArray1<i64>,
+        open: PyReadonlyArray1<f64>,
+        high: PyReadonlyArray1<f64>,
+        low: PyReadonlyArray1<f64>,
+        close: PyReadonlyArray1<f64>,
+        volume: PyReadonlyArray1<f64>,
+    ) -> PyResult<Self> {
+        Ok(Self { bars: Arc::new(kernel_bars(timestamps, open, high, low, close, volume)?) })
+    }
+
+    fn __len__(&self) -> usize {
+        self.bars.len()
+    }
+}
+
+/// The native series of one instrument's bar arrays.
+fn kernel_bars(
+    timestamps: PyReadonlyArray1<i64>,
+    open: PyReadonlyArray1<f64>,
+    high: PyReadonlyArray1<f64>,
+    low: PyReadonlyArray1<f64>,
+    close: PyReadonlyArray1<f64>,
+    volume: PyReadonlyArray1<f64>,
+) -> PyResult<Vec<KernelBar>> {
+    // Borrow NumPy while building the one owned native representation.
+    let ts = timestamps
+        .as_slice()
+        .map_err(|_| PyValueError::new_err("timestamps must be contiguous"))?;
+    let o = open.as_slice().map_err(|_| PyValueError::new_err("open must be contiguous"))?;
+    let h = high.as_slice().map_err(|_| PyValueError::new_err("high must be contiguous"))?;
+    let l = low.as_slice().map_err(|_| PyValueError::new_err("low must be contiguous"))?;
+    let c = close.as_slice().map_err(|_| PyValueError::new_err("close must be contiguous"))?;
+    let v = volume.as_slice().map_err(|_| PyValueError::new_err("volume must be contiguous"))?;
+    let n = ts.len();
+    if [o.len(), h.len(), l.len(), c.len(), v.len()].iter().any(|&len| len != n) {
+        return Err(PyValueError::new_err("all bar arrays must share one length"));
+    }
+    Ok((0..n)
+        .map(|i| KernelBar {
+            timestamp: ts[i],
+            open: o[i],
+            high: h[i],
+            low: l[i],
+            close: c[i],
+            volume: v[i],
+        })
+        .collect())
 }
 
 /// Multi-instrument session over deterministically merged bar streams.
@@ -122,31 +187,14 @@ impl PyPortfolioSession {
         close: PyReadonlyArray1<f64>,
         volume: PyReadonlyArray1<f64>,
     ) -> PyResult<()> {
-        // Borrow NumPy while building the one owned native representation.
-        let ts = timestamps
-            .as_slice()
-            .map_err(|_| PyValueError::new_err("timestamps must be contiguous"))?;
-        let o = open.as_slice().map_err(|_| PyValueError::new_err("open must be contiguous"))?;
-        let h = high.as_slice().map_err(|_| PyValueError::new_err("high must be contiguous"))?;
-        let l = low.as_slice().map_err(|_| PyValueError::new_err("low must be contiguous"))?;
-        let c = close.as_slice().map_err(|_| PyValueError::new_err("close must be contiguous"))?;
-        let v =
-            volume.as_slice().map_err(|_| PyValueError::new_err("volume must be contiguous"))?;
-        let n = ts.len();
-        if [o.len(), h.len(), l.len(), c.len(), v.len()].iter().any(|&len| len != n) {
-            return Err(PyValueError::new_err("all bar arrays must share one length"));
-        }
-        let bars: Vec<KernelBar> = (0..n)
-            .map(|i| KernelBar {
-                timestamp: ts[i],
-                open: o[i],
-                high: h[i],
-                low: l[i],
-                close: c[i],
-                volume: v[i],
-            })
-            .collect();
+        let bars = kernel_bars(timestamps, open, high, low, close, volume)?;
         self.session_mut()?.set_bars(instrument, bars);
+        Ok(())
+    }
+
+    /// Attach an instrument's bars from a `BarStore`, without copying them.
+    fn set_bar_store(&mut self, instrument: usize, store: &PyBarStore) -> PyResult<()> {
+        self.session_mut()?.set_shared_bars(instrument, Arc::clone(&store.bars));
         Ok(())
     }
 
