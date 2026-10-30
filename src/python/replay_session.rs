@@ -25,8 +25,6 @@
 //! replay stops with [`ReplayDeclined`] and returns nothing; the caller then
 //! runs the strategy in Python from the start.
 
-use std::collections::HashMap;
-
 use crate::portfolio::kernel::EngineEvent;
 use crate::portfolio::runner::SingleRunner;
 use pyo3::create_exception;
@@ -47,7 +45,12 @@ create_exception!(
     "The replay reached a branch it does not transcribe; run the strategy in Python."
 );
 
-fn declined(why: &str) -> PyErr {
+/// The bars [`Replay::reads_held_from`] first looks over for a dust close,
+/// and the run it narrows one down to before reading each close.
+const DUST_SPAN: usize = 4096;
+const DUST_SPAN_LAST: usize = 64;
+
+pub(crate) fn declined(why: &str) -> PyErr {
     ReplayDeclined::new_err(why.to_string())
 }
 
@@ -104,6 +107,8 @@ pub(crate) struct Money<'a> {
 /// One order `SignalReplay` queued, as `apply_commands` sends it.
 struct Submit {
     client_id: String,
+    /// Where the ledger keeps the order's terms.
+    ledger_index: u32,
     buy: bool,
     market: bool,
     units: f64,
@@ -125,8 +130,9 @@ struct Replay<'a> {
 
     // `SignalReplay`'s own state, under its own names.
     working_entry: bool,
-    /// The client ids of `_orders`, by where the ledger keeps their terms.
-    orders: HashMap<String, u32>,
+    /// `_orders`: the kernel ids of the orders sent, rising, each with where
+    /// the ledger keeps its terms.
+    orders: Vec<(u64, u32)>,
     pending_target: Option<f64>,
     target_bars: i64,
     target_bar_ts: i64,
@@ -138,6 +144,8 @@ struct Replay<'a> {
     /// `runtime.account.position_quantity`: the position as the runtime's
     /// last refresh read it, which only a processed callback and a fill do.
     account_quantity: f64,
+    /// The last [`Self::reads_held_from`] asked: `(held, from, until)`.
+    held_reads: (f64, usize, usize),
 
     // The driver's: `Strategy._order_seq`, the queued commands and the
     // per-timestamp action budget.
@@ -184,7 +192,7 @@ pub(crate) fn replay<'a>(
         venue,
         money,
         working_entry: false,
-        orders: HashMap::new(),
+        orders: Vec::new(),
         pending_target: None,
         target_bars: 0,
         target_bar_ts: -1,
@@ -196,6 +204,7 @@ pub(crate) fn replay<'a>(
         // can be deferred.
         bar_callback_required: true,
         account_quantity: 0.0,
+        held_reads: (0.0, 0, 0),
         order_seq,
         commands: Vec::new(),
         budget_ts: None,
@@ -226,7 +235,7 @@ impl Replay<'_> {
             }
             next = i + 1;
             if python_bar != Some(i) && !self.bar_callback_required {
-                if let Some((halted, pending)) = self.fast_forward_rules() {
+                if let Some((halted, pending, until)) = self.fast_forward_rules(i) {
                     let (kind, last, events) = step_rules_until(
                         self.runner,
                         &self.bars,
@@ -236,7 +245,7 @@ impl Replay<'_> {
                         pending,
                         &self.quiet,
                         i,
-                        n,
+                        until,
                     );
                     if kind == 2 {
                         python_bar = Some(last);
@@ -269,6 +278,7 @@ impl Replay<'_> {
             self.dispatch(i, events)?;
             self.settle(i)?;
         }
+        debug_assert!(!self.rules.holds_taken(), "a callback bar handed back was never taken");
         Ok(())
     }
 
@@ -286,7 +296,7 @@ impl Replay<'_> {
             return Err(declined("execution did not quiesce within its action budget"));
         }
         for command in &commands {
-            submit_order_on(
+            let order_id = submit_order_on(
                 self.runner.kernel_mut(),
                 if command.buy { "buy" } else { "sell" },
                 if command.market { "market" } else { "limit" },
@@ -309,6 +319,13 @@ impl Replay<'_> {
                 false,
                 None,
             )?;
+            let at = match self.orders.last() {
+                Some(&(last, _)) if last >= order_id => {
+                    self.orders.partition_point(|&(id, _)| id < order_id)
+                }
+                _ => self.orders.len(),
+            };
+            self.orders.insert(at, (order_id, command.ledger_index));
         }
         Ok(!commands.is_empty())
     }
@@ -344,7 +361,6 @@ impl Replay<'_> {
                 }
                 EngineEvent::OrderFilled {
                     order_id,
-                    client_id,
                     price,
                     size,
                     commission,
@@ -355,7 +371,6 @@ impl Replay<'_> {
                     self.on_order_filled(
                         at,
                         order_id,
-                        client_id,
                         price,
                         size,
                         commission,
@@ -364,12 +379,12 @@ impl Replay<'_> {
                     )?;
                     order_fill_preceded = true;
                 }
-                EngineEvent::OrderCanceled { client_id, .. } => {
-                    self.end_order(at, client_id, EndStatus::Canceled);
+                EngineEvent::OrderCanceled { order_id, .. } => {
+                    self.end_order(at, order_id, EndStatus::Canceled);
                     order_fill_preceded = false;
                 }
-                EngineEvent::OrderExpired { client_id, .. } => {
-                    self.end_order(at, client_id, EndStatus::Expired);
+                EngineEvent::OrderExpired { order_id, .. } => {
+                    self.end_order(at, order_id, EndStatus::Expired);
                     order_fill_preceded = false;
                 }
                 EngineEvent::OrderRejected { .. } => {
@@ -383,20 +398,86 @@ impl Replay<'_> {
 
     // -- the strategy: `SignalReplay` ---------------------------------------
 
-    /// `fast_forward_rules`: whether the kernel may take quiet callbacks,
-    /// as `(halted, pending_target)`.
-    fn fast_forward_rules(&self) -> Option<(bool, Option<f64>)> {
+    /// `fast_forward_rules`: whether the kernel may take quiet callbacks
+    /// from bar `from`, as `(halted, pending_target, until)`: it takes those
+    /// before `until`.
+    ///
+    /// A quiet callback is asked with the book as it stands, where a callback
+    /// the strategy takes reads a held lot too small to trade as flat
+    /// (`reads_dust_as_flat`). `SignalReplay` declines the whole run once the
+    /// lot is dust at the run's lowest close; here the callbacks are taken
+    /// up to the first bar whose close makes it dust, where the strategy
+    /// takes them again.
+    fn fast_forward_rules(&mut self, from: usize) -> Option<(bool, Option<f64>, usize)> {
+        let n = self.bars.len();
         if self.cash_halted {
-            return Some((true, self.pending_target));
+            return Some((true, self.pending_target, n));
         }
         if self.pending_target.is_some() || self.working_orders != 0 {
             return None;
         }
         let held = self.account_quantity;
-        if held != 0.0 && self.is_dust(held, self.venue.lowest_close) {
-            return None;
+        let until = if held != 0.0 { self.reads_held_from(held, from) } else { n };
+        (until > from).then_some((false, None, until))
+    }
+
+    /// The first bar from `from` on whose close the lot `held` is dust, or
+    /// the bar count where there is none.
+    ///
+    /// `is_dust` is monotone in the price, so a lot that is not dust at the
+    /// lowest close of a run of bars is dust at none of them. The run's own
+    /// lowest close settles most lots; for the rest, the stream's summaries
+    /// (`BarIndex`) find the bar in time logarithmic in how far off it is.
+    /// They summarize the kernel's closes, which are the ones the strategy
+    /// reads dust at only when they are the same array; otherwise every bar
+    /// is taken as one that may read dust.
+    fn reads_held_from(&mut self, held: f64, from: usize) -> usize {
+        let n = self.bars.len();
+        if !self.is_dust(held, self.venue.lowest_close) {
+            return n;
         }
-        Some((false, None))
+        // No bar of `from..until` reads `held` as dust, and `until` does (or
+        // ends the run), so the same holds from any bar before `until`.
+        let (asked, start, until) = self.held_reads;
+        if asked.to_bits() == held.to_bits() && start <= from && from < until {
+            return until;
+        }
+        let closes = self.rules.primary_closes();
+        if self.is_dust(held, closes[from]) {
+            return from;
+        }
+        let index = match self.bars.index.as_deref() {
+            Some(index) if std::ptr::eq(closes, self.bars.close) => index,
+            _ => return from,
+        };
+        let dust_in = |start: usize, end: usize| {
+            let lowest = index.extremes(self.bars.close, self.bars.high, self.bars.low, start, end);
+            self.is_dust(held, lowest.lowest_close)
+        };
+        // Runs of doubling length from `from`, up to the first that holds a
+        // dust bar, which halving then narrows to.
+        let mut found = n;
+        let (mut start, mut span) = (from, DUST_SPAN);
+        while start < n {
+            let end = n.min(start.saturating_add(span));
+            if !dust_in(start, end) {
+                (start, span) = (end, span.saturating_mul(2));
+                continue;
+            }
+            let (mut low, mut high) = (start, end);
+            while high - low > DUST_SPAN_LAST {
+                let middle = low + (high - low) / 2;
+                if dust_in(low, middle) {
+                    high = middle;
+                } else {
+                    low = middle;
+                }
+            }
+            found = (low..high).find(|&idx| self.is_dust(held, closes[idx])).unwrap_or(low);
+            break;
+        }
+        self.held_reads = (held, from, found);
+        found
     }
 
     fn on_bar(&mut self, i: usize) -> PyResult<()> {
@@ -540,6 +621,7 @@ impl Replay<'_> {
         self.submit(
             Submit {
                 client_id: String::new(),
+                ledger_index: 0,
                 buy,
                 market,
                 units,
@@ -585,6 +667,7 @@ impl Replay<'_> {
         self.submit(
             Submit {
                 client_id: String::new(),
+                ledger_index: 0,
                 buy: true,
                 market,
                 units,
@@ -638,7 +721,7 @@ impl Replay<'_> {
             arrived_on_ns,
             policies_after_fill,
         });
-        self.orders.insert(order.client_id.clone(), index);
+        order.ledger_index = index;
         self.commands.push(order);
         Ok(())
     }
@@ -702,7 +785,6 @@ impl Replay<'_> {
         &mut self,
         at: usize,
         order_id: u64,
-        client_id: String,
         price: f64,
         size: f64,
         commission: f64,
@@ -710,7 +792,7 @@ impl Replay<'_> {
         gross_realized: f64,
     ) -> PyResult<()> {
         self.working_entry = false;
-        let Some(&order) = self.orders.get(&client_id) else {
+        let Some(order) = self.ledger_index(order_id) else {
             return Err(declined("a fill of an order this replay did not send"));
         };
         let now = self.bars.ts[at];
@@ -729,13 +811,20 @@ impl Replay<'_> {
     }
 
     /// `on_order_canceled` / `on_order_expired`.
-    fn end_order(&mut self, at: usize, client_id: String, status: EndStatus) {
-        if let Some(&order) = self.orders.get(&client_id) {
+    fn end_order(&mut self, at: usize, order_id: u64, status: EndStatus) {
+        if let Some(order) = self.ledger_index(order_id) {
             self.ledger.end(order, status, self.bars.ts[at]);
         }
         self.working_entry = false;
         self.working_orders = (self.working_orders - 1).max(0);
         self.bar_callback_required = true;
+    }
+
+    /// Where the ledger keeps the terms of the order the kernel calls
+    /// `order_id`, if this replay sent it.
+    fn ledger_index(&self, order_id: u64) -> Option<u32> {
+        let at = self.orders.partition_point(|&(id, _)| id < order_id);
+        self.orders.get(at).filter(|&&(id, _)| id == order_id).map(|&(_, index)| index)
     }
 
     fn on_order_rejected(&mut self) {

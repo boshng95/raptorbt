@@ -149,6 +149,8 @@ impl InstantCurve {
             // before it held: evenly spaced bars put the next day's first bar
             // that far on, so each day of a long run is found a probe or two
             // from there rather than by a search across the rest of the run.
+            // The day the run starts in has no length to go by; its bars are
+            // taken to keep the spacing of the first two.
             let (mut day_start, mut span) = (first, 0);
             while idx < last {
                 let until = daily.same_day_until();
@@ -157,7 +159,12 @@ impl InstantCurve {
                 let next = if timestamps[last - 1] < until {
                     last
                 } else {
-                    first_at_or_after(timestamps, idx, last, day_start + span, until)
+                    let guess = if span == 0 {
+                        spaced_guess(timestamps, idx, last, until)
+                    } else {
+                        day_start + span
+                    };
+                    first_at_or_after(timestamps, idx, last, guess, until)
                 };
                 if next > idx {
                     daily.observe(timestamps[next - 1], equity(next - 1));
@@ -264,6 +271,23 @@ fn first_at_or_after(timestamps: &[i64], lo: usize, hi: usize, guess: usize, unt
     from + timestamps[from..to].partition_point(|&ts| ts < until)
 }
 
+/// Where the first of `timestamps[idx..last]` at or after `until` stands if
+/// the bars keep the spacing of `timestamps[idx]` and the bar after it: a
+/// guess for [`first_at_or_after`], exact for evenly spaced bars, and `idx`
+/// itself where there is no spacing to go by.
+fn spaced_guess(timestamps: &[i64], idx: usize, last: usize, until: i64) -> usize {
+    if idx + 1 >= last {
+        return idx;
+    }
+    let step = timestamps[idx + 1].saturating_sub(timestamps[idx]);
+    let ahead = until.saturating_sub(timestamps[idx]);
+    if step <= 0 || ahead <= 0 {
+        return idx;
+    }
+    let bars = usize::try_from((ahead - 1) / step + 1).unwrap_or(usize::MAX);
+    idx.saturating_add(bars).min(last)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -302,6 +326,22 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn evenly_spaced_bars_are_found_where_the_spacing_puts_them() {
+        // Minute bars from 00:07: the next midnight, a stamp between bars,
+        // one at the first bar, one before it, and one past the last.
+        let minute = 60_000_000_000_i64;
+        let timestamps: Vec<i64> = (0..3000).map(|k| (k + 7) * minute).collect();
+        for until in [1440 * minute, 100 * minute + 1, 7 * minute, 0, i64::MIN, i64::MAX] {
+            for idx in [0, 5, 1432] {
+                let want = idx + timestamps[idx..].partition_point(|&t| t < until);
+                assert_eq!(spaced_guess(&timestamps, idx, timestamps.len(), until), want);
+            }
+        }
+        // A single bar has no spacing.
+        assert_eq!(spaced_guess(&timestamps, 4, 5, i64::MAX), 4);
     }
 
     /// Drive `curve` the way both drivers do for one priced event.

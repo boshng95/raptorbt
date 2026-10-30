@@ -443,6 +443,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "num-bigint"
+version = "0.4.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c89e69e7e0f03bea5ef08013795c25018e101932225a656383bd384495ecc367"
+dependencies = [
+ "num-integer",
+ "num-traits",
+]
+
+[[package]]
 name = "num-complex"
 version = "0.4.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -641,6 +651,8 @@ dependencies = [
  "approx",
  "clarabel",
  "criterion",
+ "num-bigint",
+ "num-traits",
  "numpy",
  "pyo3",
  "rayon",

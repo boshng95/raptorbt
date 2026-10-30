@@ -31,13 +31,7 @@ use super::rule_session::{PyCrossoverRuleSession, QuietBar, QuietParams, QuietTu
 /// `ctx.position is not None` and `ctx.net_position`, as the Python context
 /// reads them: a left-to-right sum of signed sizes over the open positions.
 pub(crate) fn held_position(runner: &SingleRunner) -> (bool, f64) {
-    let kernel = runner.kernel();
-    let has_position = kernel.position_snapshot().is_some();
-    let net = kernel
-        .position_snapshots()
-        .into_iter()
-        .fold(0.0, |total, p| total + p.size * f64::from(p.direction as i32));
-    (has_position, net)
+    runner.kernel().net_position()
 }
 
 /// Fold the `units` / `size_frac` kwargs into a quantity spec.
@@ -601,7 +595,7 @@ impl PyKernelSession {
             max_actions_per_timestamp: venue.11,
         };
         let money = Money { units, snap, affordable, exhausted, model: money.as_deref() };
-        let stepper = rules.split(py)?;
+        let stepper = rules.split(py)?.handing_back();
         let booked = book.is_some();
         let ledger = Ledger::new(book.map(
             |(
@@ -1202,6 +1196,7 @@ pub(crate) fn step_rules_until(
                 at = callback + 1;
             }
             let reached = runner.step_idle_run(&columns, from, stop);
+            debug_assert!(!acts || reached == stop, "the bound stepped short of a callback asked");
             if reached < stop {
                 // Every callback asked sits at or before this bar.
                 let (bar, input) = bars.bar(reached);

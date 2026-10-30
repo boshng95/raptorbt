@@ -13,6 +13,10 @@ use crate::execution::fill::FiniteShare;
 /// Units of one level of [`BarIndex::levels`] per unit of the next, and
 /// bars per unit of the finest.
 const FANOUT: usize = 8;
+/// `FANOUT` as a power of two, so that a unit's index and alignment are a
+/// shift and a mask rather than a division per unit folded.
+const FANOUT_BITS: u32 = FANOUT.trailing_zeros();
+const _: () = assert!(FANOUT.is_power_of_two());
 /// Levels of [`BarIndex::levels`]: units of 8, 64, ..., 8^LEVELS bars. A
 /// run of `n` bars folds at most `2 * (FANOUT - 1)` units of each level
 /// below its own scale, so the decision runs of a minute stream resampled
@@ -186,35 +190,38 @@ impl BarIndex {
         let mut acc = Extremes::EMPTY;
         let mut idx = start;
         // The run in aligned units, in order: up the levels while each
-        // unit's boundary lies inside the run, then down them. `size` bars
-        // make a unit of `level - 1`, or a bar when `level` is 0.
-        let take = |acc: &mut Extremes, level: usize, size: usize, idx: usize| match level {
+        // unit's boundary lies inside the run, then down them. `size` bars,
+        // `1 << bits`, make a unit of `level - 1`, or a bar when `level` is 0.
+        let take = |acc: &mut Extremes, level: usize, bits: u32, idx: usize| match level {
             0 => acc.push(close[idx], high[idx], low[idx]),
-            _ => acc.merge(&self.levels[level - 1][idx / size]),
+            _ => acc.merge(&self.levels[level - 1][idx >> bits]),
         };
-        let (mut level, mut size) = (0, 1);
+        let (mut level, mut bits) = (0, 0);
+        let mut size = 1;
         while level < LEVELS {
-            let unit = size * FANOUT;
-            while !idx.is_multiple_of(unit) && idx + size <= end {
-                take(&mut acc, level, size, idx);
+            let within = (size << FANOUT_BITS) - 1;
+            while idx & within != 0 && idx + size <= end {
+                take(&mut acc, level, bits, idx);
                 idx += size;
             }
-            if !idx.is_multiple_of(unit) {
+            if idx & within != 0 {
                 break;
             }
             level += 1;
-            size = unit;
+            bits += FANOUT_BITS;
+            size <<= FANOUT_BITS;
         }
         loop {
             while idx + size <= end {
-                take(&mut acc, level, size, idx);
+                take(&mut acc, level, bits, idx);
                 idx += size;
             }
             if level == 0 {
                 break;
             }
             level -= 1;
-            size /= FANOUT;
+            bits -= FANOUT_BITS;
+            size >>= FANOUT_BITS;
         }
         acc
     }

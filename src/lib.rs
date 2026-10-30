@@ -24,6 +24,7 @@ pub mod python;
 pub mod signals;
 pub mod stops;
 pub mod strategies;
+pub mod twins;
 
 /// Python module entry point
 #[pymodule]
@@ -85,6 +86,18 @@ fn _raptorbt(py: Python<'_>, m: &PyModule) -> PyResult<()> {
     m.add_class::<python::fill_ledger::PyReplayLedger>()?;
     m.add("ReplayDeclined", py.get_type::<python::replay_session::ReplayDeclined>())?;
     m.add_function(wrap_pyfunction!(python::strategy_bindings::resolve_atr_period, m)?)?;
+
+    // Register the canonical report of a replay and its exact-arithmetic probes
+    m.add_function(wrap_pyfunction!(python::report_bindings::canonical_report, m)?)?;
+    m.add_function(wrap_pyfunction!(python::report_bindings::exact_fsum, m)?)?;
+    m.add_function(wrap_pyfunction!(python::report_bindings::exact_sum, m)?)?;
+    m.add_function(wrap_pyfunction!(python::report_bindings::exact_np_sum, m)?)?;
+    m.add_function(wrap_pyfunction!(python::report_bindings::exact_stdev, m)?)?;
+    m.add_function(wrap_pyfunction!(python::report_bindings::exact_median, m)?)?;
+    m.add_function(wrap_pyfunction!(python::report_bindings::exact_pow, m)?)?;
+
+    // Register the exact twins of the engine's indicator walks
+    m.add_function(wrap_pyfunction!(python::twin_bindings::indicator_twin, m)?)?;
 
     // Register batch spread backtest
     m.add_class::<python::bindings::PyBatchSpreadItem>()?;

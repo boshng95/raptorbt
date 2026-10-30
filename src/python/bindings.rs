@@ -1034,12 +1034,14 @@ pub struct PyBacktestResult {
     pub metrics: PyBacktestMetrics,
     equity_curve: Vec<f64>,
     drawdown_curve: Vec<f64>,
-    trades: Vec<PyTrade>,
+    pub(crate) trades: Vec<PyTrade>,
     returns: Vec<f64>,
     timestamps: Vec<i64>,
-    orders: Vec<PyOrder>,
-    daily_performance_timestamps: Vec<i64>,
-    daily_performance_equity: Vec<f64>,
+    /// The engine's records, made `PyOrder`s only when asked for: a sweep's
+    /// summary never reads them.
+    orders: Vec<crate::execution::orders::OrderRecord>,
+    pub(crate) daily_performance_timestamps: Vec<i64>,
+    pub(crate) daily_performance_equity: Vec<f64>,
 }
 
 #[pymethods]
@@ -1084,7 +1086,7 @@ impl PyBacktestResult {
     /// Every order the run placed, in submission order — including the ones
     /// that never filled. Empty for a run that placed no typed orders.
     fn orders(&self) -> Vec<PyOrder> {
-        self.orders.clone()
+        self.orders.iter().cloned().map(convert_order).collect()
     }
 
     fn __repr__(&self) -> String {
@@ -2825,14 +2827,13 @@ pub(crate) fn convert_result(result: crate::core::types::BacktestResult) -> PyBa
     };
 
     let trades: Vec<PyTrade> = result.trades.into_iter().map(convert_trade).collect();
-    let orders: Vec<PyOrder> = result.orders.into_iter().map(convert_order).collect();
 
     PyBacktestResult {
         metrics,
         equity_curve: result.equity_curve,
         drawdown_curve: result.drawdown_curve,
         trades,
-        orders,
+        orders: result.orders,
         returns: result.returns,
         timestamps: result.timestamps,
         daily_performance_timestamps,

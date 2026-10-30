@@ -1,7 +1,9 @@
 //! Performance metrics for RaptorBT.
 
 pub mod annualization;
+pub mod canonical;
 pub mod drawdown;
+pub mod exact;
 pub mod streaming;
 pub mod trade_stats;
 

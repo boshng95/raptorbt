@@ -27,6 +27,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyString};
 
 use super::money::{fixed, round_to};
+use crate::metrics::canonical::FillAmounts;
 
 /// `10**p` for the precisions `_money` is asked for, as exact doubles.
 const POW10: [f64; 23] = [
@@ -54,7 +55,7 @@ fn py_max(a: f64, b: f64) -> f64 {
 
 /// `_money`: scale by the currency's precision, round half away from zero,
 /// scale back. `None` where it raises (`math.floor` of an infinity or NaN).
-fn money(value: f64, precision: u32) -> Option<f64> {
+pub(crate) fn money(value: f64, precision: u32) -> Option<f64> {
     let scale = *POW10.get(precision as usize)?;
     let scaled = value * scale;
     if !scaled.is_finite() {
@@ -70,7 +71,7 @@ fn money(value: f64, precision: u32) -> Option<f64> {
 /// `round(x, precision)` on a float: correctly rounded, ties to even on the
 /// exact binary value, as Rust's fixed formatting spells it. `None` near
 /// the range's end, where Python's may overflow.
-fn py_round(x: f64, precision: u32) -> Option<f64> {
+pub(crate) fn py_round(x: f64, precision: u32) -> Option<f64> {
     if !x.is_finite() {
         return Some(x);
     }
@@ -81,7 +82,7 @@ fn py_round(x: f64, precision: u32) -> Option<f64> {
 }
 
 /// `f"{x:.{precision}f}"`.
-fn spelled(x: f64, precision: usize) -> String {
+pub(crate) fn spelled(x: f64, precision: usize) -> String {
     if x.is_nan() {
         // Python spells a NaN of either sign without one; Rust as `NaN`.
         return "nan".to_string();
@@ -499,6 +500,56 @@ impl PyReplayLedger {
         }
         rows.sort_by_key(|row| self.ledger.orders[row.order as usize].decided_ns);
         rows
+    }
+
+    /// The settlement currency's precision the book was opened on.
+    pub(crate) fn currency_precision(&self) -> Option<u32> {
+        self.ledger.terms.as_ref().map(|terms| terms.currency_precision)
+    }
+
+    /// When each fill that took exposure back landed, in fill order: the
+    /// timestamps of `LedgerBook.reductions`.
+    pub(crate) fn reduction_times(&self) -> Option<Vec<i64>> {
+        let booking = self.ledger.booking.as_ref()?;
+        Some(
+            booking
+                .ts
+                .iter()
+                .zip(&booking.reduces)
+                .filter_map(|(&ts, &reduces)| reduces.then_some(ts))
+                .collect(),
+        )
+    }
+
+    /// `normalize_performance_fills` of `report()`, row for row: the
+    /// commission text's number (`+ 0.0`), `filled_qty` read back from its
+    /// text, and `avg_px`, each NaN read as nothing. None without a booking,
+    /// or where Python refuses an infinite amount.
+    pub(crate) fn report_amounts(&self) -> Option<FillAmounts> {
+        let terms = self.ledger.terms.as_ref()?;
+        let rows = self.report_rows(self.ledger.booking.as_ref()?, terms.size_increment);
+        let read = |value: f64, precision: usize| -> Option<f64> {
+            if value.is_nan() {
+                Some(0.0)
+            } else if value.is_infinite() {
+                None
+            } else {
+                spelled(value, precision).parse::<f64>().ok()
+            }
+        };
+        let mut amounts = FillAmounts::default();
+        for row in &rows {
+            amounts
+                .commission
+                .push(read(row.commission + 0.0, terms.currency_precision as usize)? + 0.0);
+            amounts.quantity.push(read(row.filled, terms.size_precision)?);
+            amounts.price.push(match row.avg_px {
+                px if px.is_nan() => 0.0,
+                px if px.is_infinite() => return None,
+                px => px,
+            });
+        }
+        Some(amounts)
     }
 }
 

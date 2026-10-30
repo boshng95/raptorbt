@@ -40,6 +40,14 @@ const EXACT: [f64; 23] = [
 /// `u128` to find. The digits `round(x, precision)` and
 /// `f"{x:.{precision}f}"` both take, without spelling them.
 fn scaled_half_even(x: f64, precision: u32) -> Option<u64> {
+    scaled_half_even_clear(x, precision).map(|(units, _)| units)
+}
+
+/// [`scaled_half_even`], and whether every value within one float step of
+/// `x` rounds to the same units: true where the tie lies further off than
+/// that step, so `x`'s shortest repr -- within half a step -- rounds there
+/// too.
+fn scaled_half_even_clear(x: f64, precision: u32) -> Option<(u64, bool)> {
     if !x.is_finite() || precision as usize >= EXACT.len() {
         return None;
     }
@@ -53,18 +61,21 @@ fn scaled_half_even(x: f64, precision: u32) -> Option<u64> {
         return None;
     }
     // Below `2**53 * 10**22 < 2**127`.
-    let product = u128::from(mantissa) * 10_u128.pow(precision);
+    let step = 10_u128.pow(precision);
+    let product = u128::from(mantissa) * step;
     let shift = shift as u32;
-    let units = if shift >= 128 {
-        // Below one half.
-        0
+    // A float step of `x` is one unit of the mantissa, so `step` of these.
+    let (units, clear) = if shift >= 128 {
+        // Below a quarter, its steps far finer than another quarter.
+        (0, true)
     } else {
         let whole = product >> shift;
         let rest = product & ((1 << shift) - 1);
         let half = 1 << (shift - 1);
-        whole + u128::from(rest > half || (rest == half && whole & 1 == 1))
+        let up = rest > half || (rest == half && whole & 1 == 1);
+        (whole + u128::from(up), rest.abs_diff(half) > step)
     };
-    (units < 1 << 53).then_some(units as u64)
+    (units < 1 << 53).then_some((units as u64, clear))
 }
 
 /// `round(x, precision)` on a finite float: the decimal nearest its exact
@@ -75,7 +86,34 @@ pub(crate) fn round_to(x: f64, precision: u32) -> Option<f64> {
         let value = units as f64 / EXACT[precision as usize];
         return Some(if x.is_sign_negative() { -value } else { value });
     }
-    format!("{:.*}", precision as usize, x).parse().ok()
+    read_spelled(format_args!("{:.*}", precision as usize, x), |text| text.parse().ok())
+}
+
+/// `read(&format!(...))`, spelled on the stack: the text this module reads
+/// back is short, and a replay spells some of it a few times an order.
+fn read_spelled<T>(args: std::fmt::Arguments<'_>, read: impl FnOnce(&str) -> T) -> T {
+    let mut spelled = Spelled { bytes: [0; 64], len: 0 };
+    match std::fmt::Write::write_fmt(&mut spelled, args) {
+        // Only whole `str`s are written, so the bytes are one too.
+        Ok(()) => read(std::str::from_utf8(&spelled.bytes[..spelled.len]).unwrap_or_default()),
+        Err(_) => read(&std::fmt::format(args)),
+    }
+}
+
+/// A fixed buffer of text, which refuses what does not fit.
+struct Spelled {
+    bytes: [u8; 64],
+    len: usize,
+}
+
+impl std::fmt::Write for Spelled {
+    fn write_str(&mut self, text: &str) -> std::fmt::Result {
+        let end = self.len + text.len();
+        let slot = self.bytes.get_mut(self.len..end).ok_or(std::fmt::Error)?;
+        slot.copy_from_slice(text.as_bytes());
+        self.len = end;
+        Ok(())
+    }
 }
 
 /// `f"{x:.{precision}f}"` for a float that is not a NaN.
@@ -131,7 +169,7 @@ impl Dec {
         if !x.is_finite() {
             return None;
         }
-        Dec::shortest(x).or_else(|| Dec::parse(&format!("{x:e}")))
+        Dec::shortest(x).or_else(|| read_spelled(format_args!("{x:e}"), Dec::parse))
     }
 
     /// `Dec::of` without spelling the float, wherever its digits number at
@@ -212,7 +250,7 @@ impl Dec {
             let scale = EXACT[self.e.unsigned_abs() as usize];
             return if self.e >= 0 { c * scale } else { c / scale };
         }
-        format!("{}e{}", self.c, self.e).parse().unwrap_or(f64::NAN)
+        read_spelled(format_args!("{}e{}", self.c, self.e), |text| text.parse().unwrap_or(f64::NAN))
     }
 
     /// The approximate value, for a search's first guess only.
@@ -321,6 +359,13 @@ struct Cost {
 impl Cost {
     /// `_cash`.
     fn cash(&self, cash: f64) -> Option<Dec> {
+        // Clear of a tie, the shortest repr rounds where the float does.
+        if let Some((units, true)) =
+            u32::try_from(-self.cent).ok().and_then(|places| scaled_half_even_clear(cash, places))
+        {
+            let c = i128::from(units);
+            return Dec::checked(if cash.is_sign_negative() { -c } else { c }, self.cent);
+        }
         Dec::of(cash)?.quantize(self.cent, Rounding::HalfEven)
     }
 
@@ -818,6 +863,21 @@ mod tests {
             per_share: dec("0.005"),
             max_pct: dec("0.01"),
         }
+    }
+
+    #[test]
+    fn cash_rounds_as_its_shortest_repr_does() {
+        for x in awkward_floats() {
+            for places in [0, 2, 3, 8, 22, 23] {
+                let cost = Cost { cent: -places, ..us_cost() };
+                let want = Dec::of(x).and_then(|d| d.quantize(-places, Rounding::HalfEven));
+                let got = cost.cash(x);
+                assert_eq!(got.map(|d| (d.c, d.e)), want.map(|d| (d.c, d.e)), "{x:e} at {places}");
+            }
+        }
+        // The fast path answers what a run meets, and leaves a tie alone.
+        assert!(matches!(scaled_half_even_clear(98_765.432_109_876_54, 2), Some((_, true))));
+        assert!(matches!(scaled_half_even_clear(1.005, 2), Some((_, false))));
     }
 
     #[test]

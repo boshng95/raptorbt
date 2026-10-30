@@ -933,6 +933,17 @@ impl EngineKernel {
         self.ledger.positions().iter().map(Self::snapshot_of).collect()
     }
 
+    /// Whether a position is open, and the signed sizes of the open
+    /// positions summed left to right in opening order: what
+    /// [`Self::position_snapshots`] sums to, read without copying them.
+    pub fn net_position(&self) -> (bool, f64) {
+        let open = self.ledger.positions();
+        let net = open.iter().fold(0.0, |total, managed| {
+            total + managed.position.size * f64::from(managed.position.direction as i32)
+        });
+        (!open.is_empty(), net)
+    }
+
     fn snapshot_of(managed: &crate::portfolio::ledger::ManagedPosition) -> PositionSnapshot {
         let p = &managed.position;
         PositionSnapshot {

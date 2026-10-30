@@ -108,6 +108,10 @@ from raptorbt._raptorbt import (
     EngineEvent,
     PositionSnapshot,
     resolve_atr_period,
+    # The canonical report of a replay, built in Rust
+    canonical_report,
+    # The exact twins of the engine's indicator walks
+    indicator_twin,
 )
 from raptorbt.strategy import (
     Bar,
@@ -230,6 +234,8 @@ __all__ = [
     "EngineEvent",
     "PositionSnapshot",
     "resolve_atr_period",
+    "canonical_report",
+    "indicator_twin",
     # Class-based strategy contract
     "Bar",
     "ClosePosition",

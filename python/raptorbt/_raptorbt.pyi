@@ -1444,3 +1444,39 @@ def resolve_atr_period(
     config: BacktestConfig | None = ...,
     instrument_config: InstrumentConfig | None = ...,
 ) -> int | None: ...
+
+# The canonical report of a single-name replay, as the engine's
+# PerformanceReportService writes it (execution_lane None), with the number
+# of order fills report rows and the closed trade rows' realized P&L in
+# order; None where the result must be built in Python instead. symbol is
+# the name the ledger booked; offsets are the (utc_ns, offset_ns)
+# transitions of timezone, known through offsets_until_ns.
+def canonical_report(
+    result: BacktestResult,
+    ledger: ReplayLedger,
+    *,
+    symbol: str,
+    starting: float,
+    timezone: str,
+    offsets: list[tuple[int, int]],
+    offsets_until_ns: int,
+    risk_free_rate: float = ...,
+) -> tuple[dict[str, Any], int, list[float]] | None: ...
+
+def indicator_twin(
+    kind: str,
+    params: dict[str, Any],
+    open: _F64,
+    high: _F64,
+    low: _F64,
+    close: _F64,
+    volume: _F64,
+) -> tuple[_Bool, dict[str, _F64]] | str: ...
+
+# Exact-arithmetic probes: Python's float arithmetic as the report uses it.
+def _exact_fsum(values: list[float]) -> float | None: ...
+def _exact_sum(values: list[float]) -> float: ...
+def _exact_np_sum(values: list[float]) -> float: ...
+def _exact_stdev(values: list[float]) -> float | None: ...
+def _exact_median(values: list[float]) -> float | None: ...
+def _exact_pow(base: float, exponent: float) -> float | None: ...

@@ -10,6 +10,8 @@ pub mod money;
 pub mod numpy_bridge;
 pub mod portfolio_bindings;
 pub mod replay_session;
+pub mod report_bindings;
 pub mod rule_session;
 pub mod session_bindings;
 pub mod strategy_bindings;
+pub mod twin_bindings;

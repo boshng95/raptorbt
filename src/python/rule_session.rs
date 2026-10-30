@@ -19,7 +19,9 @@
 //! [`PyCrossoverRuleSession::quiet_bar`] is what the kernel's fast-forward
 //! uses: it takes one callback bar on the strategy's behalf and keeps it only
 //! when the strategy would have done nothing with it, restoring the state it
-//! started from otherwise so that Python can take the same bar itself.
+//! started from otherwise so that Python can take the same bar itself. The
+//! kernel's own replay, which takes that bar too, has nothing to restore: its
+//! stepper keeps the bar's `advance` for it instead ([`RuleStepper::handing_back`]).
 
 use numpy::PyArray1;
 use pyo3::exceptions::PyValueError;
@@ -32,6 +34,9 @@ const POW10: [f64; 17] =
     [1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15, 1e16];
 const FIXED_PRECISION: u32 = 16;
 const FIXED_SCALAR: f64 = 1e16;
+/// `2**126`: a product of two exact integers below it in magnitude is one a
+/// 128-bit integer holds.
+const I128_SAFE: f64 = 85_070_591_730_234_615_865_843_651_857_942_052_864.0;
 
 /// `money_as_double`: round to the currency's minor unit, scale to Nautilus's
 /// fixed precision as an integer, and convert that integer back to a double.
@@ -45,6 +50,16 @@ pub(crate) fn money_as_double(value: f64, currency_precision: u32) -> Option<f64
     let minor = (value * POW10[currency_precision as usize]).round_ties_even();
     if minor.abs() >= 1e37 {
         return None;
+    }
+    // `minor` and the power of ten are exact integers, so the product is the
+    // float nearest the raw integer, which is what converting it gives. Well
+    // inside the 128-bit range the integer cannot overflow, and the product
+    // is the answer without it -- but for the sign of a zero, which an
+    // integer does not have.
+    let scale = POW10[(FIXED_PRECISION - currency_precision) as usize];
+    let raw = minor * scale;
+    if raw.abs() < I128_SAFE {
+        return Some(if raw == 0.0 { 0.0 } else { raw / FIXED_SCALAR });
     }
     let raw = (minor as i128).checked_mul(10i128.pow(FIXED_PRECISION - currency_precision))?;
     Some(raw as f64 / FIXED_SCALAR)
@@ -966,35 +981,42 @@ impl Data {
         quiet: &QuietParams,
     ) -> bool {
         saved.clone_from(state);
-        let quiet_bar = self.try_quiet_bar(view, state, bar, quiet);
+        let advanced = self.advance_bar(view, state, bar);
+        let quiet_bar = self.settles_quiet(view, state, bar, quiet, &advanced);
         if !quiet_bar {
             std::mem::swap(state, saved);
         }
         quiet_bar
     }
 
-    fn try_quiet_bar(
+    /// `advance` on callback bar `bar`, with the account it was read with.
+    fn advance_bar(
         &self,
         view: &View,
         state: &mut State,
         bar: &QuietBar,
+    ) -> PyResult<(bool, Option<Target>)> {
+        self.advance(view, state, bar.now, bar.idx, bar.has_position, bar.net_position, bar.pending)
+    }
+
+    /// Whether callback bar `bar`, whose `advance` answered `advanced` and
+    /// left `state`, is quiet.
+    fn settles_quiet(
+        &self,
+        view: &View,
+        state: &State,
+        bar: &QuietBar,
         quiet: &QuietParams,
+        advanced: &PyResult<(bool, Option<Target>)>,
     ) -> bool {
         // An error is Python's to raise, on its own call.
-        let Ok((processed, target)) = self.advance(
-            view,
-            state,
-            bar.now,
-            bar.idx,
-            bar.has_position,
-            bar.net_position,
-            bar.pending,
-        ) else {
+        let &Ok((processed, target)) = advanced else {
             return false;
         };
         // `_refresh` reads the cash as `money_as_double`, which raises on a
         // value that is not a number.
-        if processed && money_as_double(bar.cash, quiet.currency_precision).is_none() {
+        let cash = money_as_double(bar.cash, quiet.currency_precision);
+        if processed && cash.is_none() {
             return false;
         }
         if bar.halted {
@@ -1004,7 +1026,7 @@ impl Data {
             return false;
         }
         if !bar.has_position {
-            let Some(cash) = money_as_double(bar.cash, quiet.currency_precision) else {
+            let Some(cash) = cash else {
                 return false;
             };
             let mut funds = cash * quiet.fraction;
@@ -1534,7 +1556,14 @@ impl PyCrossoverRuleSession {
     /// `PyKernelSession::step_rules_until`.
     pub(crate) fn split<'a>(&'a mut self, py: Python<'a>) -> PyResult<RuleStepper<'a>> {
         let view = self.data.view(py)?;
-        Ok(RuleStepper { data: &self.data, view, state: &mut self.state, saved: &mut self.saved })
+        Ok(RuleStepper {
+            data: &self.data,
+            view,
+            state: &mut self.state,
+            saved: &mut self.saved,
+            hands_back: false,
+            taken: None,
+        })
     }
 }
 
@@ -1544,11 +1573,86 @@ pub(crate) struct RuleStepper<'a> {
     view: View<'a>,
     state: &'a mut State,
     saved: &'a mut State,
+    /// Whether a callback bar [`Self::quiet_bar`] finds would act is left
+    /// advanced, for the caller's own `advance` on it, rather than restored.
+    hands_back: bool,
+    /// That bar, while the caller has yet to take it.
+    taken: Option<Taken>,
+}
+
+/// The `advance` of a callback bar a quiet scan found would act, kept for
+/// the caller's own call on the bar.
+///
+/// The rules stand past the bar, as `advance` left them; the caller's call
+/// answers with what that `advance` did, read with the same account. A call
+/// with another account, or anything else that touches the rules first,
+/// finds the rules where no run of the caller's would have them, and the
+/// replay declines ([`Taken::spoil`]).
+struct Taken {
+    idx: usize,
+    now: i64,
+    has_position: bool,
+    net_position: f64,
+    pending: Option<f64>,
+    advanced: PyResult<(bool, Option<Target>)>,
+}
+
+impl Taken {
+    /// Whether the caller's `advance` reads the bar as the scan did.
+    fn answers(
+        &self,
+        now: i64,
+        idx: usize,
+        has_position: bool,
+        net_position: f64,
+        pending: Option<f64>,
+    ) -> bool {
+        self.idx == idx
+            && self.now == now
+            && self.has_position == has_position
+            && self.net_position.to_bits() == net_position.to_bits()
+            && self.pending.map(f64::to_bits) == pending.map(f64::to_bits)
+    }
+
+    fn spoil(&mut self) {
+        self.advanced =
+            Err(super::replay_session::declined("the rules moved past a callback bar handed back"));
+    }
 }
 
 impl RuleStepper<'_> {
+    /// This stepper, keeping a callback bar that would act advanced for the
+    /// caller's own `advance` on it: a caller that takes every bar handed
+    /// back, and touches the rules no other way first, never needs the state
+    /// from before the bar, and [`Self::quiet_bar`] then copies nothing.
+    pub(crate) fn handing_back(mut self) -> Self {
+        self.hands_back = true;
+        self
+    }
+
     pub(crate) fn quiet_bar(&mut self, bar: &QuietBar, quiet: &QuietParams) -> bool {
-        self.data.quiet_bar(&self.view, self.state, self.saved, bar, quiet)
+        if !self.hands_back {
+            return self.data.quiet_bar(&self.view, self.state, self.saved, bar, quiet);
+        }
+        if let Some(taken) = &mut self.taken {
+            // A scan past a bar handed back is a scan over rules standing
+            // past it.
+            taken.spoil();
+            return false;
+        }
+        let advanced = self.data.advance_bar(&self.view, self.state, bar);
+        if self.data.settles_quiet(&self.view, self.state, bar, quiet, &advanced) {
+            return true;
+        }
+        self.taken = Some(Taken {
+            idx: bar.idx,
+            now: bar.now,
+            has_position: bar.has_position,
+            net_position: bar.net_position,
+            pending: bar.pending,
+            advanced,
+        });
+        false
     }
 
     /// [`PyCrossoverRuleSession::advance`], answering with the target itself.
@@ -1560,6 +1664,12 @@ impl RuleStepper<'_> {
         net_position: f64,
         pending: Option<f64>,
     ) -> PyResult<(bool, Option<Target>)> {
+        if let Some(mut taken) = self.taken.take() {
+            if !taken.answers(now, idx, has_position, net_position, pending) {
+                taken.spoil();
+            }
+            return taken.advanced;
+        }
         self.data.advance(&self.view, self.state, now, idx, has_position, net_position, pending)
     }
 
@@ -1571,12 +1681,14 @@ impl RuleStepper<'_> {
         net_position: f64,
         pending: Option<f64>,
     ) -> bool {
+        debug_assert!(self.taken.is_none(), "rules read past a bar handed back");
         self.data.held_reopens(&self.view, self.state, idx, has_position, net_position, pending)
     }
 
     /// The primary bar the next composite reaches, or the bar count past the
     /// last one.
     pub(crate) fn next_dispatch_position(&self) -> usize {
+        debug_assert!(self.taken.is_none(), "rules read past a bar handed back");
         self.data.next_dispatch_position(&self.view, self.state)
     }
 
@@ -1587,16 +1699,30 @@ impl RuleStepper<'_> {
 
     /// [`PyCrossoverRuleSession::on_fill`].
     pub(crate) fn on_fill(&mut self) {
+        if let Some(taken) = &mut self.taken {
+            taken.spoil();
+        }
         self.state.visit_primary_after_fill = true;
     }
 
     pub(crate) fn visit_primary_after_fill(&self) -> bool {
+        debug_assert!(self.taken.is_none(), "rules read past a bar handed back");
         self.state.visit_primary_after_fill
+    }
+
+    /// Whether a bar handed back has yet to be taken.
+    pub(crate) fn holds_taken(&self) -> bool {
+        self.taken.is_some()
     }
 
     /// The session's primary close at bar `idx`.
     pub(crate) fn primary_close(&self, idx: usize) -> f64 {
         self.view.primary_close[idx]
+    }
+
+    /// The session's primary closes.
+    pub(crate) fn primary_closes(&self) -> &[f64] {
+        self.view.primary_close
     }
 }
 
