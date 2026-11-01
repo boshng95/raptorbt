@@ -340,7 +340,7 @@ def run_strategy_backtest(
         money = replay[8] if len(replay) > 8 else None
         book = replay[9] if len(replay) > 9 else None
         tag = getattr(strategy.config, "order_id_tag", None) or "O"
-        log = session.replay_rules(
+        arguments = (
             timestamps,
             open_,
             high,
@@ -365,6 +365,13 @@ def run_strategy_backtest(
             money,
             book,
         )
+        # A strategy may be shown the replay before the kernel runs it, with
+        # the terms its session was opened on: one that raises there ends the
+        # run with the session unspent, for a caller that replays it elsewhere.
+        take = getattr(strategy, "take_replay", None)
+        if take is not None:
+            take(arguments, config, instrument_config)
+        log = session.replay_rules(*arguments)
         strategy._order_seq += (
             sum(1 for entry in log if entry[0] == "submit")
             if isinstance(log, list)

@@ -61,19 +61,60 @@ fn whole_seconds(ns: i64) -> Option<i64> {
     (ns % NS_PER_SECOND == 0).then_some(ns / NS_PER_SECOND)
 }
 
+/// What [`trip_rows`] reads of a round trip.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Trip {
+    pub entry_time: i64,
+    pub exit_time: i64,
+    pub size: f64,
+    pub entry_price: f64,
+    pub exit_price: f64,
+    pub pnl: f64,
+    pub entry_fees: f64,
+    pub exit_fees: f64,
+    pub short: bool,
+    /// Whether the data ended on it (`exit_reason == "EndOfData"`).
+    pub end_of_data: bool,
+}
+
 /// `convert_session`'s trade rows, sorted as `BacktestResult` sorts them.
-///
-/// Round trips in the order they opened; one that closed renders its one
-/// row, one the data ended on its open row and its settlement. *reduction_ns*
-/// are the reducing fills of the book on *symbol*, which a settled position
-/// must not have taken (`trims_of`): its rows would then be split by them.
 fn trade_rows(
     trades: &[PyTrade],
     symbol: &str,
     reduction_ns: &[i64],
     precision: u32,
 ) -> Option<Vec<TradeRow>> {
-    let mut opened: Vec<&PyTrade> = trades.iter().collect();
+    if trades.iter().any(|item| item.symbol != symbol) {
+        return None;
+    }
+    let trips = trades.iter().map(|item| Trip {
+        entry_time: item.entry_time,
+        exit_time: item.exit_time,
+        size: item.size,
+        entry_price: item.entry_price,
+        exit_price: item.exit_price,
+        pnl: item.pnl,
+        entry_fees: item.entry_fees,
+        exit_fees: item.exit_fees,
+        short: item.direction <= 0,
+        end_of_data: item.exit_reason == "EndOfData",
+    });
+    trip_rows(trips, reduction_ns, precision)
+}
+
+/// The trade rows of one instrument's round trips, sorted as
+/// `BacktestResult` sorts them.
+///
+/// Round trips in the order they opened; one that closed renders its one
+/// row, one the data ended on its open row and its settlement. *reduction_ns*
+/// are the reducing fills of the book, which a settled position must not
+/// have taken (`trims_of`): its rows would then be split by them.
+pub(crate) fn trip_rows(
+    trips: impl Iterator<Item = Trip>,
+    reduction_ns: &[i64],
+    precision: u32,
+) -> Option<Vec<TradeRow>> {
+    let mut opened: Vec<Trip> = trips.collect();
     opened.sort_by_key(|item| item.entry_time);
     let mut rows: Vec<Keyed> = Vec::with_capacity(opened.len() + 1);
     for item in opened {
@@ -85,10 +126,7 @@ fn trade_rows(
             item.entry_fees,
             item.exit_fees,
         ];
-        if item.symbol != symbol
-            || item.exit_time <= 0
-            || amounts.iter().any(|value| !value.is_finite())
-        {
+        if item.exit_time <= 0 || amounts.iter().any(|value| !value.is_finite()) {
             return None;
         }
         let opened_s = whole_seconds(item.entry_time)?;
@@ -96,8 +134,8 @@ fn trade_rows(
         let entry_fee = money(item.entry_fees, precision)?;
         money(item.exit_fees, precision)?;
         let duration_hours = Some((closed_s - opened_s) as f64 / 3600.0);
-        let short = item.direction <= 0;
-        if item.exit_reason == "EndOfData" {
+        let short = item.short;
+        if item.end_of_data {
             let trimmed =
                 reduction_ns.iter().any(|&ns| ns > item.entry_time && ns <= item.exit_time);
             if trimmed {
@@ -150,7 +188,7 @@ fn trade_rows(
     Some(rows.into_iter().map(|keyed| keyed.row).collect())
 }
 
-fn to_python(py: Python<'_>, value: &Value) -> PyResult<PyObject> {
+pub(crate) fn to_python(py: Python<'_>, value: &Value) -> PyResult<PyObject> {
     Ok(match value {
         Value::None => py.None(),
         Value::Bool(flag) => flag.into_py(py),

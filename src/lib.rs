@@ -18,6 +18,7 @@ pub mod data;
 pub mod execution;
 pub mod indicators;
 pub mod instruments;
+pub mod lean;
 pub mod metrics;
 pub mod portfolio;
 pub mod python;
@@ -85,6 +86,11 @@ fn _raptorbt(py: Python<'_>, m: &PyModule) -> PyResult<()> {
     m.add_class::<python::money::PyMoneyModel>()?;
     m.add_class::<python::fill_ledger::PyReplayLedger>()?;
     m.add("ReplayDeclined", py.get_type::<python::replay_session::ReplayDeclined>())?;
+    m.add_class::<python::lean_bindings::PyLeanMarket>()?;
+    m.add_class::<python::lean_bindings::PyLeanFrame>()?;
+    m.add_function(wrap_pyfunction!(python::lean_bindings::lean_replay, m)?)?;
+    m.add_function(wrap_pyfunction!(python::lean_bindings::lean_replay_many, m)?)?;
+    m.add("LeanDeclined", py.get_type::<python::lean_bindings::LeanDeclined>())?;
     m.add_function(wrap_pyfunction!(python::strategy_bindings::resolve_atr_period, m)?)?;
 
     // Register the canonical report of a replay and its exact-arithmetic probes

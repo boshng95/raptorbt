@@ -15,7 +15,68 @@ use num_traits::{ToPrimitive, Zero};
 /// `math.fsum` of finite floats: Shewchuk's exact partials, then CPython's
 /// correction that makes a half-way sum round to even across them. `None`
 /// where it raises: an intermediate overflow.
-pub fn fsum(values: impl IntoIterator<Item = f64>) -> Option<f64> {
+///
+/// `math.fsum` rounds the exact sum correctly, so it is the one float any
+/// correct rounding of that sum gives. [`certified_sum`] finds it in one
+/// cheap pass wherever it can prove it has, and the partials decide the rest.
+pub fn fsum<I>(values: I) -> Option<f64>
+where
+    I: IntoIterator<Item = f64>,
+    I::IntoIter: Clone,
+{
+    let values = values.into_iter();
+    certified_sum(values.clone()).or_else(|| partials_sum(values))
+}
+
+/// Rump, Ogita and Oishi's `Sum2` (a cascade of error-free additions) and
+/// the bound on what its error terms' plain sum misses: the correctly
+/// rounded sum where every value the bound admits rounds to it. None where
+/// the bound leaves the rounding open, the sum is zero or not normal, or the
+/// values are large enough that the partials could overflow.
+fn certified_sum(values: impl Iterator<Item = f64>) -> Option<f64> {
+    let (mut hi, mut lo, mut spread, mut magnitude, mut count) =
+        (0.0_f64, 0.0_f64, 0.0_f64, 0.0_f64, 0_u64);
+    for value in values {
+        // `hi + error` is `hi + value` exactly.
+        let sum = hi + value;
+        let part = sum - hi;
+        let error = (hi - (sum - part)) + (value - part);
+        hi = sum;
+        lo += error;
+        spread += error.abs();
+        magnitude += value.abs();
+        count += 1;
+    }
+    // A NaN or infinity anywhere carries through to `magnitude`.
+    if !(magnitude < 1e300) || count >= 1 << 40 {
+        return None;
+    }
+    // The exact sum is `hi` plus the errors' exact sum, which `lo` misses by
+    // at most `gamma(count - 1) * sum|error|` (Higham 4.2); `spread` is that
+    // sum to within the same factor, and the constant doubles the bound.
+    let bound = spread * count as f64 * 2.3e-16;
+    if spread != 0.0 && bound < f64::MIN_POSITIVE {
+        return None;
+    }
+    // `rounded + residual` is `hi + lo` exactly.
+    let rounded = hi + lo;
+    let part = rounded - hi;
+    let residual = (hi - (rounded - part)) + (lo - part);
+    let size = rounded.abs();
+    if !(size >= 1e-290) {
+        return None;
+    }
+    // The gaps to the floats either side of `rounded`; a sum strictly within
+    // half of each rounds to it. Rounding is monotonic and the half gaps are
+    // floats, so the comparisons below are exact in what they decide.
+    let bits = size.to_bits();
+    let (out, toward) = (f64::from_bits(bits + 1) - size, size - f64::from_bits(bits - 1));
+    let (above, below) = if rounded > 0.0 { (out, toward) } else { (toward, out) };
+    (residual + bound < above / 2.0 && residual - bound > -below / 2.0).then_some(rounded)
+}
+
+/// `math.fsum` as CPython computes it.
+fn partials_sum(values: impl Iterator<Item = f64>) -> Option<f64> {
     let mut partials: Vec<f64> = Vec::new();
     for value in values {
         if !value.is_finite() {
@@ -187,36 +248,34 @@ pub fn stdev(values: &[f64]) -> Option<f64> {
     // Each non-zero value as `mantissa * 2**exponent`, grouped by exponent:
     // within one, the mantissas and their squares sum exactly in 128 bits
     // (below `2**53` and `2**106`, over fewer than `2**21` values).
-    let mut terms: Vec<(i32, i64)> = values
-        .iter()
-        .filter(|value| **value != 0.0)
-        .map(|&value| {
-            let (mantissa, exponent) = decompose(value);
-            (exponent, mantissa)
-        })
-        .collect();
-    if terms.len() >= 1 << 21 {
+    let (mut lowest, mut highest, mut terms) = (i32::MAX, i32::MIN, 0_usize);
+    for &value in values.iter().filter(|value| **value != 0.0) {
+        let exponent = decompose(value).1;
+        lowest = lowest.min(exponent);
+        highest = highest.max(exponent);
+        terms += 1;
+    }
+    if terms >= 1 << 21 {
         return None;
     }
-    terms.sort_unstable_by_key(|&(exponent, _)| exponent);
-    let base = terms.first().map_or(0, |&(exponent, _)| exponent);
+    let base = if lowest <= highest { lowest } else { 0 };
+    // One bucket per exponent in use: integer sums, so the order the values
+    // land in is immaterial.
+    let mut buckets = vec![(0_i128, 0_u128); (highest - lowest + 1).max(0) as usize];
+    for &value in values.iter().filter(|value| **value != 0.0) {
+        let (mantissa, exponent) = decompose(value);
+        let bucket = &mut buckets[(exponent - base) as usize];
+        bucket.0 += i128::from(mantissa);
+        bucket.1 += (i128::from(mantissa) * i128::from(mantissa)) as u128;
+    }
     let mut total = BigInt::zero();
     let mut squares = BigUint::zero();
-    let mut start = 0;
-    while start < terms.len() {
-        let exponent = terms[start].0;
-        let mut stop = start;
-        let (mut sum, mut sum_sq) = (0_i128, 0_u128);
-        while stop < terms.len() && terms[stop].0 == exponent {
-            let mantissa = terms[stop].1;
-            sum += i128::from(mantissa);
-            sum_sq += (i128::from(mantissa) * i128::from(mantissa)) as u128;
-            stop += 1;
+    for (shift, &(sum, sum_sq)) in buckets.iter().enumerate() {
+        if sum == 0 && sum_sq == 0 {
+            continue;
         }
-        let shift = (exponent - base) as usize;
         total += BigInt::from(sum) << shift;
         squares += BigUint::from(sum_sq) << (2 * shift);
-        start = stop;
     }
     // The variance, `(n * S2 - S1**2) / (n * (n - 1))`, over `2**(2 * base)`.
     let count = values.len() as u64;
@@ -381,6 +440,53 @@ mod tests {
         assert_eq!(fsum([-0.0]).map(f64::is_sign_negative), Some(false));
         assert_eq!(fsum([1e308, 1e308]), None);
         assert_eq!(fsum([]), Some(0.0));
+    }
+
+    #[test]
+    fn certified_sums_are_the_partials() {
+        // A small xorshift, so the cases are the same on every run.
+        let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut certified = 0;
+        for case in 0..20_000 {
+            let n = 1 + (next() % 400) as usize;
+            let values: Vec<f64> = (0..n)
+                .map(|_| {
+                    let unit = (next() >> 11) as f64 / (1_u64 << 53) as f64 - 0.5;
+                    match case % 5 {
+                        // Daily returns.
+                        0 => unit * 0.1,
+                        // Their squares.
+                        1 => unit * unit * 1e-3,
+                        // Magnitudes across the whole range.
+                        2 => unit * 2f64.powi((next() % 200) as i32 - 100),
+                        // Cancellation down to nothing.
+                        3 => {
+                            if next() % 2 == 0 {
+                                1e16
+                            } else {
+                                -1e16 + unit
+                            }
+                        }
+                        // Ties: halves of an ulp of the running sum.
+                        _ => [1.0, 2f64.powi(-53), -2f64.powi(-54), 3.0][(next() % 4) as usize],
+                    }
+                })
+                .collect();
+            let want = partials_sum(values.iter().copied());
+            if let Some(sum) = certified_sum(values.iter().copied()) {
+                certified += 1;
+                assert_eq!(Some(sum.to_bits()), want.map(f64::to_bits), "case {case}: {values:?}");
+            }
+            assert_eq!(fsum(values.iter().copied()).map(f64::to_bits), want.map(f64::to_bits));
+        }
+        // The fast path is the common one.
+        assert!(certified > 12_000, "{certified}");
     }
 
     #[test]

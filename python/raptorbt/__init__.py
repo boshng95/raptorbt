@@ -112,6 +112,12 @@ from raptorbt._raptorbt import (
     canonical_report,
     # The exact twins of the engine's indicator walks
     indicator_twin,
+    # The lean lane: library cells replayed in batches on a shared market
+    LeanMarket,
+    LeanFrame,
+    LeanDeclined,
+    lean_replay,
+    lean_replay_many,
 )
 from raptorbt.strategy import (
     Bar,
@@ -236,6 +242,11 @@ __all__ = [
     "resolve_atr_period",
     "canonical_report",
     "indicator_twin",
+    "LeanMarket",
+    "LeanFrame",
+    "LeanDeclined",
+    "lean_replay",
+    "lean_replay_many",
     # Class-based strategy contract
     "Bar",
     "ClosePosition",

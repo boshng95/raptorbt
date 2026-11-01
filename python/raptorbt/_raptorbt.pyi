@@ -1473,6 +1473,101 @@ def indicator_twin(
     volume: _F64,
 ) -> tuple[_Bool, dict[str, _F64]] | str: ...
 
+# The lean lane: the account-coupled native replay of a library cell (a
+# legacy spec of crossovers or level rules over one resample, long only),
+# run on a market and frame shared by every cell of a stream. Its answers
+# are that lane's to the bit; a cell outside the shape is named, never run.
+class LeanDeclined(RuntimeError): ...
+
+class LeanMarket:
+    def __init__(
+        self,
+        timestamps: _I64,
+        open: _F64,
+        high: _F64,
+        low: _F64,
+        close: _F64,
+        volume: _F64,
+        lot: float,
+        slices: float,
+        transitions: list[tuple[int, int]],
+    ) -> None: ...
+    def __len__(self) -> int: ...
+
+class LeanFrame:
+    def __init__(
+        self,
+        market: LeanMarket,
+        due: _I64,
+        dispatch_timestamps: _I64,
+        dispatch_positions: _I64,
+        labels: _I64,
+        close: _F64,
+    ) -> None: ...
+    def __len__(self) -> int: ...
+
+# (a_key, a_value, b_key, b_value, above, clock)
+_Cross = tuple[int, float, int, float, bool, int]
+# (dust, position_required, has_instrument, size_increment, minimum_notional)
+_RuleFlags = tuple[bool, bool, bool, float, float]
+# (conditions, exit_roots, entry_roots, n_clocks, level)
+_Tree = tuple[
+    list[tuple[int, list[int], int, float, int, float, int, float, float]],
+    list[int],
+    list[int],
+    int,
+    tuple[bool, float, float],
+]
+_Terms = tuple[float, float, float | None, int | None, float, float, float, float]
+_Venue = tuple[int, bool, bool, bool, float, float, float, float, float, str, int, int]
+_Book = tuple[float, int, float, int, int, str]
+
+def lean_replay(
+    frame: LeanFrame,
+    gate: _Bool | None,
+    terms: _Terms,
+    quiet: tuple[int, float, float, float, float, float, float, float],
+    venue: _Venue,
+    money: MoneyModel,
+    book: _Book,
+    keys: tuple[list[_F64], list[_Bool], _Bool | None, _Bool | None],
+    entry: _Cross,
+    exit: _Cross,
+    flags: _RuleFlags,
+    *,
+    starting: float,
+    timezone: str,
+    offsets: list[tuple[int, int]],
+    offsets_until_ns: int,
+    jumps: bool = ...,
+    log: bool = ...,
+    tree: _Tree | None = ...,
+) -> dict[str, Any]: ...
+
+# Per cell, the dict lean_replay returns without its log (a str naming why
+# where the cell leaves the lean shape); with screen, one dict of arrays.
+def lean_replay_many(
+    frame: LeanFrame,
+    gate: _Bool | None,
+    terms: _Terms,
+    quiet: tuple[int, float, float, float, float, float, float, float],
+    venue: _Venue,
+    money: MoneyModel,
+    book: _Book,
+    keys: tuple[list[_F64], list[_Bool], list[_Bool]],
+    cells: list[tuple[list[int], int, int, _Cross, _Cross, _RuleFlags]],
+    *,
+    starting: float,
+    timezone: str,
+    offsets: list[tuple[int, int]],
+    offsets_until_ns: int,
+    threads: int = ...,
+    screen: bool = ...,
+    curve: bool = ...,
+    timings: bool = ...,
+    trees: list[_Tree | None] | None = ...,
+) -> Any: ...
+
 # Exact-arithmetic probes: Python's float arithmetic as the report uses it.
 def _exact_fsum(values: list[float]) -> float | None: ...
 def _exact_sum(values: list[float]) -> float: ...

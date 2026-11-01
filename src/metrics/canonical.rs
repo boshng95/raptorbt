@@ -126,7 +126,9 @@ impl LocalClock {
     }
 
     /// `calendar_returns.close_date`: the local day an instant closes, the
-    /// day before at the stroke of midnight.
+    /// day before at the stroke of midnight. The reference `close_dates` is
+    /// held to.
+    #[cfg(test)]
     fn close_date(&self, utc_s: i64) -> Option<Date> {
         let local = self.local(utc_s)?;
         let mut days = local.div_euclid(DAY_SECONDS);
@@ -134,6 +136,42 @@ impl LocalClock {
             days -= 1;
         }
         Some(Date::of_days(days))
+    }
+
+    /// `close_date` of each of rising `stamps`, the schedule and the calendar
+    /// walked once rather than searched for each.
+    fn close_dates(&self, stamps: &[i64]) -> Option<Vec<Date>> {
+        let mut dates = Vec::with_capacity(stamps.len());
+        // How many offsets are in force by the stamp: `local`'s partition point.
+        let mut at = 0;
+        let mut previous: Option<(i64, Date)> = None;
+        for &utc_s in stamps {
+            if utc_s > self.until_s {
+                return None;
+            }
+            while at < self.offsets.len() && self.offsets[at].0 <= utc_s {
+                at += 1;
+            }
+            if at == 0 {
+                return None;
+            }
+            let local = utc_s + self.offsets[at - 1].1;
+            let mut days = local.div_euclid(DAY_SECONDS);
+            if local.rem_euclid(DAY_SECONDS) == 0 {
+                days -= 1;
+            }
+            let date = match previous {
+                Some((seen, date)) if seen == days => date,
+                // The next day, inside every month.
+                Some((seen, date)) if seen + 1 == days && date.day < 28 => {
+                    Date { day: date.day + 1, ..date }
+                }
+                _ => Date::of_days(days),
+            };
+            previous = Some((days, date));
+            dates.push(date);
+        }
+        Some(dates)
     }
 
     /// The local date of an instant.
@@ -400,8 +438,8 @@ struct Calendar {
 
 impl Calendar {
     fn of(stamps: &[i64], equity: &[f64], clock: &LocalClock, starting: f64) -> Option<Self> {
-        let local_dates =
-            stamps.iter().map(|&stamp| clock.close_date(stamp)).collect::<Option<Vec<_>>>()?;
+        // `calculate` has checked the stamps rise.
+        let local_dates = clock.close_dates(stamps)?;
         let mut month_ends: Vec<(Month, f64)> = Vec::new();
         for (date, &value) in local_dates.iter().zip(equity) {
             let month = (date.year, date.month);
@@ -838,6 +876,37 @@ mod tests {
         let sydney = LocalClock::new(&[(0, 39_600 * NS_PER_SECOND)], i64::MAX).unwrap();
         assert_eq!(sydney.close_date(1_640_955_600).unwrap().iso(), "2021-12-31");
         assert!(LocalClock::new(&[(10, 0)], 0).is_none());
+    }
+
+    #[test]
+    fn close_dates_walk_as_close_date_searches() {
+        // New York's offsets across two years of transitions, stamps every
+        // few hours and on the midnights either side of each change.
+        let hour = 3_600 * NS_PER_SECOND;
+        let offsets = [
+            (1_615_705_200 * NS_PER_SECOND, -4 * hour),
+            (1_636_264_800 * NS_PER_SECOND, -5 * hour),
+            (1_647_154_800 * NS_PER_SECOND, -4 * hour),
+            (1_667_714_400 * NS_PER_SECOND, -5 * hour),
+        ];
+        let clock = LocalClock::new(&offsets, 1_680_000_000 * NS_PER_SECOND).unwrap();
+        let mut stamps: Vec<i64> = (1_615_705_200..1_680_000_000).step_by(3_571 * 3).collect();
+        for &(from, offset) in &offsets {
+            let midnight = (from + offset) / NS_PER_SECOND / DAY_SECONDS * DAY_SECONDS;
+            for day in -2..3 {
+                let local = midnight + day * DAY_SECONDS;
+                stamps.extend([local - 1, local, local + 1].map(|at| at - offset / NS_PER_SECOND));
+            }
+        }
+        stamps.retain(|&at| (1_615_705_200..=1_680_000_000).contains(&at));
+        stamps.sort_unstable();
+        let walked = clock.close_dates(&stamps).unwrap();
+        for (stamp, date) in stamps.iter().zip(&walked) {
+            assert_eq!(Some(*date), clock.close_date(*stamp), "{stamp}");
+        }
+        // Before the first offset or past the schedule, as `local` gives.
+        assert!(clock.close_dates(&[1_615_705_199]).is_none());
+        assert!(clock.close_dates(&[1_680_000_001]).is_none());
     }
 
     #[test]

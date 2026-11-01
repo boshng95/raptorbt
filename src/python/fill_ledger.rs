@@ -116,14 +116,19 @@ pub(crate) struct OrderRecord {
     pub policies_after_fill: bool,
 }
 
+/// `_OrderTerms.stamp`: the decision's time on the bar the order arrived
+/// on, else `now_ns`.
+fn stamp(decided_ns: i64, arrived_on_ns: i64, now_ns: i64) -> i64 {
+    if arrived_on_ns == now_ns && decided_ns != 0 {
+        decided_ns
+    } else {
+        now_ns
+    }
+}
+
 impl OrderRecord {
-    /// `_OrderTerms.stamp`.
     fn stamp(&self, now_ns: i64) -> i64 {
-        if self.arrived_on_ns == now_ns && self.decided_ns != 0 {
-            self.decided_ns
-        } else {
-            now_ns
-        }
+        stamp(self.decided_ns, self.arrived_on_ns, now_ns)
     }
 }
 
@@ -170,6 +175,154 @@ struct Booking {
     ended: Vec<u32>,
 }
 
+/// One fill as `FillBook.record` books it.
+struct Booked {
+    ts: i64,
+    size: f64,
+    price: f64,
+    left: f64,
+    cost: f64,
+    reduces: bool,
+    /// The units held after it.
+    held: f64,
+    /// The balance it left.
+    balance: f64,
+}
+
+/// `FillBook.record` of `raw`, stamped `ts`, for an order on `buy`'s side
+/// against a book holding `held` units and `balance`; None where the Python
+/// booking would raise.
+fn book_fill(
+    precision: u32,
+    balance: f64,
+    held: f64,
+    buy: bool,
+    ts: i64,
+    raw: &FillRecord,
+) -> Option<Booked> {
+    let left = or_zero(raw.leaves);
+    let cost = money(or_zero(raw.commission), precision)?;
+    let size = or_zero(raw.size);
+    let price = or_zero(raw.price);
+    let signed = if buy { size } else { -size };
+    let reduces = held != 0.0 && (held > 0.0) != (signed > 0.0);
+    let mut after = held + signed;
+    if after.abs() <= py_max(held.abs(), size) * 1e-12 {
+        after = 0.0;
+    }
+    // `_book_fill`: every fill here reports what it realized.
+    let realized = money(raw.gross_realized, precision)?;
+    let balance = py_round(balance + realized - cost, precision)?;
+    Some(Booked { ts, size, price, left, cost, reduces, held: after, balance })
+}
+
+/// `_order_row`'s running `(filled, avg_px, commission)` after one more
+/// fill, in its order of operations.
+fn run_sums(sums: (f64, f64, f64), qty: f64, px: f64, cost: f64) -> (f64, f64, f64) {
+    let (before, avg_px, commission) = sums;
+    let filled = before + qty;
+    let avg_px = if avg_px == 0.0 { px } else { (avg_px * before + px * qty) / filled };
+    (filled, avg_px, commission + cost)
+}
+
+/// An order as a [`Tally`] keeps it: its side, `_OrderTerms`' stamps, and
+/// its report row once it fills.
+#[derive(Clone, Copy)]
+struct Slip {
+    buy: bool,
+    decided_ns: i64,
+    arrived_on_ns: i64,
+    row: Option<u32>,
+}
+
+/// An `order_fills_report` row's running sums, and when its order was
+/// decided, which the rows are sorted by.
+struct Sums {
+    decided_ns: i64,
+    filled: f64,
+    avg_px: f64,
+    commission: f64,
+}
+
+/// What a ledger that keeps no log books: the book's running balance and
+/// units, and of the columns only what the report reads -- per order that
+/// filled its row's running sums, and when each reduction landed. A replay
+/// that trades every minute books a hundred thousand fills; the columns and
+/// log behind them are most of the memory it writes.
+struct Tally {
+    /// False once a fill would have raised, as the booking's `None`.
+    booked: bool,
+    balance: f64,
+    held: f64,
+    orders: Vec<Slip>,
+    rows: Vec<Sums>,
+    reductions: Vec<i64>,
+}
+
+impl Tally {
+    /// Book `raw` as [`Ledger::book`] does; false where it would raise.
+    fn book(&mut self, precision: u32, raw: &FillRecord) -> bool {
+        let slip = self.orders[raw.order as usize];
+        let ts = stamp(slip.decided_ns, slip.arrived_on_ns, raw.now_ns);
+        let Some(fill) = book_fill(precision, self.balance, self.held, slip.buy, ts, raw) else {
+            return false;
+        };
+        self.held = fill.held;
+        self.balance = fill.balance;
+        if fill.reduces {
+            self.reductions.push(fill.ts);
+        }
+        let at = match slip.row {
+            Some(at) => at as usize,
+            None => {
+                self.rows.push(Sums {
+                    decided_ns: slip.decided_ns,
+                    filled: 0.0,
+                    avg_px: 0.0,
+                    commission: 0.0,
+                });
+                self.orders[raw.order as usize].row = Some(self.rows.len() as u32 - 1);
+                self.rows.len() - 1
+            }
+        };
+        let row = &mut self.rows[at];
+        (row.filled, row.avg_px, row.commission) =
+            run_sums((row.filled, row.avg_px, row.commission), fill.size, fill.price, fill.cost);
+        true
+    }
+}
+
+/// `normalize_performance_fills` of report rows' `(commission, filled,
+/// avg_px)`, row for row: the commission text's number (`+ 0.0`),
+/// `filled_qty` read back from its text, and `avg_px`, each NaN read as
+/// nothing. None where Python refuses an infinite amount.
+fn amounts(terms: &BookTerms, rows: impl Iterator<Item = (f64, f64, f64)>) -> Option<FillAmounts> {
+    let read = |value: f64, precision: usize| -> Option<f64> {
+        if value.is_nan() {
+            Some(0.0)
+        } else if value.is_infinite() {
+            None
+        } else {
+            // `float(f"{value:.{precision}f}")`, without the text.
+            match u32::try_from(precision) {
+                Ok(precision) => round_to(value, precision),
+                Err(_) => spelled(value, precision).parse::<f64>().ok(),
+            }
+        }
+    };
+    let mut amounts = FillAmounts::default();
+    for (commission, filled, avg_px) in rows {
+        amounts.commission.push(read(commission + 0.0, terms.currency_precision as usize)? + 0.0);
+        amounts.quantity.push(read(filled, terms.size_precision)?);
+        amounts.price.push(match avg_px {
+            px if px.is_nan() => 0.0,
+            px if px.is_infinite() => return None,
+            px => px,
+        });
+    }
+    Some(amounts)
+}
+
 /// Everything a replay sent and the venue did, in order.
 pub(crate) struct Ledger {
     terms: Option<BookTerms>,
@@ -177,6 +330,8 @@ pub(crate) struct Ledger {
     fills: Vec<FillRecord>,
     entries: Vec<Entry>,
     booking: Option<Booking>,
+    /// In place of the four above, where the ledger keeps no log.
+    tally: Option<Tally>,
 }
 
 impl Ledger {
@@ -198,11 +353,54 @@ impl Ledger {
             ends: Vec::new(),
             ended: Vec::new(),
         });
-        Self { terms, orders: Vec::new(), fills: Vec::new(), entries: Vec::new(), booking }
+        Self {
+            terms,
+            orders: Vec::new(),
+            fills: Vec::new(),
+            entries: Vec::new(),
+            booking,
+            tally: None,
+        }
+    }
+
+    /// A ledger that books into a `FillBook` opened on `terms` and keeps
+    /// only what the report reads ([`Tally`]): no log, no orders' terms, no
+    /// fills' columns.
+    pub(crate) fn tally(terms: BookTerms) -> Self {
+        let tally = Tally {
+            booked: true,
+            balance: terms.balance,
+            held: 0.0,
+            orders: Vec::new(),
+            rows: Vec::new(),
+            reductions: Vec::new(),
+        };
+        Self {
+            terms: Some(terms),
+            orders: Vec::new(),
+            fills: Vec::new(),
+            entries: Vec::new(),
+            booking: None,
+            tally: Some(tally),
+        }
+    }
+
+    /// Whether it keeps the log.
+    pub(crate) fn logs(&self) -> bool {
+        self.tally.is_none()
     }
 
     /// Record an order; its index names it from here on.
     pub(crate) fn submit(&mut self, order: OrderRecord) -> u32 {
+        if let Some(tally) = self.tally.as_mut() {
+            tally.orders.push(Slip {
+                buy: order.buy,
+                decided_ns: order.decided_ns,
+                arrived_on_ns: order.arrived_on_ns,
+                row: None,
+            });
+            return tally.orders.len() as u32 - 1;
+        }
         let index = self.orders.len() as u32;
         self.orders.push(order);
         self.entries.push(Entry::Submit(index));
@@ -225,17 +423,16 @@ impl Ledger {
         gross_realized: f64,
         commission: f64,
     ) {
+        let raw =
+            FillRecord { order, now_ns, order_id, size, price, leaves, gross_realized, commission };
+        if let (Some(tally), Some(terms)) = (self.tally.as_mut(), self.terms.as_ref()) {
+            if tally.booked && !tally.book(terms.currency_precision, &raw) {
+                tally.booked = false;
+            }
+            return;
+        }
         let index = self.fills.len() as u32;
-        self.fills.push(FillRecord {
-            order,
-            now_ns,
-            order_id,
-            size,
-            price,
-            leaves,
-            gross_realized,
-            commission,
-        });
+        self.fills.push(raw);
         self.entries.push(Entry::Fill(index));
         if !self.book(index) {
             self.booking = None;
@@ -249,23 +446,18 @@ impl Ledger {
         };
         let raw = &self.fills[index as usize];
         let order = &self.orders[raw.order as usize];
-        let precision = terms.currency_precision;
-        let ts = order.stamp(raw.now_ns);
-        let left = or_zero(raw.leaves);
-        let Some(cost) = money(or_zero(raw.commission), precision) else {
+        let held = booking.held;
+        let Some(fill) = book_fill(
+            terms.currency_precision,
+            booking.balance,
+            held,
+            order.buy,
+            order.stamp(raw.now_ns),
+            raw,
+        ) else {
             return false;
         };
-        let size = or_zero(raw.size);
-        let price = or_zero(raw.price);
-        let realized = raw.gross_realized;
-
-        let signed = if order.buy { size } else { -size };
-        let held = booking.held;
-        let reduces = held != 0.0 && (held > 0.0) != (signed > 0.0);
-        let mut after = held + signed;
-        if after.abs() <= py_max(held.abs(), size) * 1e-12 {
-            after = 0.0;
-        }
+        let (ts, after) = (fill.ts, fill.held);
         booking.held = after;
 
         // `_track_peak`.
@@ -283,26 +475,23 @@ impl Ledger {
             }
         }
 
-        // `_book_fill`: every fill here reports what it realized.
-        let Some(realized_money) = money(realized, precision) else {
-            return false;
-        };
-        let Some(balance) = py_round(booking.balance + realized_money - cost, precision) else {
-            return false;
-        };
-        booking.balance = balance;
+        booking.balance = fill.balance;
         booking.ts.push(ts);
-        booking.size.push(size);
-        booking.price.push(price);
-        booking.leaves.push(left);
-        booking.cost.push(cost);
-        booking.balances.push(balance);
-        booking.reduces.push(reduces);
+        booking.size.push(fill.size);
+        booking.price.push(fill.price);
+        booking.leaves.push(fill.left);
+        booking.cost.push(fill.cost);
+        booking.balances.push(fill.balance);
+        booking.reduces.push(fill.reduces);
         true
     }
 
-    /// `_record_end`, then `FillBook.end_order`: an order ends once.
+    /// `_record_end`, then `FillBook.end_order`: an order ends once. A
+    /// tally keeps no ends: the report's amounts do not read them.
     pub(crate) fn end(&mut self, order: u32, status: EndStatus, now_ns: i64) {
+        if self.tally.is_some() {
+            return;
+        }
         self.entries.push(Entry::End { order, status, now_ns });
         if let Some(booking) = self.booking.as_mut() {
             let slot = &mut booking.ends[order as usize];
@@ -314,11 +503,115 @@ impl Ledger {
     }
 
     pub(crate) fn submitted(&self) -> usize {
-        self.orders.len()
+        self.tally.as_ref().map_or(self.orders.len(), |tally| tally.orders.len())
+    }
+
+    /// Whether every fill was booked.
+    pub(crate) fn booked(&self) -> bool {
+        self.tally.as_ref().map_or(self.booking.is_some(), |tally| tally.booked)
+    }
+
+    /// The settlement currency's precision the book was opened on.
+    pub(crate) fn currency_precision(&self) -> Option<u32> {
+        self.terms.as_ref().map(|terms| terms.currency_precision)
+    }
+
+    /// When each fill that took exposure back landed, in fill order: the
+    /// timestamps of `LedgerBook.reductions`. None without a booking.
+    pub(crate) fn reduction_times(&self) -> Option<Vec<i64>> {
+        if let Some(tally) = &self.tally {
+            return tally.booked.then(|| tally.reductions.clone());
+        }
+        let booking = self.booking.as_ref()?;
+        Some(
+            booking
+                .ts
+                .iter()
+                .zip(&booking.reduces)
+                .filter_map(|(&ts, &reduces)| reduces.then_some(ts))
+                .collect(),
+        )
+    }
+
+    /// [`amounts`] of `order_fills_report`'s rows, in their order. None
+    /// without a booking, or where Python refuses an infinite amount.
+    pub(crate) fn report_amounts(&self) -> Option<FillAmounts> {
+        let terms = self.terms.as_ref()?;
+        if let Some(tally) = &self.tally {
+            if !tally.booked {
+                return None;
+            }
+            let mut rows: Vec<&Sums> = tally.rows.iter().collect();
+            rows.sort_by_key(|row| row.decided_ns);
+            return amounts(terms, rows.iter().map(|row| (row.commission, row.filled, row.avg_px)));
+        }
+        let rows = self.report_rows(self.booking.as_ref()?, terms.size_increment);
+        amounts(terms, rows.iter().map(|row| (row.commission, row.filled, row.avg_px)))
+    }
+
+    /// `order_fills_report`'s rows: one per order that filled at all, in the
+    /// order the orders first filled, then stably by when they were placed.
+    fn report_rows(&self, booking: &Booking, size_increment: f64) -> Vec<ReportRow> {
+        let mut rows: Vec<ReportRow> = Vec::new();
+        let mut row_of: Vec<Option<usize>> = vec![None; self.orders.len()];
+        for (index, fill) in self.fills.iter().enumerate() {
+            let at = match row_of[fill.order as usize] {
+                Some(at) => at,
+                None => {
+                    rows.push(ReportRow {
+                        order: fill.order,
+                        last_fill: 0,
+                        filled: 0.0,
+                        avg_px: 0.0,
+                        commission: 0.0,
+                        status: 0,
+                        ts_last: 0,
+                        quantity: 0.0,
+                        slippage: 0.0,
+                    });
+                    row_of[fill.order as usize] = Some(rows.len() - 1);
+                    rows.len() - 1
+                }
+            };
+            let row = &mut rows[at];
+            (row.filled, row.avg_px, row.commission) = run_sums(
+                (row.filled, row.avg_px, row.commission),
+                booking.size[index],
+                booking.price[index],
+                booking.cost[index],
+            );
+            row.last_fill = index as u32;
+        }
+        for row in &mut rows {
+            let order = &self.orders[row.order as usize];
+            let last = row.last_fill as usize;
+            row.quantity = order.units;
+            if booking.leaves[last] <= 0.0 {
+                row.status = 0;
+                row.ts_last = booking.ts[last];
+                if row.filled < row.quantity - size_increment / 2.0 {
+                    row.quantity = row.filled;
+                }
+            } else if let Some((status, ts)) = booking.ends[row.order as usize] {
+                row.status = match status {
+                    EndStatus::Canceled => 1,
+                    EndStatus::Expired => 2,
+                };
+                row.ts_last = ts;
+            } else {
+                row.status = 3;
+                row.ts_last = booking.ts[last];
+            }
+            if let Some(price) = order.limit_price {
+                row.slippage = if order.buy { row.avg_px - price } else { price - row.avg_px };
+            }
+        }
+        rows.sort_by_key(|row| self.orders[row.order as usize].decided_ns);
+        rows
     }
 
     /// The replay's log, as `KernelSession.replay_rules` returns it without
-    /// a book.
+    /// a book; empty where the ledger keeps none.
     pub(crate) fn log(&self, py: Python<'_>) -> Vec<PyObject> {
         self.entries
             .iter()
@@ -440,116 +733,20 @@ impl PyReplayLedger {
         slot.as_ref().map(|names| names.clone()).unwrap_or_else(|| unreachable!())
     }
 
-    /// `order_fills_report`'s rows: one per order that filled at all, in the
-    /// order the orders first filled, then stably by when they were placed.
-    fn report_rows(&self, booking: &Booking, size_increment: f64) -> Vec<ReportRow> {
-        let mut rows: Vec<ReportRow> = Vec::new();
-        let mut row_of: Vec<Option<usize>> = vec![None; self.ledger.orders.len()];
-        for (index, fill) in self.ledger.fills.iter().enumerate() {
-            let at = match row_of[fill.order as usize] {
-                Some(at) => at,
-                None => {
-                    rows.push(ReportRow {
-                        order: fill.order,
-                        last_fill: 0,
-                        filled: 0.0,
-                        avg_px: 0.0,
-                        commission: 0.0,
-                        status: 0,
-                        ts_last: 0,
-                        quantity: 0.0,
-                        slippage: 0.0,
-                    });
-                    row_of[fill.order as usize] = Some(rows.len() - 1);
-                    rows.len() - 1
-                }
-            };
-            // `_order_row`'s running sums, in its order of operations.
-            let row = &mut rows[at];
-            let (qty, px) = (booking.size[index], booking.price[index]);
-            let before = row.filled;
-            row.filled = before + qty;
-            row.avg_px =
-                if row.avg_px == 0.0 { px } else { (row.avg_px * before + px * qty) / row.filled };
-            row.commission += booking.cost[index];
-            row.last_fill = index as u32;
-        }
-        for row in &mut rows {
-            let order = &self.ledger.orders[row.order as usize];
-            let last = row.last_fill as usize;
-            row.quantity = order.units;
-            if booking.leaves[last] <= 0.0 {
-                row.status = 0;
-                row.ts_last = booking.ts[last];
-                if row.filled < row.quantity - size_increment / 2.0 {
-                    row.quantity = row.filled;
-                }
-            } else if let Some((status, ts)) = booking.ends[row.order as usize] {
-                row.status = match status {
-                    EndStatus::Canceled => 1,
-                    EndStatus::Expired => 2,
-                };
-                row.ts_last = ts;
-            } else {
-                row.status = 3;
-                row.ts_last = booking.ts[last];
-            }
-            if let Some(price) = order.limit_price {
-                row.slippage = if order.buy { row.avg_px - price } else { price - row.avg_px };
-            }
-        }
-        rows.sort_by_key(|row| self.ledger.orders[row.order as usize].decided_ns);
-        rows
-    }
-
-    /// The settlement currency's precision the book was opened on.
+    /// [`Ledger::currency_precision`].
     pub(crate) fn currency_precision(&self) -> Option<u32> {
-        self.ledger.terms.as_ref().map(|terms| terms.currency_precision)
+        self.ledger.currency_precision()
     }
 
-    /// When each fill that took exposure back landed, in fill order: the
-    /// timestamps of `LedgerBook.reductions`.
+    /// [`Ledger::reduction_times`].
     pub(crate) fn reduction_times(&self) -> Option<Vec<i64>> {
-        let booking = self.ledger.booking.as_ref()?;
-        Some(
-            booking
-                .ts
-                .iter()
-                .zip(&booking.reduces)
-                .filter_map(|(&ts, &reduces)| reduces.then_some(ts))
-                .collect(),
-        )
+        self.ledger.reduction_times()
     }
 
-    /// `normalize_performance_fills` of `report()`, row for row: the
-    /// commission text's number (`+ 0.0`), `filled_qty` read back from its
-    /// text, and `avg_px`, each NaN read as nothing. None without a booking,
-    /// or where Python refuses an infinite amount.
+    /// [`Ledger::report_amounts`]: `normalize_performance_fills` of
+    /// `report()`, row for row.
     pub(crate) fn report_amounts(&self) -> Option<FillAmounts> {
-        let terms = self.ledger.terms.as_ref()?;
-        let rows = self.report_rows(self.ledger.booking.as_ref()?, terms.size_increment);
-        let read = |value: f64, precision: usize| -> Option<f64> {
-            if value.is_nan() {
-                Some(0.0)
-            } else if value.is_infinite() {
-                None
-            } else {
-                spelled(value, precision).parse::<f64>().ok()
-            }
-        };
-        let mut amounts = FillAmounts::default();
-        for row in &rows {
-            amounts
-                .commission
-                .push(read(row.commission + 0.0, terms.currency_precision as usize)? + 0.0);
-            amounts.quantity.push(read(row.filled, terms.size_precision)?);
-            amounts.price.push(match row.avg_px {
-                px if px.is_nan() => 0.0,
-                px if px.is_infinite() => return None,
-                px => px,
-            });
-        }
-        Some(amounts)
+        self.ledger.report_amounts()
     }
 }
 
@@ -570,7 +767,7 @@ impl PyReplayLedger {
     /// Whether every fill was booked; if not, book `log()` instead.
     #[getter]
     fn booked(&self) -> bool {
-        self.ledger.booking.is_some()
+        self.ledger.booked()
     }
 
     /// The balance the last fill left, as `FillBook.balance`.
@@ -705,7 +902,7 @@ impl PyReplayLedger {
                 terms.currency.clone(),
             )
         };
-        let rows = self.report_rows(self.booking()?, size_increment);
+        let rows = self.ledger.report_rows(self.booking()?, size_increment);
         if rows.is_empty() {
             return Ok(None);
         }
@@ -859,6 +1056,56 @@ mod tests {
         ledger.fill(entry, 7, 1, 2.0, 10.0, 0.0, f64::NAN, 0.0);
         assert!(ledger.booking.is_none());
         assert_eq!(ledger.entries.len(), 2);
+    }
+
+    fn bits(values: &[f64]) -> Vec<u64> {
+        values.iter().map(|v| v.to_bits()).collect()
+    }
+
+    /// Orders decided at 30, 10, 40 and 20 that first fill in another order;
+    /// a partial fill, a second fill, a reduction, a cancel and a flip.
+    fn trade(ledger: &mut Ledger) {
+        for (buy, decided_ns) in [(true, 30), (true, 10), (false, 40), (false, 20)] {
+            ledger.submit(OrderRecord { buy, decided_ns, arrived_on_ns: decided_ns, ..order(buy) });
+        }
+        ledger.fill(0, 30, 1, 1.0, 10.0, 1.0, 0.0, 0.013);
+        ledger.fill(1, 31, 2, 2.0, 10.5, 0.0, 0.0, 0.021);
+        ledger.fill(0, 32, 1, 1.0, 10.25, 0.0, 0.0, 0.0105);
+        ledger.fill(3, 33, 4, 3.0, 11.0, 1.0, 2.0, 0.033);
+        ledger.end(3, EndStatus::Canceled, 34);
+        ledger.fill(2, 40, 3, 2.0, 9.5, 0.0, -0.5, 0.019);
+    }
+
+    #[test]
+    fn a_tally_reports_what_the_log_reports() {
+        let (mut logged, mut tally) = (Ledger::new(Some(terms())), Ledger::tally(terms()));
+        trade(&mut logged);
+        trade(&mut tally);
+        assert!(logged.logs() && !tally.logs());
+        assert!(tally.booked() && tally.entries.is_empty() && tally.fills.is_empty());
+        assert_eq!(tally.submitted(), 4);
+        let (want, got) = (logged.report_amounts().unwrap(), tally.report_amounts().unwrap());
+        assert_eq!(bits(&got.commission), bits(&want.commission));
+        assert_eq!(bits(&got.quantity), bits(&want.quantity));
+        assert_eq!(bits(&got.price), bits(&want.price));
+        // Sorted by when each was decided, not by when it first filled.
+        assert_eq!(got.quantity, vec![2.0, 3.0, 2.0, 2.0]);
+        assert_eq!(tally.reduction_times(), logged.reduction_times());
+        assert_eq!(tally.reduction_times(), Some(vec![33, 40]));
+        let (Some(book), Some(sums)) = (logged.booking.as_ref(), tally.tally.as_ref()) else {
+            panic!("both booked");
+        };
+        assert_eq!((sums.balance.to_bits(), sums.held), (book.balance.to_bits(), book.held));
+    }
+
+    #[test]
+    fn a_tally_stops_booking_where_python_would_raise() {
+        let mut tally = Ledger::tally(terms());
+        let entry = tally.submit(order(true));
+        tally.fill(entry, 7, 1, 2.0, 10.0, 0.0, f64::NAN, 0.0);
+        tally.fill(entry, 8, 1, 1.0, 10.0, 0.0, 0.0, 0.0);
+        assert!(!tally.booked());
+        assert!(tally.report_amounts().is_none() && tally.reduction_times().is_none());
     }
 
     #[test]

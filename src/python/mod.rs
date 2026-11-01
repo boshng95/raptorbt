@@ -6,6 +6,7 @@ pub mod data_bindings;
 pub mod fill_ledger;
 pub mod indicator_bindings;
 pub mod instrument_bindings;
+pub mod lean_bindings;
 pub mod money;
 pub mod numpy_bridge;
 pub mod portfolio_bindings;
