@@ -7,8 +7,9 @@
 //! entry side: its crossing only ever compares one resample bar's operands
 //! with the one before (every resample bar is visited, in order, and a
 //! primary visit repeats the operands it already holds), so whether a bar
-//! enters is a bit computed once for the whole series. The exit side's clock
-//! is only stepped while a position is held, so it stays a clock.
+//! enters is a bit computed once for the whole series -- once a call, for
+//! every cell on the same keys ([`Signals`]). The exit side's clock is only
+//! stepped while a position is held, so it stays a clock.
 //!
 //! A session filter (`slot_admits`) leaves a bar it does not admit unvisited:
 //! its keys do not update and no clock steps, so the crossings are between
@@ -19,6 +20,10 @@
 //! whose answer holds between composites, so a primary bar's visit can act
 //! again. Their cursor is `python::rule_session`'s `advance_level` and its
 //! condition program, branch for branch; every resample bar steps it.
+
+use std::collections::HashMap;
+use std::hash::Hash;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use super::Declined;
 
@@ -208,13 +213,107 @@ impl Dispatch {
     }
 }
 
+/// A slice's place in memory, standing for its contents within one call:
+/// the caller's arrays neither move nor change while it runs.
+type Place = (usize, usize);
+
+fn place<T>(slice: &[T]) -> Place {
+    (slice.as_ptr() as usize, slice.len())
+}
+
+/// A crossover operand as [`Signals`] keys it: a key's values by place, a
+/// constant by its bits.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum Side {
+    Key(Place),
+    Const(u64),
+}
+
+type Slot<T> = Arc<OnceLock<T>>;
+
+/// Slots by key, each made for the first cell that asks for it.
+type Slots<K, T> = Mutex<HashMap<K, Slot<T>>>;
+
+/// A crossover under a session filter: its operands and direction.
+type Crossover = (Option<Place>, Side, Side, bool);
+
+/// What the cells of one call on a [`Dispatch`] share, worked out for the
+/// first cell that reads it: each session filter's admitted bars, each key's
+/// first ready bar under a filter, and each crossover's crossings under a
+/// filter. A cell reads a crossing only after its own first ready bar
+/// ([`Stream::entry_bit`]), so one series serves every cell, whatever its
+/// other keys.
+pub struct Signals<'a> {
+    pub d: &'a Dispatch,
+    admitted: Slots<Option<Place>, Arc<[bool]>>,
+    ready: Slots<(Option<Place>, Place), Result<usize, Declined>>,
+    crossings: Slots<Crossover, Arc<[bool]>>,
+}
+
+impl<'a> Signals<'a> {
+    pub fn new(d: &'a Dispatch) -> Self {
+        Self { d, admitted: Mutex::default(), ready: Mutex::default(), crossings: Mutex::default() }
+    }
+
+    /// `key`'s slot in `map`, made where no cell has asked for it yet.
+    fn slot<K: Eq + Hash, T>(map: &Slots<K, T>, key: K) -> Slot<T> {
+        let mut map = map.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        Arc::clone(map.entry(key).or_default())
+    }
+
+    /// Per resample bar, whether `cross` on `values` crosses from the bar
+    /// `admitted` admits before; on every admitted bar but the first.
+    fn crossings(
+        &self,
+        filter: Option<Place>,
+        admitted: &[bool],
+        values: &[&[f64]],
+        cross: &Cross,
+    ) -> Arc<[bool]> {
+        let side = |operand: Operand| match operand {
+            Operand::Key(key) => Side::Key(place(values[key])),
+            Operand::Const(value) => Side::Const(value.to_bits()),
+        };
+        let key = (filter, side(cross.fast), side(cross.slow), cross.above);
+        let slot = Self::slot(&self.crossings, key);
+        let crossings = slot.get_or_init(|| {
+            let operand = |operand: Operand, r: usize| match operand {
+                Operand::Key(key) => values[key][r],
+                Operand::Const(value) => value,
+            };
+            let mut out = vec![false; admitted.len()];
+            let mut previous = None;
+            for r in (0..admitted.len()).filter(|&r| admitted[r]) {
+                let (a, b) = (operand(cross.fast, r), operand(cross.slow, r));
+                if let Some(previous) = previous {
+                    out[r] = crossed(previous, a, b, cross.above);
+                }
+                previous = Some((a, b));
+            }
+            out.into()
+        });
+        Arc::clone(crossings)
+    }
+}
+
+/// The first bar `admitted` admits on which `flags` is set, or the bar
+/// count; only an admitted bar's flags are read.
+fn first_ready(admitted: &[bool], flags: &[bool]) -> Result<usize, Declined> {
+    let n = flags.len();
+    let first = (0..n).find(|&r| admitted[r] && flags[r]).unwrap_or(n);
+    if (first..n).any(|r| admitted[r] && !flags[r]) {
+        return Err(Declined("a key that goes unready again"));
+    }
+    Ok(first)
+}
+
 /// One cell's decision stream: its keys' values on a [`Dispatch`]'s
 /// resample bars, and the crossings it trades.
 pub struct Stream<'a> {
     pub d: &'a Dispatch,
     pub values: Vec<&'a [f64]>,
     /// Per resample bar, whether the session filter admits its visit.
-    pub admitted: Vec<bool>,
+    pub admitted: Arc<[bool]>,
     /// Per primary bar, the same; None where every bar is.
     pub primary_admits: Option<&'a [bool]>,
     /// The first admitted resample bar on which every key is ready.
@@ -223,11 +322,14 @@ pub struct Stream<'a> {
     pub exit: Cross,
     /// Level rules, in place of `entry` and `exit`.
     pub tree: Option<&'a Tree>,
-    /// Per resample bar, whether its visit enters; empty under level rules.
-    pub entry_bits: Vec<bool>,
-    /// Per resample bar, whether its visit exits a position the admitted bar
-    /// before was visited holding; empty under level rules.
-    pub exit_bits: Vec<bool>,
+    /// Per resample bar, whether `entry` crosses from the admitted bar
+    /// before, as every cell on its keys reads it: this one's visit enters
+    /// only after its first ready bar ([`Stream::entry_bit`]). Empty under
+    /// level rules.
+    entry_crossings: Arc<[bool]>,
+    /// The same for `exit`: past the first ready bar, whether a visit exits
+    /// a position the admitted bar before was visited holding.
+    exit_crossings: Arc<[bool]>,
     pub dust: bool,
     pub position_required: bool,
     pub has_instrument: bool,
@@ -236,9 +338,11 @@ pub struct Stream<'a> {
 }
 
 impl<'a> Stream<'a> {
+    /// A cell on `signals`' dispatch, with what it shares with the other
+    /// cells there taken from `signals`.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        d: &'a Dispatch,
+        signals: &Signals<'a>,
         values: Vec<&'a [f64]>,
         init: &[&[bool]],
         admits: Option<&[bool]>,
@@ -252,6 +356,7 @@ impl<'a> Stream<'a> {
         size_increment: f64,
         minimum_notional: f64,
     ) -> Result<Self, Declined> {
+        let d = signals.d;
         let n = d.len();
         if tree.is_some() && !d.labels_rise {
             return Err(Declined("level rules on labels that do not rise"));
@@ -259,21 +364,20 @@ impl<'a> Stream<'a> {
         if values.is_empty() || init.len() != values.len() {
             return Err(Declined("no keys, or keys without their flags"));
         }
-        let admitted = admits.map_or_else(|| vec![true; n], <[bool]>::to_vec);
-        if admitted.len() != n {
+        if admits.is_some_and(|admits| admits.len() != n) {
             return Err(Declined("admits of another length"));
         }
+        let filter = admits.map(place);
+        let slot = Signals::slot(&signals.admitted, filter);
+        let admitted =
+            Arc::clone(slot.get_or_init(|| admits.map_or_else(|| vec![true; n].into(), Arc::from)));
         let mut ready = 0;
         for (key, flags) in init.iter().enumerate() {
             if flags.len() != n || values[key].len() != n {
                 return Err(Declined("key lengths differ"));
             }
-            // Only an admitted bar's flags are read.
-            let first = (0..n).find(|&r| admitted[r] && flags[r]).unwrap_or(n);
-            if (first..n).any(|r| admitted[r] && !flags[r]) {
-                return Err(Declined("a key that goes unready again"));
-            }
-            ready = ready.max(first);
+            let slot = Signals::slot(&signals.ready, (filter, place(flags)));
+            ready = ready.max((*slot.get_or_init(|| first_ready(&admitted, flags)))?);
         }
         // The first admitted bar from there.
         let ready = Stream::next_set(&admitted, ready);
@@ -287,7 +391,14 @@ impl<'a> Stream<'a> {
         {
             return Err(Declined("an operand names no key"));
         }
-        let mut stream = Self {
+        let (entry_crossings, exit_crossings) = match tree {
+            Some(_) => (Arc::from([]), Arc::from([])),
+            None => (
+                signals.crossings(filter, &admitted, &values, &entry),
+                signals.crossings(filter, &admitted, &values, &exit),
+            ),
+        };
+        Ok(Self {
             d,
             values,
             admitted,
@@ -296,19 +407,14 @@ impl<'a> Stream<'a> {
             entry,
             exit,
             tree,
-            entry_bits: Vec::new(),
-            exit_bits: Vec::new(),
+            entry_crossings,
+            exit_crossings,
             dust,
             position_required,
             has_instrument,
             size_increment,
             minimum_notional,
-        };
-        if tree.is_none() {
-            stream.entry_bits = stream.bits(&entry);
-            stream.exit_bits = stream.bits(&exit);
-        }
-        Ok(stream)
+        })
     }
 
     #[inline]
@@ -333,24 +439,26 @@ impl<'a> Stream<'a> {
             .map_or(bits.len(), |at| from + at)
     }
 
-    /// Per resample bar, whether `cross` crosses from the admitted bar
-    /// before; only on admitted bars after the first ready one, whose clock
-    /// starts there.
-    fn bits(&self, cross: &Cross) -> Vec<bool> {
-        let n = self.d.len();
-        let mut out = vec![false; n];
-        let mut previous = None;
-        for r in self.ready..n {
-            if !self.admitted[r] {
-                continue;
-            }
-            let (a, b) = self.operands(cross, r);
-            if let Some(previous) = previous {
-                out[r] = crossed(previous, a, b, cross.above);
-            }
-            previous = Some((a, b));
-        }
-        out
+    /// Whether resample bar `r`'s visit enters: `entry` crosses there from
+    /// the admitted bar before, on an admitted bar after the first ready one,
+    /// whose clock starts there.
+    #[inline]
+    pub fn entry_bit(&self, r: usize) -> bool {
+        r > self.ready && self.entry_crossings[r]
+    }
+
+    /// The first resample bar from `from` whose visit enters, or the bar
+    /// count.
+    #[inline]
+    pub fn next_entry(&self, from: usize) -> usize {
+        Self::next_set(&self.entry_crossings, from.max(self.ready + 1))
+    }
+
+    /// The first resample bar from `from` whose visit exits a position the
+    /// admitted bar before was visited holding, or the bar count.
+    #[inline]
+    pub fn next_exit(&self, from: usize) -> usize {
+        Self::next_set(&self.exit_crossings, from.max(self.ready + 1))
     }
 
     /// The last admitted resample bar in `from..to`.
@@ -519,7 +627,7 @@ impl Cursor {
     /// whose visit can act -- the next that enters. The visits before it
     /// see a flat book, step no exit clock and decide nothing.
     pub fn quiet_flat(&self, s: &Stream) -> usize {
-        Stream::next_set(&s.entry_bits, self.next_dispatch)
+        s.next_entry(self.next_dispatch)
     }
 
     /// Holding a lot no close reads as dust, with the exit clock on the bar
@@ -540,7 +648,7 @@ impl Cursor {
         if p0.to_bits() != a.to_bits() || p1.to_bits() != b.to_bits() {
             return None;
         }
-        Some(Stream::next_set(&s.exit_bits, self.next_dispatch))
+        Some(s.next_exit(self.next_dispatch))
     }
 
     /// Take the quiet visits of resample bars `next_dispatch..to`, flat or
@@ -635,7 +743,7 @@ impl Cursor {
             if bar < s.ready {
                 return None;
             }
-            (bar, s.entry_bits[bar])
+            (bar, s.entry_bit(bar))
         };
         let mut exit = false;
         if position != 0 {

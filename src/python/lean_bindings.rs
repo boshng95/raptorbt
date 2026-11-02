@@ -28,7 +28,9 @@ use super::rule_session::{QuietParams, QuietTuple};
 use crate::lean::kernel::{Terms, Trade};
 use crate::lean::market::Market;
 use crate::lean::replay::{replay, Cell, Frame, Outcome};
-use crate::lean::rules::{Compare, Condition, Cross, Dispatch, Level, Operand, Stream, Tree};
+use crate::lean::rules::{
+    Compare, Condition, Cross, Dispatch, Level, Operand, Signals, Stream, Tree,
+};
 use crate::lean::Declined;
 use crate::metrics::canonical::{calculate, LocalClock, ReportInputs, Value};
 
@@ -269,6 +271,8 @@ struct Shared<'a> {
     /// None where the offsets do not make a clock, and no cell reports.
     clock: Option<LocalClock>,
     jumps: bool,
+    /// What the cells share on the frame's dispatch.
+    signals: Signals<'a>,
 }
 
 impl<'a> Shared<'a> {
@@ -321,6 +325,7 @@ impl<'a> Shared<'a> {
             timezone,
             clock: LocalClock::new(offsets, offsets_until_ns),
             jumps,
+            signals: Signals::new(&frame.frame.dispatch),
         }
     }
 
@@ -452,7 +457,7 @@ fn run(
     let frame = shared.frame;
     let entered = Instant::now();
     let stream = Stream::new(
-        &frame.frame.dispatch,
+        &shared.signals,
         spec.values.clone(),
         &spec.init,
         spec.admits,
