@@ -310,7 +310,12 @@ fn amounts(terms: &BookTerms, rows: impl Iterator<Item = (f64, f64, f64)>) -> Op
             }
         }
     };
-    let mut amounts = FillAmounts::default();
+    let rows_hint = rows.size_hint().0;
+    let mut amounts = FillAmounts {
+        commission: Vec::with_capacity(rows_hint),
+        quantity: Vec::with_capacity(rows_hint),
+        price: Vec::with_capacity(rows_hint),
+    };
     for (commission, filled, avg_px) in rows {
         amounts.commission.push(read(commission + 0.0, terms.currency_precision as usize)? + 0.0);
         amounts.quantity.push(read(filled, terms.size_precision)?);
@@ -391,6 +396,10 @@ impl Ledger {
     }
 
     /// Record an order; its index names it from here on.
+    ///
+    /// Inline, so a tally takes its three fields where the caller built
+    /// them rather than reading back the record it just wrote.
+    #[inline]
     pub(crate) fn submit(&mut self, order: OrderRecord) -> u32 {
         if let Some(tally) = self.tally.as_mut() {
             tally.orders.push(Slip {
@@ -401,6 +410,11 @@ impl Ledger {
             });
             return tally.orders.len() as u32 - 1;
         }
+        self.submit_logged(order)
+    }
+
+    #[inline(never)]
+    fn submit_logged(&mut self, order: OrderRecord) -> u32 {
         let index = self.orders.len() as u32;
         self.orders.push(order);
         self.entries.push(Entry::Submit(index));

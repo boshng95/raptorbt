@@ -31,6 +31,62 @@ const MAX_TOTAL_SCALE: u32 = 22;
 /// Integers above this are no longer exactly representable in `f64`.
 const MAX_EXACT_INT: i128 = 1i128 << 53;
 
+/// `10**k` for `k` in `0..=22`, each exact in a float.
+const EXACT_POWERS: [f64; 23] = [
+    1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15, 1e16,
+    1e17, 1e18, 1e19, 1e20, 1e21, 1e22,
+];
+
+/// `10_f64.powi(k)`. Through `1e22` every product `powi` forms is exact, so
+/// the table holds the same float without the call.
+#[inline]
+pub(crate) fn pow10_f64(k: u32) -> f64 {
+    match EXACT_POWERS.get(k as usize) {
+        Some(&power) => power,
+        None => 10_f64.powi(k as i32),
+    }
+}
+
+/// `x.round()`, half away from zero. On x86-64 `round` is a software
+/// routine, while SSE4.1 truncates in hardware; `x - x.trunc()` is exact,
+/// so comparing it with a half decides the same float.
+#[inline]
+pub(crate) fn round_half_away(x: f64) -> f64 {
+    #[cfg(all(target_arch = "x86_64", target_feature = "sse4.1"))]
+    {
+        let whole = x.trunc();
+        if (x - whole).abs() >= 0.5 {
+            whole + x.signum()
+        } else {
+            whole
+        }
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "sse4.1")))]
+    {
+        x.round()
+    }
+}
+
+/// `a.checked_mul(b)`, one machine multiply where both fit 64 bits: their
+/// product always fits 128, and the checked `i128` multiply is a call.
+#[inline]
+pub(crate) fn mul_i128(a: i128, b: i128) -> Option<i128> {
+    match (i64::try_from(a), i64::try_from(b)) {
+        (Ok(a), Ok(b)) => Some(i128::from(a) * i128::from(b)),
+        _ => a.checked_mul(b),
+    }
+}
+
+/// `c as f64`: a 64-bit conversion where `c` fits, which rounds the same
+/// and is one instruction rather than a call.
+#[inline]
+pub(crate) fn i128_to_f64(c: i128) -> f64 {
+    match i64::try_from(c) {
+        Ok(c) => c as f64,
+        Err(_) => c as f64,
+    }
+}
+
 /// The scale that expresses `value` as an integer, if a short decimal does.
 ///
 /// Searched smallest-first so `0.001` is found at three digits rather than
@@ -47,14 +103,15 @@ fn decimal_scale(value: f64) -> Option<(i128, u32)> {
         return None;
     }
     for scale in 0..=MAX_SCALE {
-        let scaled = value * 10f64.powi(scale as i32);
+        let scaled = value * pow10_f64(scale);
         if scaled.abs() >= MAX_EXACT_INT as f64 {
             return None;
         }
-        let nearest = scaled.round();
+        let nearest = round_half_away(scaled);
         let drift = scaled.abs().max(1.0) * f64::EPSILON * 16.0;
         if (scaled - nearest).abs() <= drift {
-            return Some((nearest as i128, scale));
+            // At most `2**53`, so the 64-bit conversion is exact.
+            return Some((i128::from(nearest as i64), scale));
         }
     }
     None
@@ -73,13 +130,13 @@ pub(crate) fn decimal_product(factors: &[f64]) -> Option<f64> {
     let mut total_scale: u32 = 0;
     for &factor in factors {
         let (scaled, scale) = decimal_scale(factor)?;
-        mantissa = mantissa.checked_mul(scaled)?;
+        mantissa = mul_i128(mantissa, scaled)?;
         total_scale = total_scale.checked_add(scale)?;
         if mantissa.abs() >= MAX_EXACT_INT || total_scale > MAX_TOTAL_SCALE {
             return None;
         }
     }
-    Some(mantissa as f64 / 10f64.powi(total_scale as i32))
+    Some(i128_to_f64(mantissa) / pow10_f64(total_scale))
 }
 
 /// The sum of two decimals, as the `f64` nearest to it.
@@ -99,7 +156,7 @@ pub(crate) fn decimal_sum(a: f64, b: f64) -> Option<f64> {
     if total.abs() >= MAX_EXACT_INT {
         return None;
     }
-    Some(total as f64 / 10f64.powi(scale as i32))
+    Some(i128_to_f64(total) / pow10_f64(scale))
 }
 
 /// Round a settlement-currency amount to the currency's own precision.
@@ -114,8 +171,8 @@ pub(crate) fn quantize_money(value: f64, precision: Option<u32>) -> f64 {
     let Some(precision) = precision else {
         return value;
     };
-    let factor = 10_f64.powi(precision.min(15) as i32);
-    (value * factor).round() / factor
+    let factor = pow10_f64(precision.min(15));
+    round_half_away(value * factor) / factor
 }
 
 #[cfg(test)]
@@ -183,6 +240,66 @@ mod tests {
                 "{a} * {b}: exact={exact}, plain={}",
                 a * b
             );
+        }
+    }
+
+    /// Bit patterns spread over every exponent, and the halves, ties and
+    /// specials a rounding rule gets wrong.
+    fn bit_floats() -> Vec<f64> {
+        let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut out: Vec<f64> = (0..200_000)
+            .map(|_| {
+                state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+                let mut z = state;
+                z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+                f64::from_bits(z ^ (z >> 31))
+            })
+            .collect();
+        for k in -3000..3000 {
+            let half = k as f64 + 0.5;
+            out.extend([half, -half, half / 1024.0, k as f64 * 1e-3, k as f64 * 0.1 + 0.05]);
+        }
+        let big = (1_u64 << 52) as f64;
+        out.extend([
+            0.0, -0.0, 0.5, -0.5, 1.5, 2.5, 0.49999999999999994, -0.49999999999999994,
+            big - 0.5, big + 1.0, 2.0 * big - 1.0, -(big - 0.5), f64::MIN_POSITIVE,
+            5e-324, f64::MAX, f64::MIN, f64::INFINITY, f64::NEG_INFINITY, f64::NAN,
+        ]);
+        out
+    }
+
+    #[test]
+    fn round_half_away_is_round() {
+        for x in bit_floats() {
+            let (ours, std) = (round_half_away(x), x.round());
+            assert!(ours.to_bits() == std.to_bits() || (ours.is_nan() && std.is_nan()), "{x:e}");
+        }
+    }
+
+    #[test]
+    fn the_power_table_is_powi() {
+        for k in 0..=40 {
+            assert_eq!(pow10_f64(k).to_bits(), 10_f64.powi(k as i32).to_bits(), "{k}");
+        }
+    }
+
+    #[test]
+    fn the_fast_paths_answer_as_i128_does() {
+        let edges = [
+            0_i128, 1, -1, 10, i64::MAX as i128, i64::MIN as i128, i64::MAX as i128 + 1,
+            i64::MIN as i128 - 1, 1 << 53, (1 << 53) + 1, 1 << 100, -(1 << 100), i128::MAX,
+            i128::MIN, 10_i128.pow(28) - 1, 123_456_789_012_345_678,
+        ];
+        for &a in &edges {
+            assert_eq!(i128_to_f64(a).to_bits(), (a as f64).to_bits(), "{a}");
+            for &b in &edges {
+                assert_eq!(mul_i128(a, b), a.checked_mul(b), "{a} * {b}");
+            }
+        }
+        for x in bit_floats() {
+            let c = x as i128;
+            assert_eq!(i128_to_f64(c).to_bits(), (c as f64).to_bits(), "{c}");
         }
     }
 }

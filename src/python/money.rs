@@ -22,11 +22,36 @@ use std::cmp::Ordering;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
+use crate::core::decimals::{i128_to_f64, mul_i128, pow10_f64, round_half_away};
+
 /// `10**28`: one past the largest coefficient `Decimal` keeps exact.
 const DIGITS: i128 = 10_000_000_000_000_000_000_000_000_000;
 
+/// `10**k` for `k` in `0..=38`, every power an `i128` holds.
+const POWERS: [i128; 39] = {
+    let mut powers = [1_i128; 39];
+    let mut k = 1;
+    while k < powers.len() {
+        powers[k] = powers[k - 1] * 10;
+        k += 1;
+    }
+    powers
+};
+
 fn pow10(n: u32) -> Option<i128> {
-    10_i128.checked_pow(n)
+    POWERS.get(n as usize).copied()
+}
+
+/// `(a / d, a % d)` for a positive `d`: one 64-bit division where both fit,
+/// as the `i128` division is a call.
+#[inline]
+fn div_rem(a: i128, d: i128) -> (i128, i128) {
+    if let (Ok(x), Ok(y)) = (i64::try_from(a), i64::try_from(d)) {
+        if y > 0 {
+            return (i128::from(x / y), i128::from(x % y));
+        }
+    }
+    (a / d, a % d)
 }
 
 /// `10**k` for `k` in `0..=22`, each exact in a float.
@@ -61,7 +86,7 @@ fn scaled_half_even_clear(x: f64, precision: u32) -> Option<(u64, bool)> {
         return None;
     }
     // Below `2**53 * 10**22 < 2**127`.
-    let step = 10_u128.pow(precision);
+    let step = POWERS[precision as usize] as u128;
     let product = u128::from(mantissa) * step;
     let shift = shift as u32;
     // A float step of `x` is one unit of the mantissa, so `step` of these.
@@ -182,28 +207,43 @@ impl Dec {
     /// exact operands -- is the correctly rounded read of `c`e`-k`. The
     /// fewest places with an answer are the fewest digits, which is the
     /// shortest repr. `None` past that range, for the spelling to answer.
+    ///
+    /// An answer at `k` places is one at every `k' > k` still below `2**51`:
+    /// `c * 10**(k' - k)` reads back as `|x|` and is the one such integer
+    /// there. So only the most places below `2**51` are tried, and dropping
+    /// the trailing zeros leaves the digits the fewest places give.
     fn shortest(x: f64) -> Option<Dec> {
         const LIMIT: f64 = (1_u64 << 51) as f64;
         let magnitude = x.abs();
         if magnitude == 0.0 {
             return Some(Dec::ZERO);
         }
-        for (places, scale) in EXACT.iter().enumerate() {
-            let scaled = magnitude * scale;
-            if scaled >= LIMIT {
-                return None;
-            }
-            let units = scaled.round();
-            if units != 0.0 && units / scale == magnitude {
-                let (mut c, mut e) = (units as i128, -(places as i32));
-                while c % 10 == 0 {
-                    c /= 10;
-                    e += 1;
-                }
-                return Some(Dec { c: if x < 0.0 { -c } else { c }, e });
+        // `10**places` below `2**(50 - e)` keeps a float under `2**(e + 1)`
+        // below `2**51`; the most places are that many or one more.
+        let e = ((magnitude.to_bits() >> 52) as i64) - 1023;
+        let mut places = (((50 - e).max(0) * 78_913) >> 18).min(EXACT.len() as i64 - 1) as usize;
+        if places + 1 < EXACT.len() && magnitude * EXACT[places + 1] < LIMIT {
+            places += 1;
+        }
+        while magnitude * EXACT[places] >= LIMIT {
+            places = places.checked_sub(1)?;
+        }
+        let scale = EXACT[places];
+        let units = round_half_away(magnitude * scale);
+        if units == 0.0 || units / scale != magnitude {
+            return None;
+        }
+        // Below `2**51`, so the digits come off in 64 bits, and they end in
+        // at most fifteen zeros.
+        let (mut c, mut e) = (units as u64, -(places as i32));
+        for (power, zeros) in [(100_000_000, 8), (10_000, 4), (100, 2), (10, 1)] {
+            if c % power == 0 {
+                c /= power;
+                e += zeros;
             }
         }
-        None
+        let c = i128::from(c);
+        Some(Dec { c: if x < 0.0 { -c } else { c }, e })
     }
 
     /// A decimal literal, as `Decimal(text)` reads it, trailing zeros dropped.
@@ -246,7 +286,7 @@ impl Dec {
     fn to_f64(self) -> f64 {
         // Both operands exact, so the one operation rounds once.
         if self.c.unsigned_abs() < (1_u128 << 53) && self.e.unsigned_abs() <= 22 {
-            let c = self.c as f64;
+            let c = self.c as i64 as f64;
             let scale = EXACT[self.e.unsigned_abs() as usize];
             return if self.e >= 0 { c * scale } else { c / scale };
         }
@@ -255,18 +295,27 @@ impl Dec {
 
     /// The approximate value, for a search's first guess only.
     fn approx(self) -> f64 {
-        self.c as f64 * 10_f64.powi(self.e)
+        let scale = match self.e {
+            0..=22 => pow10_f64(self.e as u32),
+            // `powi` takes the reciprocal of the positive power.
+            -22..=-1 => 1.0 / pow10_f64(self.e.unsigned_abs()),
+            _ => 10_f64.powi(self.e),
+        };
+        i128_to_f64(self.c) * scale
     }
 
     fn mul(self, other: Dec) -> Option<Dec> {
-        Dec::checked(self.c.checked_mul(other.c)?, self.e.checked_add(other.e)?)
+        Dec::checked(mul_i128(self.c, other.c)?, self.e.checked_add(other.e)?)
     }
 
     /// Both coefficients on the finer exponent.
     fn align(self, other: Dec) -> Option<(i128, i128, i32)> {
+        if self.e == other.e {
+            return Some((self.c, other.c, self.e));
+        }
         let e = self.e.min(other.e);
-        let a = self.c.checked_mul(pow10((self.e - e) as u32)?)?;
-        let b = other.c.checked_mul(pow10((other.e - e) as u32)?)?;
+        let a = mul_i128(self.c, pow10((self.e - e) as u32)?)?;
+        let b = mul_i128(other.c, pow10((other.e - e) as u32)?)?;
         Some((a, b, e))
     }
 
@@ -293,12 +342,15 @@ impl Dec {
     /// `quantize(Decimal(1).scaleb(e), rounding)`.
     fn quantize(self, e: i32, rounding: Rounding) -> Option<Dec> {
         if self.e >= e {
-            return Dec::checked(self.c.checked_mul(pow10((self.e - e) as u32)?)?, e);
+            return Dec::checked(mul_i128(self.c, pow10((self.e - e) as u32)?)?, e);
         }
         let shift = (self.e as i64 - e as i64).unsigned_abs();
         // A coefficient below `10**28` is under half of `10**38`'s step.
         let (q, r, half) = match u32::try_from(shift).ok().and_then(pow10) {
-            Some(d) => (self.c / d, self.c % d, (2 * (self.c % d).abs()).cmp(&d)),
+            Some(d) => {
+                let (q, r) = div_rem(self.c, d);
+                (q, r, (2 * r.abs()).cmp(&d))
+            }
             None => (0, self.c, Ordering::Less),
         };
         let q = match rounding {
@@ -322,10 +374,11 @@ impl Dec {
         }
         let mut numerator = self.c;
         for shift in 0..=28 {
-            if numerator % other.c == 0 {
-                return Dec::checked(numerator / other.c, self.e - other.e - shift);
+            let (quotient, rest) = div_rem(numerator, other.c);
+            if rest == 0 {
+                return Dec::checked(quotient, self.e - other.e - shift);
             }
-            numerator = numerator.checked_mul(10)?;
+            numerator = mul_i128(numerator, 10)?;
         }
         None
     }
@@ -333,11 +386,11 @@ impl Dec {
     /// `floor(self / other)` for two positive values.
     fn floor_div(self, other: Dec) -> Option<i128> {
         if self.e >= other.e {
-            let numerator = self.c.checked_mul(pow10((self.e - other.e) as u32)?)?;
-            Some(numerator / other.c)
+            let numerator = mul_i128(self.c, pow10((self.e - other.e) as u32)?)?;
+            Some(div_rem(numerator, other.c).0)
         } else {
-            match pow10((other.e - self.e) as u32).and_then(|d| other.c.checked_mul(d)) {
-                Some(denominator) => Some(self.c / denominator),
+            match pow10((other.e - self.e) as u32).and_then(|d| mul_i128(other.c, d)) {
+                Some(denominator) => Some(div_rem(self.c, denominator).0),
                 // A denominator past `i128` exceeds every coefficient.
                 None => Some(0),
             }
@@ -411,7 +464,7 @@ impl Cost {
     }
 
     fn lots(&self, count: i128) -> Option<Dec> {
-        Dec::checked(count.checked_mul(self.lot.c)?, self.lot.e)
+        Dec::checked(mul_i128(count, self.lot.c)?, self.lot.e)
     }
 
     /// `affordable_quantity`: the most whole lots `cash` buys at `price`.
@@ -445,7 +498,7 @@ impl Cost {
         }
         // The last affordable count is below `most`; guess it from the
         // average cost of a lot there, then bracket it.
-        let guess = (most as f64 * (c.approx() / cost_most.approx())).floor();
+        let guess = (i128_to_f64(most) * (c.approx() / cost_most.approx())).floor();
         let guess = if guess.is_finite() { (guess as i128).clamp(0, most - 1) } else { 0 };
         let (mut lo, mut hi) = (0, most);
         if affordable(guess)? {
@@ -527,12 +580,17 @@ impl Grid {
         // `float(Price(rounded, price_precision))`: Nautilus scales by the
         // precision in floats, rounds half away from zero and keeps the
         // fixed-point raw, which `float` divides back out.
-        let units = (rounded * 10_f64.powi(self.price_precision)).round();
+        let scale = match u32::try_from(self.price_precision) {
+            Ok(precision) => pow10_f64(precision),
+            Err(_) => 10_f64.powi(self.price_precision),
+        };
+        let units = round_half_away(rounded * scale);
         if !(units.abs() < 1e17) {
             return None;
         }
-        let raw = (units as i128).checked_mul(pow10(16 - self.price_precision as u32)?)?;
-        Some(raw as f64 / 1e16)
+        // Below `1e17`, so the 64-bit conversion is exact.
+        let raw = mul_i128(i128::from(units as i64), pow10(16 - self.price_precision as u32)?)?;
+        Some(i128_to_f64(raw) / 1e16)
     }
 }
 
@@ -796,6 +854,50 @@ mod tests {
             }
         }
         values
+    }
+
+    /// `Dec::shortest` as it tried every number of places from none up.
+    fn shortest_by_places(x: f64) -> Option<Dec> {
+        const LIMIT: f64 = (1_u64 << 51) as f64;
+        let magnitude = x.abs();
+        if magnitude == 0.0 {
+            return Some(Dec::ZERO);
+        }
+        for (places, scale) in EXACT.iter().enumerate() {
+            let scaled = magnitude * scale;
+            if scaled >= LIMIT {
+                return None;
+            }
+            let units = round_half_away(scaled);
+            if units != 0.0 && units / scale == magnitude {
+                let (mut c, mut e) = (units as u64, -(places as i32));
+                while c % 10 == 0 {
+                    c /= 10;
+                    e += 1;
+                }
+                let c = i128::from(c);
+                return Some(Dec { c: if x < 0.0 { -c } else { c }, e });
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn the_most_places_answer_as_the_fewest_do() {
+        let mut values = awkward_floats();
+        // Whole numbers and short decimals at every magnitude, where the
+        // zeros to drop run longest.
+        for digits in [1_u64, 7, 25, 100, 123_456, 1_000_000, 999_999_999_999_999] {
+            for places in 0..24 {
+                values.push(digits as f64 / 10_f64.powi(places));
+                values.push(digits as f64 * 10_f64.powi(places));
+            }
+        }
+        values.extend([2_f64.powi(51), 2_f64.powi(51) - 1.0, 2_f64.powi(51) - 0.5, 1e-22, 4e-23]);
+        for x in values {
+            let (fast, slow) = (Dec::shortest(x), shortest_by_places(x));
+            assert_eq!(fast.map(|d| (d.c, d.e)), slow.map(|d| (d.c, d.e)), "{x:e}");
+        }
     }
 
     #[test]

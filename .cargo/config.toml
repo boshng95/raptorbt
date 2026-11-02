@@ -1,0 +1,6 @@
+# Linux x86-64 builds assume AVX2 (x86-64-v3, CPUs from 2013 on): the
+# replay's exact rounding and float conversions compile to single instructions
+# there instead of library calls, about 5% of a lean cell. The answers are the
+# baseline build's, bit for bit. RUSTFLAGS, where set, replaces this.
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "target-cpu=x86-64-v3"]

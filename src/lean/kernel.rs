@@ -508,13 +508,28 @@ impl<'m> Kernel<'m> {
         self.last_bar = Some(last);
     }
 
+    /// `events.append(&mut self.pending)`. The caller's list is usually
+    /// empty, and then trading the two buffers moves the same events in the
+    /// same order without copying them.
+    #[inline]
+    fn take_pending(&mut self, events: &mut Vec<Event>) {
+        if self.pending.is_empty() {
+            return;
+        }
+        if events.is_empty() {
+            std::mem::swap(events, &mut self.pending);
+        } else {
+            events.append(&mut self.pending);
+        }
+    }
+
     /// `EngineKernel::step` on bar `i`.
     pub fn step(&mut self, i: usize, events: &mut Vec<Event>) {
         self.last_bar = Some(i);
         if self.idle() {
             return;
         }
-        events.append(&mut self.pending);
+        self.take_pending(events);
         self.match_events(i, events);
         self.sweep_markets(i, self.m.ts[i], events);
     }
@@ -583,7 +598,12 @@ impl<'m> Kernel<'m> {
                 None => {}
             }
         }
-        for outcome in expiries.drain(..).chain(actions.drain(..)) {
+        // Two loops rather than a chained iterator, which moved each outcome
+        // through the stack in pieces.
+        for outcome in expiries.drain(..) {
+            self.apply(i, ts, outcome, events);
+        }
+        for outcome in actions.drain(..) {
             self.apply(i, ts, outcome, events);
         }
         self.expiries = expiries;
@@ -594,7 +614,7 @@ impl<'m> Kernel<'m> {
     /// orders its own fills provoked. No expiry, no replay.
     pub fn walk_book(&mut self, now: i64, events: &mut Vec<Event>) {
         let Some(i) = self.last_bar else { return };
-        events.append(&mut self.pending);
+        self.take_pending(events);
         let book = self.m.book_after(i);
         let orders = &self.orders;
         self.working.retain(|&id| !orders[id].status.terminal());
