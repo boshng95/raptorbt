@@ -535,11 +535,62 @@ fn report(
     Some((report, fills.price.len(), closed))
 }
 
+/// CPython 3.12's `sum()` of floats from its int start 0: the first term
+/// added to 0 (a -0.0 reads 0.0), the rest by Neumaier's compensated sum,
+/// whose compensation is added last where nonzero and finite.
+#[derive(Default)]
+struct PySum {
+    terms: usize,
+    total: f64,
+    compensation: f64,
+}
+
+impl PySum {
+    fn add(&mut self, x: f64) {
+        if self.terms == 0 {
+            self.total = 0.0 + x;
+        } else {
+            let t = self.total + x;
+            if self.total.abs() >= x.abs() {
+                self.compensation += (self.total - t) + x;
+            } else {
+                self.compensation += (x - t) + self.total;
+            }
+            self.total = t;
+        }
+        self.terms += 1;
+    }
+
+    fn value(&self) -> f64 {
+        if self.compensation != 0.0 && self.compensation.is_finite() {
+            self.total + self.compensation
+        } else {
+            self.total
+        }
+    }
+}
+
+/// What the sweep's legacy trade columns read of closed trades' P&Ls:
+/// `(trades, wins, the wins' sum, losses, the losses' sum)`, a win strictly
+/// positive and a loss at most zero (a NaN is neither), each sum Python's
+/// own (`legacy_closed_trade_stats`).
+fn closed_trade_tally(pnls: &[f64]) -> (usize, usize, f64, usize, f64) {
+    let (mut wins, mut losses) = (PySum::default(), PySum::default());
+    for &pnl in pnls {
+        if pnl > 0.0 {
+            wins.add(pnl);
+        } else if pnl <= 0.0 {
+            losses.add(pnl);
+        }
+    }
+    (pnls.len(), wins.terms, wins.value(), losses.terms, losses.value())
+}
+
 /// A replayed cell as a dict: `report`, `total_trades`,
-/// `closed_trade_pnls`, `end_value`, `secs` (the replay's), `split` (the
-/// stream's setup, the report's) and `stats` (bars stepped, jumps,
-/// callbacks), with its daily curve as `day_ns` and `day_equity` where
-/// *curve*.
+/// `closed_trade_pnls` and their `closed_trade_tally`, `end_value`, `secs`
+/// (the replay's), `split` (the stream's setup, the report's) and `stats`
+/// (bars stepped, jumps, callbacks), with its daily curve as `day_ns` and
+/// `day_equity` where *curve*.
 fn to_dict(py: Python<'_>, ran: &Ran, curve: bool) -> PyResult<PyObject> {
     let out = PyDict::new(py);
     match &ran.report {
@@ -547,11 +598,13 @@ fn to_dict(py: Python<'_>, ran: &Ran, curve: bool) -> PyResult<PyObject> {
             out.set_item("report", to_python(py, report)?)?;
             out.set_item("total_trades", orders)?;
             out.set_item("closed_trade_pnls", PyList::new(py, closed))?;
+            out.set_item("closed_trade_tally", closed_trade_tally(closed))?;
         }
         None => {
             out.set_item("report", py.None())?;
             out.set_item("total_trades", py.None())?;
             out.set_item("closed_trade_pnls", py.None())?;
+            out.set_item("closed_trade_tally", py.None())?;
         }
     }
     out.set_item("end_value", ran.end_value)?;
@@ -961,4 +1014,36 @@ pub fn lean_replay_many(
         return Ok((out, secs).into_py(py));
     }
     Ok(out.into_py(py))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn py_sum(terms: &[f64]) -> f64 {
+        let mut sum = PySum::default();
+        terms.iter().for_each(|&x| sum.add(x));
+        sum.value()
+    }
+
+    #[test]
+    fn sums_floats_as_python_does() {
+        // CPython 3.12's own answers, where a plain left fold differs.
+        assert_eq!(py_sum(&[0.1; 10]), 1.0);
+        assert_eq!(py_sum(&[1e100, 1.0, -1e100, 1.0]), 2.0);
+        assert_eq!(py_sum(&[-0.0]).to_bits(), 0.0f64.to_bits());
+        assert_eq!(py_sum(&[f64::INFINITY, 1.0]), f64::INFINITY);
+        assert!(py_sum(&[f64::INFINITY, f64::NEG_INFINITY]).is_nan());
+    }
+
+    #[test]
+    fn tallies_wins_and_the_rest_as_the_legacy_columns_do() {
+        let pnls = [3.25, -1.5, 0.1, -0.0, 0.2, -2.75, 0.3, 1e-9];
+        let (trades, wins, won, losses, lost) = closed_trade_tally(&pnls);
+        assert_eq!((trades, wins, losses), (8, 5, 3));
+        assert_eq!(won.to_bits(), 0x400e_cccc_ccef_28e5);
+        assert_eq!(lost, -4.25);
+        // A NaN counts as a trade in neither bucket.
+        assert_eq!(closed_trade_tally(&[f64::NAN, 1.0]), (2, 1, 1.0, 0, 0.0));
+    }
 }

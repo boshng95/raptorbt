@@ -144,6 +144,9 @@ struct Replay<'a> {
     /// The flat cash check's need at the highest close, where it bounds
     /// the need at every close.
     need_top: Option<f64>,
+    /// The advance a scan ran on the due bar it stopped at, which that
+    /// bar's callback takes instead of running it again.
+    advanced: Option<(usize, Option<Target>)>,
     /// The highest close before the next dispatch, which every bar of a
     /// dispatch window asks for again.
     highs: RefCell<Highs>,
@@ -220,6 +223,7 @@ pub(crate) fn replay(
         callbacks: 0,
         far,
         need_top,
+        advanced: None,
         highs: RefCell::default(),
         ledger: match book {
             Some(terms) if !log => Ledger::tally(terms),
@@ -294,11 +298,11 @@ impl Replay<'_> {
         while i < n {
             if self.jumps
                 && !self.bar_callback_required
+                && self.advanced.is_none()
                 && self.commands.is_empty()
                 && self.k.idle()
             {
-                let due = self.mask_at.get(next_due).copied().unwrap_or(n);
-                let to = self.quiet_until(i, due);
+                let to = self.quiet_until(i, next_due)?;
                 if to > i {
                     // The bars between only mark the curve, on an account
                     // nothing touches.
@@ -342,19 +346,92 @@ impl Replay<'_> {
     }
 
     /// With no callback owed, nothing queued and nothing working at bar
-    /// `i`: the first bar from `i` that can act, `due` the next due bar.
-    /// The cursor takes the visits of the bars before it.
-    fn quiet_until(&mut self, i: usize, due: usize) -> usize {
+    /// `i`: the first bar from `i` that can act, `mask_at[next_due]` the
+    /// next due bar. The cursor takes the visits of the bars before it.
+    fn quiet_until(&mut self, i: usize, next_due: usize) -> Result<usize, Declined> {
         if self.far {
             if let Some((r, held)) = self.quiet_visits() {
-                let to = self.s.d.pos.get(r).copied().unwrap_or(self.m.len());
+                let n = self.m.len();
+                let to = self.s.d.pos.get(r).copied().unwrap_or(n);
                 if to > i {
                     self.cursor.pass(self.s, r, held);
-                    return to;
+                    return Ok(to);
+                }
+                // The visit that acts is this bar's own.
+                return Ok(self.mask_at.get(next_due).copied().unwrap_or(n));
+            }
+        }
+        self.quiet_scan(next_due)
+    }
+
+    /// Where the visits cannot be passed unread: the callbacks of the due
+    /// bars from `mask_at[next_due]`, run as `on_bar` runs them on an
+    /// account nothing touches, up to the first that decides something or
+    /// owes the next bar a callback. That bar's own callback takes the
+    /// advance run on it here.
+    ///
+    /// Flat, the cash check passes at every close on a balance nothing
+    /// moves. Held, a bar's callback is quiet where its close reads no dust
+    /// and its exits stay shut.
+    #[inline(never)]
+    fn quiet_scan(&mut self, mut next_due: usize) -> Result<usize, Declined> {
+        let n = self.m.len();
+        let due = self.mask_at.get(next_due).copied().unwrap_or(n);
+        if self.pending_target.is_some()
+            || self.working_orders != 0
+            || self.working_entry
+            || self.cash_halted
+        {
+            return Ok(due);
+        }
+        let (has_position, net_position) = self.k.net_position();
+        if !has_position {
+            let Some(need_top) = self.need_top else { return Ok(due) };
+            if self.account_quantity != 0.0 {
+                return Ok(due);
+            }
+            let q = self.quiet;
+            let Ok(cash) = self.strategy_cash() else { return Ok(due) };
+            let mut funds = cash * q.fraction;
+            if funds > q.cap {
+                funds = q.cap;
+            }
+            if !(funds >= need_top && funds >= q.need_at_highest) {
+                return Ok(due);
+            }
+        }
+        while let Some(&at) = self.mask_at.get(next_due) {
+            let target = self.advance(at)?;
+            let quiet = target.is_none()
+                && !self.cursor.visit_primary_after_fill
+                && (!has_position
+                    || !(self.holds_flat_dust(at, has_position, net_position)
+                        || self.cursor.held_reopens(
+                            self.s,
+                            &self.m.close,
+                            at,
+                            has_position,
+                            net_position,
+                            self.pending_target,
+                        )));
+            if !quiet {
+                self.advanced = Some((at, target));
+                return Ok(at);
+            }
+            self.callbacks += 1;
+            next_due += 1;
+            // What the next bar would try first: passing the visits unread.
+            if self.far {
+                if let Some((r, held)) = self.quiet_visits() {
+                    let to = self.s.d.pos.get(r).copied().unwrap_or(n);
+                    if to > at + 1 {
+                        self.cursor.pass(self.s, r, held);
+                        return Ok(to);
+                    }
                 }
             }
         }
-        due
+        Ok(n)
     }
 
     /// The first resample bar whose visit can act, and whether the book is
@@ -494,14 +571,26 @@ impl Replay<'_> {
     // -- the strategy: `SignalReplay` ---------------------------------------
 
     fn on_bar(&mut self, i: usize) -> Result<(), Declined> {
+        // A scan stops with nothing pending: nothing reconciles before the
+        // advance it ran.
+        let advanced = match self.advanced.take() {
+            Some((at, target)) if at == i => Some(target),
+            Some(_) => return Err(Declined("an advance run for another bar")),
+            None => None,
+        };
         if self.cash_halted {
-            self.advance(i)?;
+            if advanced.is_none() {
+                self.advance(i)?;
+            }
             self.bar_callback_required = false;
             return Ok(());
         }
         let reconciled =
             if self.pending_target.is_some() { self.reconcile_target(i)? } else { false };
-        let target = self.advance(i)?;
+        let target = match advanced {
+            Some(target) => target,
+            None => self.advance(i)?,
+        };
         if !reconciled {
             self.submit_native_intent(i, target)?;
         }
