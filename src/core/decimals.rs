@@ -262,9 +262,25 @@ mod tests {
         }
         let big = (1_u64 << 52) as f64;
         out.extend([
-            0.0, -0.0, 0.5, -0.5, 1.5, 2.5, 0.49999999999999994, -0.49999999999999994,
-            big - 0.5, big + 1.0, 2.0 * big - 1.0, -(big - 0.5), f64::MIN_POSITIVE,
-            5e-324, f64::MAX, f64::MIN, f64::INFINITY, f64::NEG_INFINITY, f64::NAN,
+            0.0,
+            -0.0,
+            0.5,
+            -0.5,
+            1.5,
+            2.5,
+            0.49999999999999994,
+            -0.49999999999999994,
+            big - 0.5,
+            big + 1.0,
+            2.0 * big - 1.0,
+            -(big - 0.5),
+            f64::MIN_POSITIVE,
+            5e-324,
+            f64::MAX,
+            f64::MIN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NAN,
         ]);
         out
     }
@@ -287,9 +303,22 @@ mod tests {
     #[test]
     fn the_fast_paths_answer_as_i128_does() {
         let edges = [
-            0_i128, 1, -1, 10, i64::MAX as i128, i64::MIN as i128, i64::MAX as i128 + 1,
-            i64::MIN as i128 - 1, 1 << 53, (1 << 53) + 1, 1 << 100, -(1 << 100), i128::MAX,
-            i128::MIN, 10_i128.pow(28) - 1, 123_456_789_012_345_678,
+            0_i128,
+            1,
+            -1,
+            10,
+            i64::MAX as i128,
+            i64::MIN as i128,
+            i64::MAX as i128 + 1,
+            i64::MIN as i128 - 1,
+            1 << 53,
+            (1 << 53) + 1,
+            1 << 100,
+            -(1 << 100),
+            i128::MAX,
+            i128::MIN,
+            10_i128.pow(28) - 1,
+            123_456_789_012_345_678,
         ];
         for &a in &edges {
             assert_eq!(i128_to_f64(a).to_bits(), (a as f64).to_bits(), "{a}");

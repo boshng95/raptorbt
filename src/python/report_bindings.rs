@@ -105,8 +105,11 @@ fn trade_rows(
 /// The trade rows of one instrument's round trips, sorted as
 /// `BacktestResult` sorts them.
 ///
-/// Round trips in the order they opened; one that closed renders its one
-/// row, one the data ended on its open row and its settlement. *reduction_ns*
+/// Round trips in the order they opened, one row each: one that closed its
+/// close, one the data ended on its settlement -- the close at the last
+/// price, carrying the entry fee the open position had booked, as
+/// `force_close_open_positions` replaces an open position's row with its
+/// close (two rows counted the position twice). *reduction_ns*
 /// are the reducing fills of the book, which a settled position must not
 /// have taken (`trims_of`): its rows would then be split by them.
 pub(crate) fn trip_rows(
@@ -142,23 +145,14 @@ pub(crate) fn trip_rows(
                 return None;
             }
             let direction = if short { -1.0 } else { 1.0 };
-            rows.push(Keyed {
-                row: TradeRow {
-                    opened_s,
-                    closed_s: None,
-                    realized: py_round(-entry_fee, precision)?,
-                    duration_hours: None,
-                },
-                short,
-                entry_price: item.entry_price,
-                exit_price: 0.0,
-                quantity: item.size,
-            });
+            // What the open position booked, then the mark, in the order
+            // Python adds them (`round_trip_rows`), so the sum is its float.
+            let booked = py_round(-entry_fee, precision)?;
             rows.push(Keyed {
                 row: TradeRow {
                     opened_s,
                     closed_s: Some(closed_s),
-                    realized: direction * (item.exit_price - item.entry_price) * item.size,
+                    realized: booked + direction * (item.exit_price - item.entry_price) * item.size,
                     duration_hours,
                 },
                 short,
@@ -345,21 +339,18 @@ mod tests {
     }
 
     #[test]
-    fn a_settled_position_renders_its_open_row_and_its_settlement() {
+    fn a_settled_position_renders_one_row() {
         let rows = trade_rows(&[trade(3600, 9000, 0.0, "EndOfData")], "AAPL", &[], 2).unwrap();
-        // The open row carries the entry fee, as booked (`Money`), then
-        // rounded again; it sorts after every closed row.
+        // One position, one row: its close at the last price, carrying the
+        // entry fee as booked (`Money`, then rounded again) plus the mark.
         assert_eq!(
             rows,
-            vec![
-                TradeRow {
-                    opened_s: 3600,
-                    closed_s: Some(9000),
-                    realized: 30.0,
-                    duration_hours: Some(1.5),
-                },
-                TradeRow { opened_s: 3600, closed_s: None, realized: -0.76, duration_hours: None },
-            ]
+            vec![TradeRow {
+                opened_s: 3600,
+                closed_s: Some(9000),
+                realized: -0.76 + 30.0,
+                duration_hours: Some(1.5),
+            }]
         );
     }
 
