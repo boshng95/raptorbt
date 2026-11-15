@@ -293,6 +293,12 @@ impl EngineKernel {
     pub fn open_orders(&self) -> Vec<&Order> {
         self.orders.working().collect()
     }
+
+    /// Whether an exit -- a reduce-only order -- sent before `now` is still
+    /// working: one that outlived the bar it met, and rests.
+    pub fn resting_exit(&self, now: Timestamp) -> bool {
+        self.orders.working().any(|order| order.reduce_only && order.submitted_ts < now)
+    }
     /// Queue verdict for a resting limit, or `None` when the queue model is
     /// off or cannot see enough to judge — the caller then falls back to
     /// `fill_prob_limit`.

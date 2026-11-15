@@ -176,8 +176,11 @@ struct Dec {
 #[derive(Clone, Copy)]
 enum Rounding {
     Ceiling,
-    Floor,
     HalfEven,
+    /// `ROUND_HALF_UP`: a tie away from zero.
+    HalfUp,
+    /// `ROUND_HALF_DOWN`: a tie toward zero.
+    HalfDown,
 }
 
 impl Dec {
@@ -355,12 +358,13 @@ impl Dec {
         };
         let q = match rounding {
             Rounding::Ceiling if r > 0 => q + 1,
-            Rounding::Floor if r < 0 => q - 1,
             Rounding::HalfEven
                 if half == Ordering::Greater || (half == Ordering::Equal && q % 2 != 0) =>
             {
                 q + self.signum()
             }
+            Rounding::HalfUp if half != Ordering::Less => q + self.signum(),
+            Rounding::HalfDown if half == Ordering::Greater => q + self.signum(),
             _ => q,
         };
         Dec::checked(q, e)
@@ -541,14 +545,61 @@ impl Cost {
 struct Grid {
     /// `fallback_buffer_for_venue`.
     buffer: f64,
-    /// `venue_price_tick`'s table: ascending `(below, tick)`, `None` on top.
+    /// `venue_tick_tiers`: ascending `(below, tick)`, `None` on top.
     tiers: Vec<(Option<Dec>, Dec)>,
+    /// The instrument's price increment.
+    increment: Dec,
     /// `_increment_precision(price_increment)`.
     increment_precision: usize,
     price_precision: i32,
 }
 
 impl Grid {
+    /// `order_price_step`: the step between valid prices at `price`, or just
+    /// under it with `below`; never finer than the increment.
+    fn step(&self, price: Dec, below: bool) -> Option<Dec> {
+        let Some(&(_, mut tick)) = self.tiers.last() else {
+            return Some(self.increment);
+        };
+        for (bound, step) in &self.tiers {
+            let inside = match bound {
+                None => true,
+                Some(bound) => match price.compare(*bound)? {
+                    Ordering::Less => true,
+                    Ordering::Equal => below,
+                    Ordering::Greater => false,
+                },
+            };
+            if inside {
+                tick = *step;
+                break;
+            }
+        }
+        Some(match tick.compare(self.increment)? {
+            Ordering::Less => self.increment,
+            _ => tick,
+        })
+    }
+
+    /// `order_price_through`: the valid price one step through `reference`,
+    /// `Some(None)` for a sell with none below it.
+    fn through(&self, reference: f64, buy: bool) -> Option<Option<f64>> {
+        let at = Dec::of(reference)?;
+        let step = self.step(at, !buy)?;
+        let mut steps = at.floor_div(step)?;
+        if buy {
+            steps += 1;
+        } else if Dec::checked(steps, 0)?.mul(step)?.compare(at)? == Ordering::Equal {
+            steps -= 1;
+        }
+        if steps <= 0 {
+            return Some(None);
+        }
+        Some(Some(Dec::checked(steps, 0)?.mul(step)?.to_f64()))
+    }
+
+    /// `snapped_order_price`: `marketable_limit_price` priced from a mark,
+    /// then `Instrument.make_price`.
     fn snap(&self, reference: f64, buy: bool) -> Option<f64> {
         // `marketable_limit_price` prices nothing at or below zero; such a
         // reference, and one too large for a `Price`, are Python's to answer.
@@ -558,25 +609,23 @@ impl Grid {
         let signed = if buy { self.buffer } else { -self.buffer };
         let mut price = reference * (1.0 + signed);
         if !self.tiers.is_empty() {
+            // `nearest_order_price`: the nearest step of the tier, a tie
+            // going the aggressive way.
             let at = Dec::of(price)?;
-            let mut tick = self.tiers.last()?.1;
-            for (below, step) in &self.tiers {
-                match below {
-                    Some(bound) if at.compare(*bound)? != Ordering::Less => {}
-                    _ => {
-                        tick = *step;
-                        break;
-                    }
-                }
-            }
-            // `snap_price_to_tick`, rounding in the aggressive direction.
-            let rounding = if buy { Rounding::Ceiling } else { Rounding::Floor };
-            let steps = at.div_exact(tick)?.quantize(0, rounding)?;
-            price = steps.mul(tick)?.to_f64();
+            let step = self.step(at, false)?;
+            let rounding = if buy { Rounding::HalfUp } else { Rounding::HalfDown };
+            let steps = at.div_exact(step)?.quantize(0, rounding)?;
+            price = steps.mul(step)?.to_f64();
         }
         // `round(price, increment_precision)`: Rust's fixed formatting rounds
         // the float's exact value half to even, as Python's `round` does.
-        let rounded = round_to(price, u32::try_from(self.increment_precision).ok()?)?;
+        let mut rounded = round_to(price, u32::try_from(self.increment_precision).ok()?)?;
+        // Never short of one valid step through the reference.
+        if let Some(through) = self.through(reference, buy)? {
+            if if buy { rounded < through } else { rounded > through } {
+                rounded = through;
+            }
+        }
         // `float(Price(rounded, price_precision))`: Nautilus scales by the
         // precision in floats, rounds half away from zero and keeps the
         // fixed-point raw, which `float` divides back out.
@@ -697,7 +746,7 @@ impl PyMoneyModel {
     #[new]
     #[pyo3(signature = (
         *, sizer, percent, budget, quantity, lot, cash_precision, taker_fee, minimum,
-        per_share, max_pct, limit_entries, market_markup, buffer, tiers,
+        per_share, max_pct, limit_entries, market_markup, buffer, tiers, increment,
         increment_precision, price_precision,
     ))]
     #[allow(clippy::too_many_arguments)]
@@ -716,6 +765,7 @@ impl PyMoneyModel {
         market_markup: f64,
         buffer: f64,
         tiers: Vec<(Option<String>, String)>,
+        increment: &str,
         increment_precision: usize,
         price_precision: i32,
     ) -> PyResult<Self> {
@@ -744,6 +794,10 @@ impl PyMoneyModel {
                 Ok((below, tick))
             })
             .collect::<PyResult<Vec<_>>>()?;
+        let increment = decimal("increment", increment)?;
+        if increment.c <= 0 {
+            return Err(PyValueError::new_err("increment must be positive"));
+        }
         Ok(Self {
             sizer,
             cost: Cost {
@@ -754,7 +808,7 @@ impl PyMoneyModel {
                 per_share: decimal("per_share", per_share)?,
                 max_pct: decimal("max_pct", max_pct)?,
             },
-            grid: Grid { buffer, tiers, increment_precision, price_precision },
+            grid: Grid { buffer, tiers, increment, increment_precision, price_precision },
             limit_entries,
             market_markup,
         })
@@ -944,8 +998,14 @@ mod tests {
         assert!(same(dec("1.015").quantize(-2, Rounding::HalfEven).unwrap(), "1.02"));
         assert!(same(dec("1.001").quantize(-2, Rounding::Ceiling).unwrap(), "1.01"));
         assert!(same(dec("-1.001").quantize(-2, Rounding::Ceiling).unwrap(), "-1.00"));
-        assert!(same(dec("-1.001").quantize(-2, Rounding::Floor).unwrap(), "-1.01"));
         assert!(same(dec("7").quantize(-2, Rounding::Ceiling).unwrap(), "7"));
+        // ROUND_HALF_UP / ROUND_HALF_DOWN: a tie away from / toward zero.
+        assert!(same(dec("1.005").quantize(-2, Rounding::HalfUp).unwrap(), "1.01"));
+        assert!(same(dec("-1.005").quantize(-2, Rounding::HalfUp).unwrap(), "-1.01"));
+        assert!(same(dec("1.005").quantize(-2, Rounding::HalfDown).unwrap(), "1.00"));
+        assert!(same(dec("-1.005").quantize(-2, Rounding::HalfDown).unwrap(), "-1.00"));
+        assert!(same(dec("1.0051").quantize(-2, Rounding::HalfDown).unwrap(), "1.01"));
+        assert!(same(dec("1.0049").quantize(-2, Rounding::HalfUp).unwrap(), "1.00"));
     }
 
     #[test]
@@ -999,22 +1059,58 @@ mod tests {
 
     #[test]
     fn snaps_onto_the_price_grid() {
-        let grid =
-            Grid { buffer: 0.002, tiers: Vec::new(), increment_precision: 2, price_precision: 2 };
+        let grid = Grid {
+            buffer: 0.002,
+            tiers: Vec::new(),
+            increment: dec("0.01"),
+            increment_precision: 2,
+            price_precision: 2,
+        };
         // 92582.5 * 1.002 is 92767.665: rounded first, it lands on .66.
         assert_eq!(grid.snap(92582.5, true), Some(92767.66));
-        let asx = Grid {
+        let asx = asx_grid();
+        // The nearest step of the tier, and the reference's own step through.
+        assert_eq!(asx.snap(1.234, true), Some(1.235));
+        assert_eq!(asx.snap(1.234, false), Some(1.23));
+        assert_eq!(asx.snap(64.19, true), Some(64.25));
+        assert_eq!(asx.snap(64.19, false), Some(64.13));
+    }
+
+    fn asx_grid() -> Grid {
+        Grid {
             buffer: 0.001,
             tiers: vec![
                 (Some(dec("0.10")), dec("0.001")),
                 (Some(dec("2.00")), dec("0.005")),
                 (None, dec("0.01")),
             ],
+            increment: dec("0.001"),
             increment_precision: 3,
             price_precision: 3,
+        }
+    }
+
+    #[test]
+    fn never_prices_short_of_a_step_through_the_reference() {
+        let asx = asx_grid();
+        // 0.1998 and 0.2002 are nearest 0.200 itself: the touch, not through it.
+        assert_eq!(asx.snap(0.20, false), Some(0.195));
+        assert_eq!(asx.snap(0.20, true), Some(0.205));
+        // A tier boundary: $2.00 opens the cent tier, $1.995 closes the one below.
+        assert_eq!(asx.snap(2.00, false), Some(1.995));
+        assert_eq!(asx.snap(1.995, true), Some(2.00));
+        assert_eq!(asx.snap(0.10, false), Some(0.099));
+        assert_eq!(asx.snap(4.79, false), Some(4.78));
+        // Nothing lies below the lowest step: the nearest price stands.
+        assert_eq!(asx.snap(0.001, false), Some(0.001));
+        let cents = Grid {
+            buffer: 0.001,
+            tiers: Vec::new(),
+            increment: dec("0.01"),
+            increment_precision: 2,
+            price_precision: 2,
         };
-        assert_eq!(asx.snap(1.234, true), Some(1.24));
-        assert_eq!(asx.snap(1.234, false), Some(1.23));
-        assert_eq!(asx.snap(4.79, true), Some(4.80));
+        assert_eq!(cents.snap(0.62, false), Some(0.61));
+        assert_eq!(cents.snap(150.0, false), Some(149.85));
     }
 }

@@ -3266,3 +3266,59 @@ fn the_leverage_rate_path_is_bit_identical_to_the_pre_model_arithmetic() {
         "locked margin must be contract_value × size × rate, in that order"
     );
 }
+
+#[test]
+fn an_exit_rests_only_while_it_works_past_the_bar_it_met() {
+    // Matched the way the replays match: an order meets the book on the
+    // bar it is sent on.
+    let mut kernel = bounded_kernel_on_a_lot(PositionPolicy::Net, 1.0);
+    kernel.submit_order(
+        OrderSide::Buy,
+        QtySpec::Units(10.0),
+        OrderKind::Market,
+        TimeInForce::Gtc,
+        0,
+        0,
+        "in".to_string(),
+        None,
+        None,
+    );
+    kernel.step(0, &bar(0, 100.0), StepInput::default());
+    assert_eq!(kernel.position_snapshot().unwrap().size, 10.0);
+    let exit = |kernel: &mut EngineKernel, tif: TimeInForce, price: Price| {
+        kernel.submit_order_full(
+            OrderSide::Sell,
+            QtySpec::FullPosition,
+            OrderKind::Limit { price },
+            tif,
+            1,
+            1,
+            "out".to_string(),
+            None,
+            None,
+            false,
+            true,
+            false,
+            None,
+        )
+    };
+
+    // Killed on arrival, an IOC that missed never rests.
+    let ioc = exit(&mut kernel, TimeInForce::Ioc, 200.0);
+    kernel.step(1, &bar(1, 100.0), StepInput::default());
+    assert_eq!(order_status(&kernel, ioc), OrderStatus::Canceled);
+    assert!(!kernel.resting_exit(2));
+
+    // A DAY exit priced past the bar works on: not resting on the bar it
+    // met, resting on every bar after it.
+    let day = exit(&mut kernel, TimeInForce::Day, 200.0);
+    kernel.step(1, &bar(1, 100.0), StepInput::default());
+    assert_eq!(order_status(&kernel, day), OrderStatus::Accepted);
+    assert!(!kernel.resting_exit(1));
+    assert!(kernel.resting_exit(2));
+
+    // Filled, it is over.
+    kernel.step(2, &bar(2, 250.0), StepInput::default());
+    assert_eq!(order_status(&kernel, day), OrderStatus::Filled);
+    assert!(!kernel.resting_exit(3));
+}

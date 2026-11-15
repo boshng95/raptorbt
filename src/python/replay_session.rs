@@ -481,6 +481,11 @@ impl Replay<'_> {
     }
 
     fn on_bar(&mut self, i: usize) -> PyResult<()> {
+        // `_refuse_resting_exit`: asked first, ahead of anything that could
+        // send beside it.
+        if self.runner.kernel().resting_exit(self.bars.ts[i]) {
+            return Err(declined("an exit outlived the bar it met"));
+        }
         if self.cash_halted {
             self.advance(i)?;
             // A halted replay acts on nothing: `not _defer_quiet_primary`.

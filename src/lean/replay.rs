@@ -571,6 +571,11 @@ impl Replay<'_> {
     // -- the strategy: `SignalReplay` ---------------------------------------
 
     fn on_bar(&mut self, i: usize) -> Result<(), Declined> {
+        // `_refuse_resting_exit`: asked first, ahead of anything that could
+        // send beside it.
+        if self.k.resting_exit(self.m.ts[i]) {
+            return Err(Declined("an exit outlived the bar it met"));
+        }
         // A scan stops with nothing pending: nothing reconciles before the
         // advance it ran.
         let advanced = match self.advanced.take() {

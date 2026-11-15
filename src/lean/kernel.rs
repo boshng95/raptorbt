@@ -490,6 +490,15 @@ impl<'m> Kernel<'m> {
         id
     }
 
+    /// `EngineKernel::resting_exit`: whether a reduce-only order sent
+    /// before `now` is still working.
+    pub fn resting_exit(&self, now: i64) -> bool {
+        self.working.iter().any(|&id| {
+            let order = &self.orders[id];
+            order.reduce_only && order.at_ts < now && !order.status.terminal()
+        })
+    }
+
     fn expired(&self, id: usize, ts: i64) -> bool {
         let order = &self.orders[id];
         match order.tif {
@@ -887,5 +896,61 @@ impl<'m> Kernel<'m> {
         self.book_cash(&[gross, -0.0]);
         let trade = self.trade(&p, ts, true);
         self.trades.push(trade);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_exit_rests_only_while_it_works_past_the_bar_it_met() {
+        let minute = 60_000_000_000_i64;
+        let ts: Vec<i64> = (0..4).map(|k| 1_750_000_000_000_000_000 + k * minute).collect();
+        let close = vec![100.0, 100.0, 100.0, 250.0];
+        let m = Market::new(
+            ts.clone(),
+            close.clone(),
+            close.iter().map(|c| c + 0.5).collect(),
+            close.iter().map(|c| c - 0.5).collect(),
+            close,
+            vec![10_000.0; 4],
+            1.0,
+            4.0,
+        );
+        let terms = Terms {
+            initial_capital: 1e6,
+            price_increment: 0.01,
+            max_quantity: None,
+            currency_precision: Some(2),
+            fees: 0.0,
+            fee_per_share: 0.0,
+            fee_minimum: 0.0,
+            fee_max_pct: 0.0,
+        };
+        let mut k = Kernel::new(&m, &terms);
+        let mut events = Vec::new();
+        k.submit(0, ts[0], true, 10.0, None, Tif::Gtc, false);
+        k.step(0, &mut events);
+        assert_eq!(k.net_position(), (true, 10.0));
+
+        // Killed on arrival, an IOC that missed never rests.
+        let ioc = k.submit(1, ts[1], false, 10.0, Some(200.0), Tif::Ioc, true);
+        k.step(1, &mut events);
+        assert_eq!(k.orders[ioc].status, Status::Canceled);
+        assert!(!k.resting_exit(ts[2]));
+
+        // A DAY exit priced past the bar works on: not resting on the bar it
+        // met, resting on every bar after it.
+        let day = k.submit(2, ts[2], false, 10.0, Some(200.0), Tif::Day, true);
+        k.step(2, &mut events);
+        assert!(!k.orders[day].status.terminal());
+        assert!(!k.resting_exit(ts[2]));
+        assert!(k.resting_exit(ts[3]));
+
+        // Filled, it is over.
+        k.step(3, &mut events);
+        assert_eq!(k.orders[day].status, Status::Filled);
+        assert!(!k.resting_exit(ts[3] + minute));
     }
 }

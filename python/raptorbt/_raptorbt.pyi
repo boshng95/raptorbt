@@ -1150,6 +1150,7 @@ class MoneyModel:
         market_markup: float,
         buffer: float,
         tiers: list[tuple[str | None, str]],
+        increment: str,
         increment_precision: int,
         price_precision: int,
     ) -> None: ...
