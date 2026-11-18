@@ -143,6 +143,54 @@ impl Level {
     }
 }
 
+/// `NativeExecutionSession.advance`'s pending-close latch over one call:
+/// StrategyBase's ``_pending_flat``, which a long-only close sets and only the
+/// next primary bar's reconcile clears, once the book reads flat. While it
+/// stands every entry is refused (``PENDING_CLOSE``).
+///
+/// `close_bar` is the last primary bar the latch holds through, or -1; a
+/// close a resample delivered for the bar before has filled by the time this
+/// bar's reconcile runs, which is what `provisional` remembers.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Latch {
+    pub close_bar: i64,
+    pub provisional: bool,
+}
+
+impl Latch {
+    pub(crate) fn new(close_bar: i64) -> Self {
+        Self { close_bar, provisional: false }
+    }
+
+    /// The latch as an event on primary bar `bar` finds it, `early` for a
+    /// pre-close window, from side `start_side`: a later bar's reconcile has
+    /// run, and cleared the latch if the close filled.
+    #[inline]
+    pub(crate) fn step(&mut self, bar: i64, early: bool, start_side: i32) {
+        if self.close_bar >= 0
+            && (bar > self.close_bar + 1 || (bar == self.close_bar + 1 && !early))
+        {
+            self.close_bar =
+                if self.provisional || start_side == 0 { -1 } else { bar - i64::from(early) };
+            self.provisional = false;
+        }
+    }
+
+    /// `_close_latch`: a close decided by an event on primary bar `bar` of
+    /// the callback on primary bar `idx`.
+    #[inline]
+    pub(crate) fn close(&mut self, bar: i64, early: bool, idx: i64) {
+        self.close_bar = self.close_bar.max(bar);
+        self.provisional = !early && bar < idx;
+    }
+
+    /// Whether an entry is refused.
+    #[inline]
+    pub(crate) fn holds(&self) -> bool {
+        self.close_bar >= 0
+    }
+}
+
 /// Which rule a decision came from: `(is_exit, index)` within its list.
 type RuleId = (bool, usize);
 
@@ -204,6 +252,12 @@ struct State {
     /// Whether a crossover clock changed sides in the current visit:
     /// `_clock_flipped` over the clocks before and after it.
     flipped: bool,
+    /// `NativeExecutionSession._close_bar`: the last primary bar a long-only
+    /// close is still pending through, or -1.
+    close_bar: i64,
+    /// Whether the last `advance` entered from flat, which a close noted
+    /// ahead of it would have refused.
+    entered_from_flat: bool,
 }
 
 // `Clone` by hand so that `clone_from` keeps the copy's buffers: a run of
@@ -251,6 +305,8 @@ impl Clone for State {
             last_reached,
             last_ready,
             flipped,
+            close_bar,
+            entered_from_flat,
         } = self;
         Self {
             cursor: cursor.clone(),
@@ -266,6 +322,8 @@ impl Clone for State {
             last_reached: *last_reached,
             last_ready: *last_ready,
             flipped: *flipped,
+            close_bar: *close_bar,
+            entered_from_flat: *entered_from_flat,
         }
     }
 
@@ -284,6 +342,8 @@ impl Clone for State {
             last_reached,
             last_ready,
             flipped,
+            close_bar,
+            entered_from_flat,
         } = self;
         cursor.clone_from(&source.cursor);
         *next_dispatch = source.next_dispatch;
@@ -298,6 +358,8 @@ impl Clone for State {
         *last_reached = source.last_reached;
         *last_ready = source.last_ready;
         *flipped = source.flipped;
+        *close_bar = source.close_bar;
+        *entered_from_flat = source.entered_from_flat;
     }
 }
 
@@ -344,6 +406,9 @@ struct Data {
     has_instrument: bool,
     size_increment: f64,
     minimum_notional: f64,
+    /// Whether a long-only close latches entries off until it settles: every
+    /// run but a two-sided one (`NativeExecutionSession._two_sided`).
+    close_latch: bool,
 }
 
 fn slice<'a, T: numpy::Element>(array: &'a Py<PyArray1<T>>, py: Python<'a>) -> PyResult<&'a [T]> {
@@ -753,6 +818,22 @@ impl Data {
         }))
     }
 
+    /// Whether the event `cursor` stands on is a pre-close window, and the
+    /// primary bar the latch reads it on in the callback on primary bar `idx`
+    /// at `now`: a primary event's own, a resample's `idx` on the callback's
+    /// clock and the bar before off it.
+    #[inline]
+    fn event_bar(cursor: &Cursor, now: i64, idx: usize) -> (bool, i64) {
+        if cursor.slot == PRIMARY {
+            (false, cursor.bar as i64)
+        } else {
+            (
+                cursor.priority == 0,
+                if cursor.timestamp == now { idx as i64 } else { idx as i64 - 1 },
+            )
+        }
+    }
+
     /// `NativeExecutionSession.advance` for a deferred, repeat-safe plan with
     /// no policies, no borrow and signal entries.
     ///
@@ -769,6 +850,7 @@ impl Data {
         net_position: f64,
         pending: Option<f64>,
     ) -> PyResult<(bool, Option<Target>)> {
+        state.entered_from_flat = false;
         let held_side = if !has_position {
             0
         } else if net_position > 0.0 {
@@ -808,8 +890,11 @@ impl Data {
         let mut reason: Option<RuleId> = None;
         let mut entry_timestamp: Option<i64> = None;
         let mut policies_after_fill = false;
+        let mut latch = Latch::new(state.close_bar);
         while state.cursor.current.is_some() && state.cursor.timestamp <= now {
             let timestamp = state.cursor.timestamp;
+            let (early, event_bar) = Self::event_bar(&state.cursor, now, idx);
+            latch.step(event_bar, early, start_side);
             if state.cursor.slot == PRIMARY
                 && !state.visit_primary_after_fill
                 && entry_timestamp != Some(timestamp)
@@ -845,14 +930,24 @@ impl Data {
                 target = 0;
             }
             if intent.wants_entry && target == 0 {
+                if latch.holds() {
+                    // Refused as ``PENDING_CLOSE``; the clocks have moved on
+                    // regardless.
+                    continue;
+                }
                 target = 1;
             }
             if previous_target == 0 && target != 0 {
                 entry_timestamp = Some(timestamp);
+                state.entered_from_flat = true;
             }
             reference = Some(intent.reference);
             reason = intent.reason;
+            if self.close_latch && previous_target != 0 && target == 0 {
+                latch.close(event_bar, early, idx as i64);
+            }
         }
+        state.close_bar = latch.close_bar;
         if target == start_side {
             return Ok((true, None));
         }
@@ -891,9 +986,12 @@ impl Data {
         let mut reason: Option<RuleId> = None;
         let mut entry_timestamp: Option<i64> = None;
         let mut policies_after_fill = false;
+        let mut latch = Latch::new(state.close_bar);
         while state.cursor.current.is_some() && state.cursor.timestamp <= now {
             let timestamp = state.cursor.timestamp;
             let primary = state.cursor.slot == PRIMARY;
+            let (early, event_bar) = Self::event_bar(&state.cursor, now, idx);
+            latch.step(event_bar, early, start_side);
             if entry_timestamp == Some(timestamp) {
                 policies_after_fill = true;
             }
@@ -916,14 +1014,23 @@ impl Data {
                 target = 0;
             }
             if intent.wants_entry && target == 0 {
+                if latch.holds() {
+                    // Refused as ``PENDING_CLOSE``.
+                    continue;
+                }
                 target = 1;
             }
             if previous_target == 0 && target != 0 {
                 entry_timestamp = Some(timestamp);
+                state.entered_from_flat = true;
             }
             reference = Some(intent.reference);
             reason = intent.reason;
+            if self.close_latch && previous_target != 0 && target == 0 {
+                latch.close(event_bar, early, idx as i64);
+            }
         }
+        state.close_bar = latch.close_bar;
         if target == start_side {
             if state.last_position != start_side {
                 state.visit_primary_after_fill = true;
@@ -932,6 +1039,13 @@ impl Data {
         }
         state.visit_primary_after_fill = true;
         Ok(Some(Target { side: target, reference, reason, policies_after_fill }))
+    }
+
+    /// `NativeExecutionSession.note_close`.
+    fn note_close(&self, state: &mut State, bar: i64) {
+        if self.close_latch {
+            state.close_bar = state.close_bar.max(bar);
+        }
     }
 
     /// `_held_reopens_exits` over the bars a sparse callback steps past.
@@ -1211,18 +1325,24 @@ impl PyCrossoverRuleSession {
     #[classattr]
     const LEVEL_RULES: bool = true;
 
+    /// Whether this build keeps the pending-close latch, and so takes the
+    /// `two_sided` argument and `note_close`.
+    #[classattr]
+    const CLOSE_LATCH: bool = true;
+
     /// A session over crossover rules `exits` and `entries`, or, given
     /// `conditions`, over the rules rooted at `exit_roots` and `entry_roots`
     /// of that arena (see [`ConditionTuple`]). `level`, as `(two_sided,
     /// size_increment, minimum_notional)` of the instrument contract, makes
-    /// them level rules.
+    /// them level rules. `two_sided` is the executor's own test: a two-sided
+    /// run keeps no pending-close latch.
     #[new]
     #[pyo3(signature = (
         reg_slots, reg_stream_index, reg_rank, reg_timestamps, reg_labels, slot_close,
         slot_admits, slot_decision, key_slot, key_values, key_init, exits, entries, n_clocks,
         legacy, dispatch_timestamps, dispatch_positions, primary_close, dust,
         position_required, has_instrument, size_increment, minimum_notional, *,
-        conditions=None, exit_roots=None, entry_roots=None, level=None,
+        conditions=None, exit_roots=None, entry_roots=None, level=None, two_sided=false,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -1254,6 +1374,7 @@ impl PyCrossoverRuleSession {
         exit_roots: Option<Vec<usize>>,
         entry_roots: Option<Vec<usize>>,
         level: Option<(bool, f64, f64)>,
+        two_sided: bool,
     ) -> PyResult<Self> {
         let n_regs = reg_slots.len();
         let n_slots = slot_close.len();
@@ -1339,6 +1460,8 @@ impl PyCrossoverRuleSession {
             has_instrument,
             size_increment,
             minimum_notional,
+            // A level rule set's contract says so too.
+            close_latch: !(two_sided || level.is_some_and(|(two_sided, ..)| two_sided)),
         };
         let state = {
             let view = data.view(py)?;
@@ -1395,6 +1518,8 @@ impl PyCrossoverRuleSession {
                 last_reached: false,
                 last_ready: true,
                 flipped: false,
+                close_bar: -1,
+                entered_from_flat: false,
             }
         };
         let saved = state.clone();
@@ -1483,6 +1608,18 @@ impl PyCrossoverRuleSession {
     /// Mark that a fill landed, which makes the next primary bar a visit.
     fn on_fill(&mut self) {
         self.state.visit_primary_after_fill = true;
+    }
+
+    /// `NativeExecutionSession.note_close`: a close the executor resent on
+    /// primary bar `bar_index`, under a pending close that stands through it.
+    fn note_close(&mut self, bar_index: i64) {
+        self.data.note_close(&mut self.state, bar_index);
+    }
+
+    /// `NativeExecutionSession._close_bar`.
+    #[getter]
+    fn close_bar(&self) -> i64 {
+        self.state.close_bar
     }
 
     #[getter]
@@ -1705,6 +1842,24 @@ impl RuleStepper<'_> {
         self.state.visit_primary_after_fill = true;
     }
 
+    /// [`PyCrossoverRuleSession::note_close`], for the reconcile ahead of
+    /// callback bar `bar`'s `advance`.
+    ///
+    /// A bar handed back has had that `advance` run already, ahead of the
+    /// note. It stands unless it entered from flat, which the note would
+    /// have refused: a bar that resends a close submits nothing else, so its
+    /// target is never read, and it leaves the latch at `bar` either way --
+    /// its events are at most `bar`, which the note raises the latch to and
+    /// nothing in the bar lowers it from.
+    pub(crate) fn note_close(&mut self, bar: usize) {
+        if let Some(taken) = &mut self.taken {
+            if self.state.entered_from_flat {
+                taken.spoil();
+            }
+        }
+        self.data.note_close(self.state, bar as i64);
+    }
+
     pub(crate) fn visit_primary_after_fill(&self) -> bool {
         debug_assert!(self.taken.is_none(), "rules read past a bar handed back");
         self.state.visit_primary_after_fill
@@ -1730,8 +1885,63 @@ impl RuleStepper<'_> {
 mod tests {
     use super::{
         conditions, first_at_or_after, money_as_double, Compare, Condition, ConditionTuple,
-        Crossing, Level, Operand,
+        Crossing, Latch, Level, Operand,
     };
+
+    #[test]
+    fn a_close_refuses_entries_through_its_own_bar() {
+        // Closed on primary bar 7 by an event on its clock.
+        let mut latch = Latch::new(-1);
+        latch.close(7, false, 7);
+        assert!(latch.holds() && !latch.provisional);
+        latch.step(7, false, 1);
+        assert!(latch.holds(), "the same bar's later events");
+        // The next bar's reconcile finds the book flat, or still held.
+        let mut flat = latch;
+        flat.step(8, false, 0);
+        assert!(!flat.holds());
+        let mut held = latch;
+        held.step(8, false, 1);
+        assert_eq!(held.close_bar, 8, "a close the venue has not taken carries");
+    }
+
+    #[test]
+    fn a_pre_close_window_runs_ahead_of_its_bar_reconcile() {
+        let mut latch = Latch::new(-1);
+        latch.close(7, false, 7);
+        latch.step(8, true, 0);
+        assert!(latch.holds(), "the window on bar 8 sees the close pending");
+        latch.step(8, false, 0);
+        assert!(!latch.holds());
+        // Held, the window carries it to the bar before its own.
+        let mut held = Latch::new(5);
+        held.step(9, true, 1);
+        assert_eq!(held.close_bar, 8);
+    }
+
+    #[test]
+    fn a_close_for_the_bar_before_is_filled_by_this_bar() {
+        // A resample delivered late on bar 7 closes for bar 6: provisional.
+        let mut latch = Latch::new(-1);
+        latch.close(6, false, 7);
+        assert!(latch.provisional && latch.holds());
+        latch.step(7, false, 1);
+        assert!(!latch.holds(), "bar 7's reconcile ran after that close filled");
+        // A pre-close window's close is never provisional.
+        let mut early = Latch::new(-1);
+        early.close(6, true, 7);
+        assert!(!early.provisional);
+    }
+
+    #[test]
+    fn a_resent_close_keeps_the_latch_through_its_bar() {
+        let mut latch = Latch::new(-1);
+        latch.close(6, false, 7);
+        // `note_close` on bar 7, ahead of its events.
+        latch.close_bar = latch.close_bar.max(7);
+        latch.step(7, false, 1);
+        assert!(latch.holds());
+    }
 
     #[test]
     fn the_first_bar_at_or_after_is_found_whatever_the_hint() {

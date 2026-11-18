@@ -576,12 +576,24 @@ impl Replay<'_> {
             if target_side != 0 {
                 return Err(declined("a reversal"));
             }
+            let previous =
+                (self.pending_target, self.pending_reference, self.target_bars, self.target_bar_ts);
             self.pending_reference = reference;
             self.target_bars = 0;
             self.target_bar_ts = -1;
             self.retarget(Some(0.0));
-            // A close the venue refused persists, and is reconciled.
-            self.submit_exit(i, reference)?;
+            if !self.submit_exit(i, reference)? {
+                // A rule session's close is one attempt (`create_order`; its
+                // intents do not `persist_if_unsubmitted`): one the venue's
+                // hours refuse, or preflight, is dropped, and whatever target
+                // was in flight before it stands -- `_submit_native_intent`.
+                (
+                    self.pending_target,
+                    self.pending_reference,
+                    self.target_bars,
+                    self.target_bar_ts,
+                ) = previous;
+            }
             return Ok(());
         }
         if target_side == 0 || self.working_entry || self.cash_halted {
@@ -782,7 +794,15 @@ impl Replay<'_> {
         if now == self.last_exit_ts {
             return Ok(false);
         }
-        self.continue_target(i, self.bars.close[i])
+        let closing = self.pending_target == Some(0.0);
+        let submitted = self.continue_target(i, self.bars.close[i])?;
+        if submitted && closing {
+            // `_reconcile_exit` resends it under the strategy's pending
+            // close, which stands until the next bar's reconcile finds the
+            // book flat.
+            self.rules.note_close(i);
+        }
+        Ok(submitted)
     }
 
     #[allow(clippy::too_many_arguments)]

@@ -12,6 +12,31 @@ branch.
 
 ### Fixed
 
+- **A close a rule session decides latches its bar against entries.**
+  `CrossoverRuleSession` and the lean lane let an entry decided later in
+  the same callback undo a close decided earlier in it, which kept the lot.
+  `NativeExecutionSession.advance` refuses that entry (`PENDING_CLOSE`):
+  the close latches the primary bar it was decided for, and an entry is
+  refused until the cursor reaches the bar after it, as `StrategyBase`'s
+  pending-close check does. A close a resample delivered for the bar before
+  fills by this bar's reconcile and releases the latch on the next primary
+  visit. Both lanes now keep that latch (`close_bar`), the reconcile's
+  submitted close sets it (`note_close`), and the lean lane's quiet
+  fast-forward steps it through the dispatches it skips. A two-sided
+  session does not latch. The Python wiring passes `two_sided` when the
+  build has `CrossoverRuleSession.CLOSE_LATCH`. On crypto dust books, the
+  close of a lot that turns tradeable on the closing minute of a resample
+  bar wanting an entry was undone: about 0.1% of BTC 1h library cells.
+- **A rule session's close that the venue's hours refuse is dropped.** The
+  Rust replays (`KernelSession.replay_rules` and the lean lane) latched a
+  rules' close that met a shut bar and resent it at the next open bar. A
+  rule session's close is one attempt on Nautilus (`create_order`; its
+  intents do not `persist_if_unsubmitted`), and the Python executor's
+  `_submit_native_intent` drops it and restores the target in flight, so
+  the lot is held to the rules' next exit. Both replays now do the same.
+  On FX, whose Friday close a 1h window can end on, this moved a close from
+  the Sunday reopen to the next rules exit; risk exits, which persist
+  through the bell, are unchanged.
 - **An unfilled IOC/FOK is canceled by an off-schedule book walk.** A
   portfolio venue evaluates an order immediately when it drains the command,
   even if another instrument's bar triggered that drain. A non-marketable

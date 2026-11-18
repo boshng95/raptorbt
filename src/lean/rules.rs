@@ -26,6 +26,7 @@ use std::hash::Hash;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use super::Declined;
+use crate::python::rule_session::Latch;
 
 #[derive(Clone, Copy, Debug)]
 pub enum Operand {
@@ -494,6 +495,9 @@ pub struct Cursor {
     flipped: bool,
     last_reached: bool,
     last_sort_key: Option<(i64, u8)>,
+    /// The pending-close latch's last bar, or -1 ([`Latch`]). A lean replay
+    /// is long-only, so it always keeps one.
+    close_bar: i64,
 }
 
 impl Default for Cursor {
@@ -515,6 +519,7 @@ impl Cursor {
             flipped: false,
             last_reached: false,
             last_sort_key: None,
+            close_bar: -1,
         }
     }
 
@@ -659,6 +664,23 @@ impl Cursor {
             return;
         }
         let from = std::mem::replace(&mut self.next_dispatch, to);
+        if self.close_bar >= 0 {
+            // Each dispatch's events step the latch as `advance` would: flat,
+            // it clears; held, it carries to the dispatch's bar.
+            let mut latch = Latch::new(self.close_bar);
+            let side = i32::from(held);
+            for r in from..to {
+                let bar = s.d.pos[r] as i64;
+                if s.d.first[r] {
+                    latch.step(bar, true, side);
+                }
+                latch.step(bar, false, side);
+                if !latch.holds() {
+                    break;
+                }
+            }
+            self.close_bar = latch.close_bar;
+        }
         let Some(last) = s.last_admitted(from, to) else {
             return;
         };
@@ -696,6 +718,12 @@ impl Cursor {
         let side = side_of(net_position);
         let stop = self.next_dispatch_position(s, close.len());
         self.reopens_exits(s, close, side, net_position, pending, idx + 1, stop)
+    }
+
+    /// `NativeExecutionSession.note_close`: a close the replay resent on
+    /// primary bar `idx`, under a pending close that stands through it.
+    pub fn note_close(&mut self, idx: usize) {
+        self.close_bar = self.close_bar.max(idx as i64);
     }
 
     /// `visit` + `evaluate` of one event: the primary bar `bar`, or the
@@ -814,7 +842,11 @@ impl Cursor {
                 &events[..1]
             }
         };
+        let mut latch = Latch::new(self.close_bar);
         for &(primary, bar) in events {
+            // Every event of a lean callback is on its clock, at `idx`.
+            let early = !primary && s.d.first[bar];
+            latch.step(idx as i64, early, start_side);
             if primary
                 && !self.visit_primary_after_fill
                 && entry_timestamp != Some(now)
@@ -839,13 +871,21 @@ impl Cursor {
                 target = 0;
             }
             if wants_entry && target == 0 {
+                if latch.holds() {
+                    // Refused as ``PENDING_CLOSE``.
+                    continue;
+                }
                 target = 1;
             }
             if previous == 0 && target != 0 {
                 entry_timestamp = Some(now);
             }
             reference = Some(price);
+            if previous != 0 && target == 0 {
+                latch.close(idx as i64, early, idx as i64);
+            }
         }
+        self.close_bar = latch.close_bar;
         if target == start_side {
             return Ok((true, None));
         }
@@ -900,7 +940,10 @@ impl Cursor {
                 &events[..1]
             }
         };
+        let mut latch = Latch::new(self.close_bar);
         for &(primary, bar) in events {
+            let early = !primary && s.d.first[bar];
+            latch.step(idx as i64, early, start_side);
             if entry_timestamp == Some(now) {
                 policies_after_fill = true;
             }
@@ -922,13 +965,21 @@ impl Cursor {
                 target = 0;
             }
             if wants_entry && target == 0 {
+                if latch.holds() {
+                    // Refused as ``PENDING_CLOSE``.
+                    continue;
+                }
                 target = 1;
             }
             if previous == 0 && target != 0 {
                 entry_timestamp = Some(now);
             }
             reference = Some(price);
+            if previous != 0 && target == 0 {
+                latch.close(idx as i64, early, idx as i64);
+            }
         }
+        self.close_bar = latch.close_bar;
         if target == start_side {
             if self.last_position != start_side {
                 self.visit_primary_after_fill = true;
