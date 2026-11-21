@@ -333,15 +333,18 @@ fn a_walk_settles_one_instrument_without_consuming_its_schedule() {
     let equity_points = session.curve.len();
     let cash = session.cash();
 
-    let events = session.walk_book(0, 12);
+    // The drain meets it: its arrival, one bite of the book, not the order.
+    let events = session.walk_book(0, 12, WalkPhase::Drain);
     assert_eq!(filled_size(&events), 250.0, "one bite of the book, not the order");
     assert_eq!(session.remaining(), remaining, "no schedule entry was consumed");
     assert_eq!(session.curve.len(), equity_points, "no market event, no equity point");
     assert!((cash - session.cash() - 25_000.0).abs() < 1e-6, "the shared pool paid for it");
+    assert!(session.walk_book(0, 12, WalkPhase::Drain).is_empty(), "it arrives once");
 
-    // And again: the book does not deplete, so the next batch is worth
-    // another bite of exactly the same size.
-    assert_eq!(filled_size(&session.walk_book(0, 13)), 250.0);
+    // The walk behind the drain, and the next batch's: the book does not
+    // deplete, so each is worth another bite of exactly the same size.
+    assert_eq!(filled_size(&session.walk_book(0, 12, WalkPhase::Walk)), 250.0);
+    assert_eq!(filled_size(&session.walk_book(0, 13, WalkPhase::Walk)), 250.0);
 }
 
 #[test]
@@ -362,7 +365,7 @@ fn a_walk_of_an_instrument_that_has_seen_no_bar_does_nothing() {
         None,
         None,
     );
-    assert!(session.walk_book(1, 1).is_empty());
+    assert!(session.walk_book(1, 1, WalkPhase::Walk).is_empty());
     assert!(!session.kernel(1).is_in_position());
 }
 
@@ -1398,7 +1401,7 @@ fn a_wing_bought_by_a_book_walk_regroups_the_sold_leg_it_covers() {
         None,
         None,
     );
-    let events = session.walk_book(1, 5);
+    let events = session.walk_book(1, 5, WalkPhase::Walk);
     assert_eq!(filled_size(&events), 150.0, "the wing fills off the book: {events:?}");
 
     let covered = session.kernel(0).locked_margin();

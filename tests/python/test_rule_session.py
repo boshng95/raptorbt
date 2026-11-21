@@ -33,6 +33,7 @@ def _rules(**changes):
         "reg_slots": [0],
         "reg_stream_index": [0],
         "reg_rank": [0],
+        "reg_built": [False],
         "reg_timestamps": [timestamps],
         "reg_labels": [None],
         "slot_close": [close],
@@ -162,7 +163,7 @@ def test_an_inconsistent_layout_is_refused(changes, message) -> None:
 
 
 def test_a_condition_tree_is_taken_as_level_rules() -> None:
-    assert CrossoverRuleSession.LEVEL_RULES
+    assert CrossoverRuleSession.VERSION >= 1
     # NOT (1 > 2): one entry rule over constants, as a one-sided level rule.
     _rules(
         conditions=[

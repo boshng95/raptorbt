@@ -8,7 +8,7 @@ use pyo3::prelude::*;
 
 use crate::core::types::{BacktestConfig, Direction, InstrumentConfig, TickData};
 use crate::data::{BookLevel, BookSide, DepthTick};
-use crate::execution::orders::{OrderSide, OrderStatus, QtySpec};
+use crate::execution::orders::{OrderSide, OrderStatus, QtySpec, WalkPhase};
 use crate::portfolio::kernel::{KernelBar, StepInput};
 use crate::portfolio::ledger::PositionPolicy;
 use crate::portfolio::session::{EventSession, ScheduleData};
@@ -534,18 +534,25 @@ impl PyPortfolioSession {
         Ok((events.into_iter().map(PyEngineEvent::from).collect(), event_ts))
     }
 
-    /// Settle one instrument's resting orders at `ts_now`, off-schedule.
+    /// Settle one instrument's orders at `ts_now`, off-schedule.
     ///
-    /// A venue walks every book it keeps each time it drains a batch of
-    /// commands, so a driver that steps only the instrument whose bar is in
-    /// hand under-fills orders resting elsewhere. Call this for every
-    /// instrument after routing a batch -- the one in hand included, whose
-    /// step settled only the batch standing before its bar -- and again
-    /// while the fills it reports keep producing commands.
-    fn walk_book(&mut self, instrument: usize, ts_now: i64) -> PyResult<Vec<PyEngineEvent>> {
+    /// A venue settles a batch of commands in two halves, and a driver
+    /// keeping several books plays them apart: `drain=True` for each
+    /// instrument ordered on, matching only the orders new to the venue,
+    /// again while the fills it reports keep producing commands; then
+    /// `drain=False` for every instrument -- the one in hand included -- the
+    /// walk that gives every resting order one more look.
+    #[pyo3(signature = (instrument, ts_now, drain=false))]
+    fn walk_book(
+        &mut self,
+        instrument: usize,
+        ts_now: i64,
+        drain: bool,
+    ) -> PyResult<Vec<PyEngineEvent>> {
+        let phase = if drain { WalkPhase::Drain } else { WalkPhase::Walk };
         Ok(self
             .session_mut()?
-            .walk_book(instrument, ts_now)
+            .walk_book(instrument, ts_now, phase)
             .into_iter()
             .map(PyEngineEvent::from)
             .collect())

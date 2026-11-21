@@ -110,12 +110,14 @@ from raptorbt._raptorbt import (
     resolve_atr_period,
     # The canonical report of a replay, built in Rust
     canonical_report,
+    CANONICAL_REPORT_VERSION,
     # The exact twins of the engine's indicator walks
     indicator_twin,
     # The lean lane: library cells replayed in batches on a shared market
     LeanMarket,
     LeanFrame,
     LeanDeclined,
+    LEAN_REPLAY_VERSION,
     lean_replay,
     lean_replay_many,
 )
@@ -241,10 +243,12 @@ __all__ = [
     "PositionSnapshot",
     "resolve_atr_period",
     "canonical_report",
+    "CANONICAL_REPORT_VERSION",
     "indicator_twin",
     "LeanMarket",
     "LeanFrame",
     "LeanDeclined",
+    "LEAN_REPLAY_VERSION",
     "lean_replay",
     "lean_replay_many",
     # Class-based strategy contract

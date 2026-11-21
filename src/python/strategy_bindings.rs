@@ -22,16 +22,44 @@ use super::bar_index_cache::{self, Stream};
 use super::bindings::{
     convert_result, convert_trade, PyBacktestConfig, PyBacktestResult, PyInstrumentConfig, PyTrade,
 };
-use super::fill_ledger::{BookTerms, Ledger, PyReplayLedger};
+use super::fill_ledger::{or_zero, BookTerms, Ledger, PyReplayLedger};
 use super::instrument_bindings::PyInstrumentSpec;
 use super::money::PyMoneyModel;
-use super::replay_session::{replay, Money, Venue};
-use super::rule_session::{PyCrossoverRuleSession, QuietBar, QuietParams, QuietTuple, RuleStepper};
+use super::replay_session::{replay, Money, Shorts, Venue};
+use super::rule_session::{
+    Account, PyCrossoverRuleSession, QuietBar, QuietParams, QuietTuple, RuleStepper,
+};
+
+/// `replay_rules`' `shorts`: see [`Shorts`].
+type ShortsTuple<'py> =
+    (bool, u32, i64, Option<&'py PyAny>, Option<&'py PyAny>, Option<PyReadonlyArray1<'py, bool>>);
 
 /// `ctx.position is not None` and `ctx.net_position`, as the Python context
 /// reads them: a left-to-right sum of signed sizes over the open positions.
 pub(crate) fn held_position(runner: &SingleRunner) -> (bool, f64) {
     runner.kernel().net_position()
+}
+
+/// The account a run's risk policies read in front of a bar
+/// (`NativeExecutionSession._position`): the venue's signed lot -- dust and
+/// all -- and its average entry, each `or 0.0`; flat where nothing is held.
+pub(crate) fn policy_account(runner: &SingleRunner) -> Account {
+    let (held, net) = held_position(runner);
+    if !held {
+        return Account::FLAT;
+    }
+    let entry = runner.kernel().position_snapshot().map_or(0.0, |p| p.entry_price);
+    Account { quantity: or_zero(net), entry: or_zero(entry) }
+}
+
+/// [`policy_account`] for a run whose rules check risk policies, else the
+/// flat account nothing reads.
+fn policies_read(runner: &SingleRunner, stepper: &RuleStepper<'_>) -> Account {
+    if stepper.has_policies() {
+        policy_account(runner)
+    } else {
+        Account::FLAT
+    }
 }
 
 /// Fold the `units` / `size_frac` kwargs into a quantity spec.
@@ -303,6 +331,15 @@ pub struct PyKernelSession {
 
 #[pymethods]
 impl PyKernelSession {
+    /// The strategy `replay_rules` transcribes. The parity runner hands this
+    /// build a replay of a shape a later version added only on its own
+    /// version, and runs that one in Python otherwise.
+    ///
+    /// 1: a long-only replay. 2: a short node's (`shorts`), whose entries
+    /// sell to open through a durable short target.
+    #[classattr]
+    const REPLAY_VERSION: u32 = 2;
+
     #[new]
     #[pyo3(signature = (symbol="ASSET", direction=1, config=None, instrument_config=None, instrument=None,
                         oms_type="netting", account_type="cash", leverage=1.0))]
@@ -534,10 +571,14 @@ impl PyKernelSession {
     /// `money`, a `MoneyModel` of the same functions, answers them without
     /// calling back wherever it can. `book` is `(balance,
     /// currency_precision, size_increment, size_precision, price_precision,
-    /// currency)`.
+    /// currency)`. `shorts`, given, makes it a short node's replay:
+    /// `(cover_market, max_attempts, max_stale_bars, refusal, cover_bar,
+    /// admission)`, with `refusal(decided_ns, units, position, opened_ns) ->
+    /// bool`, `cover_bar(filled_ns) -> int` and `admission` the bars the
+    /// loan clock is asked on, each None where the run has none.
     #[pyo3(signature = (
         timestamps, open, high, low, close, volume, atr, mask, rules, quiet, venue,
-        units, snap, affordable, exhausted, gate=None, money=None, book=None,
+        units, snap, affordable, exhausted, gate=None, money=None, book=None, shorts=None,
     ))]
     #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     fn replay_rules(
@@ -561,6 +602,7 @@ impl PyKernelSession {
         gate: Option<PyReadonlyArray1<'_, bool>>,
         money: Option<PyRef<'_, PyMoneyModel>>,
         book: Option<(f64, u32, f64, usize, usize, String)>,
+        shorts: Option<ShortsTuple<'_>>,
     ) -> PyResult<PyObject> {
         let bars =
             BarArrays::new(py, &timestamps, &open, &high, &low, &close, &volume, atr.as_ref())?;
@@ -595,6 +637,24 @@ impl PyKernelSession {
             max_actions_per_timestamp: venue.11,
         };
         let money = Money { units, snap, affordable, exhausted, model: money.as_deref() };
+        let shorts = match &shorts {
+            None => None,
+            Some((cover_market, max_attempts, max_stale_bars, refusal, cover_bar, admission)) => {
+                let admission = admission
+                    .as_ref()
+                    .map(|array| array.as_slice())
+                    .transpose()
+                    .map_err(|_| PyValueError::new_err("admission must be contiguous"))?;
+                Some(Shorts {
+                    cover_market: *cover_market,
+                    max_attempts: *max_attempts,
+                    max_stale_bars: *max_stale_bars,
+                    refusal: *refusal,
+                    cover_bar: *cover_bar,
+                    admission,
+                })
+            }
+        };
         let stepper = rules.split(py)?.handing_back();
         let booked = book.is_some();
         let ledger = Ledger::new(book.map(
@@ -616,8 +676,18 @@ impl PyKernelSession {
                 }
             },
         ));
-        let ledger =
-            replay(runner, bars, m, g, stepper, QuietParams::from(quiet), venue, money, ledger)?;
+        let ledger = replay(
+            runner,
+            bars,
+            m,
+            g,
+            stepper,
+            QuietParams::from(quiet),
+            venue,
+            money,
+            shorts,
+            ledger,
+        )?;
         if booked {
             Ok(Py::new(py, PyReplayLedger::new(ledger))?.into_py(py))
         } else {
@@ -1106,6 +1176,7 @@ pub(crate) fn step_rules_until(
         // act, and the bars before it are stepped in one run -- the run
         // `step_until_event` takes across bars no callback interrupts.
         let (has_position, net_position) = held_position(runner);
+        let account = policies_read(runner, stepper);
         let cash = runner.cash();
         let mut stop = end;
         let mut at = start;
@@ -1119,7 +1190,13 @@ pub(crate) fn step_rules_until(
                 cash,
                 halted,
                 pending: pending_target,
+                account,
             };
+            let past = stepper.inert_run(&bar, quiet, bars.ts, bars.close, mask, end);
+            if past > idx {
+                at = past;
+                continue;
+            }
             if !stepper.quiet_bar(&bar, quiet) {
                 stop = idx;
                 break;
@@ -1141,6 +1218,7 @@ pub(crate) fn step_rules_until(
         // there; a bar the kernel then does not step idle leaves the rest
         // to the walk below.
         let (has_position, net_position) = held_position(runner);
+        let account = policies_read(runner, stepper);
         let cash = runner.cash();
         // Whether a close can call margin at all; when none can, the bound
         // is never read and its closes are not folded.
@@ -1187,7 +1265,16 @@ pub(crate) fn step_rules_until(
                     cash,
                     halted,
                     pending: pending_target,
+                    account,
                 };
+                // A run of callbacks reaches no further than the bound has
+                // cleared.
+                let bound = if reads_closes { end.min(cleared.max(callback) + 1) } else { end };
+                let past = stepper.inert_run(&bar, quiet, bars.ts, bars.close, mask, bound);
+                if past > callback {
+                    at = past;
+                    continue;
+                }
                 if !stepper.quiet_bar(&bar, quiet) {
                     stop = callback;
                     acts = true;
@@ -1227,6 +1314,7 @@ pub(crate) fn step_rules_until(
             // The callback runs before the bar steps, against the account
             // the previous bar left.
             let (has_position, net_position) = held_position(runner);
+            let account = policies_read(runner, stepper);
             let bar = QuietBar {
                 idx,
                 now: bars.ts[idx],
@@ -1236,6 +1324,7 @@ pub(crate) fn step_rules_until(
                 cash: runner.cash(),
                 halted,
                 pending: pending_target,
+                account,
             };
             if !stepper.quiet_bar(&bar, quiet) {
                 return (2, idx, Vec::new());

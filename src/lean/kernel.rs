@@ -1,7 +1,8 @@
 //! The kernel a library cell's replay drives, for its one shape: one
-//! instrument, long only, netting-averaging, a margin account at infinite
-//! leverage, limit and market orders, same-bar-close fills over the volume
-//! slices of [`super::market`].
+//! instrument, one side a position (a cell's entries open it long or short,
+//! and only its exits trade the other way), netting-averaging, a margin
+//! account at infinite leverage, limit and market orders, same-bar-close
+//! fills over the volume slices of [`super::market`].
 //!
 //! It is a transcription, not a model: every branch mirrors a line of
 //! `portfolio::kernel`, `kernel_orders` and `execution::orders::matching` as
@@ -64,6 +65,9 @@ struct Order {
     at_ts: i64,
     reduce_only: bool,
     status: Status,
+    /// `Order::arrived`: the order has met a book, so a walk gives it one
+    /// more bite rather than its arrival.
+    arrived: bool,
     resolved: Option<f64>,
     filled: f64,
     billing: OrderBilling,
@@ -117,6 +121,8 @@ struct Closing {
 
 #[derive(Clone, Copy, Debug)]
 struct Position {
+    /// Sold to open: `Direction::Short`.
+    short: bool,
     entry_price: f64,
     size: f64,
     entry_fees: f64,
@@ -125,9 +131,21 @@ struct Position {
     closing: Closing,
 }
 
+impl Position {
+    #[inline]
+    fn direction(&self) -> Direction {
+        if self.short {
+            Direction::Short
+        } else {
+            Direction::Long
+        }
+    }
+}
+
 /// A closed round trip, as the report reads it.
 #[derive(Clone, Debug)]
 pub struct Trade {
+    pub short: bool,
     pub entry_time: i64,
     pub exit_time: i64,
     pub entry_price: f64,
@@ -268,7 +286,7 @@ fn tape_offered(tape: &Tape, price: f64, buy: bool, immediate: bool) -> Depth {
     depth
 }
 
-/// `BarTape::offered_once`: `walk_book`'s single bite.
+/// `BarTape::offered_once`: a walk's single bite of an order already resting.
 fn offered_once(book: (f64, f64), price: f64, buy: bool) -> Depth {
     let (book_price, size) = book;
     if !marketable(book_price, price, buy) {
@@ -373,20 +391,23 @@ impl<'m> Kernel<'m> {
         self.cash
     }
 
-    /// `(has_position, net quantity)`.
+    /// `(has_position, net quantity)`: a short's negative.
     #[inline]
     pub fn net_position(&self) -> (bool, f64) {
         match &self.position {
-            Some(p) => (true, p.size),
+            Some(p) => (true, p.size * p.direction().multiplier()),
             None => (false, 0.0),
         }
     }
 
-    /// `equity(close)`: cash plus the open position marked at `close`.
+    /// `equity(close)`: cash plus the open position marked at `close`
+    /// (`unrealized_total`).
     #[inline]
     pub fn equity(&self, close: f64) -> f64 {
         match &self.position {
-            Some(p) => self.cash + ((close - p.entry_price) * p.size * 1.0) * 1.0,
+            Some(p) => {
+                self.cash + ((close - p.entry_price) * p.size * p.direction().multiplier()) * 1.0
+            }
             None => self.cash + -0.0,
         }
     }
@@ -479,6 +500,7 @@ impl<'m> Kernel<'m> {
             at_ts: now,
             reduce_only,
             status,
+            arrived: false,
             resolved: None,
             filled: 0.0,
             billing: OrderBilling::default(),
@@ -571,7 +593,13 @@ impl<'m> Kernel<'m> {
             }
             let order = &mut self.orders[id];
             let (buy, immediate) = (order.buy, order.immediate());
+            let arriving = !std::mem::replace(&mut order.arrived, true);
             if order.at == i {
+                // Sent from this bar and met by a walk already: the bar's
+                // range is behind it, and it owes no second arrival.
+                if !arriving {
+                    continue;
+                }
                 if let Some(price) = order.limit {
                     let depth = standing_offered(standing, price, buy, immediate);
                     if !depth.is_empty() {
@@ -620,7 +648,9 @@ impl<'m> Kernel<'m> {
     }
 
     /// `walk_book`: one more pass over the book the last bar left, for the
-    /// orders its own fills provoked. No expiry, no replay.
+    /// orders its own fills provoked. No expiry, no replay. An order new to
+    /// the venue arrives here, taking the walk behind its arrival as well
+    /// (`WalkPhase::Walk`); one already there takes one more bite.
     pub fn walk_book(&mut self, now: i64, events: &mut Vec<Event>) {
         let Some(i) = self.last_bar else { return };
         self.take_pending(events);
@@ -632,7 +662,10 @@ impl<'m> Kernel<'m> {
             let id = self.working[slot];
             let order = &mut self.orders[id];
             let Some(price) = order.limit else { continue };
-            let depth = offered_once(book, price, order.buy);
+            let depth = match std::mem::replace(&mut order.arrived, true) {
+                true => offered_once(book, price, order.buy),
+                false => standing_offered(book, price, order.buy, order.immediate()),
+            };
             if depth.is_empty() {
                 if order.immediate() {
                     order.status = Status::Canceled;
@@ -693,12 +726,14 @@ impl<'m> Kernel<'m> {
         let leaves = self.leaves_on_grid(id);
         let order = &self.orders[id];
         let (buy, immediate, units) = (order.buy, order.immediate(), order.units);
-        let opens = !order.reduce_only && (self.position.is_none() || buy);
+        // An order on the position's own side adds to it; one on the other
+        // side, or one that only reduces, takes from it.
+        let opens = !order.reduce_only && self.position.is_none_or(|p| buy != p.short);
         let raw = if matched.is_nan() { self.m.close[i] } else { matched };
         let executed;
         if opens {
             let explicit = leaves.unwrap_or(units);
-            match self.open_at(ts, id, raw, explicit, cap) {
+            match self.open_at(ts, id, raw, explicit, cap, !buy) {
                 Open::Rejected => {
                     self.orders[id].status = Status::Rejected;
                     events.push(Event::Rejected);
@@ -745,10 +780,10 @@ impl<'m> Kernel<'m> {
             let billed = self.bill_fill(id, fee_price, size);
             let fees = match billed {
                 Some((charge, _)) => charge,
-                None => self.q(self.fee.calculate(fee_price, size, Direction::Long)),
+                None => self.q(self.fee.calculate(fee_price, size, p.direction())),
             };
             let filled = size.min(p.size);
-            let gross = (price - p.entry_price) * filled * (1.0 * 1.0);
+            let gross = (price - p.entry_price) * filled * (p.direction().multiplier() * 1.0);
             let closing = &mut p.closing;
             closing.price = if closing.size > 0.0 {
                 (closing.price * closing.size + price * filled) / (closing.size + filled)
@@ -804,8 +839,18 @@ impl<'m> Kernel<'m> {
         self.fill(i, ts, id, price, depth, events);
     }
 
-    /// `open_at` for a buy with explicit units, under this configuration.
-    fn open_at(&mut self, ts: i64, id: usize, raw: f64, explicit: f64, cap: f64) -> Open {
+    /// `open_at` with explicit units, under this configuration: a buy, or
+    /// a sell to open a short.
+    fn open_at(
+        &mut self,
+        ts: i64,
+        id: usize,
+        raw: f64,
+        explicit: f64,
+        cap: f64,
+        short: bool,
+    ) -> Open {
+        let direction = if short { Direction::Short } else { Direction::Long };
         let price = raw + 0.0;
         let available = self.cash - 0.0;
         let contract_value = price * 1.0;
@@ -820,7 +865,7 @@ impl<'m> Kernel<'m> {
         let billed = self.bill_fill(id, contract_value, size);
         let fees = match billed {
             Some((charge, _)) => charge,
-            None => self.q(self.fee.calculate(contract_value, size, Direction::Long)),
+            None => self.q(self.fee.calculate(contract_value, size, direction)),
         };
         let funding = contract_value * size * 0.0;
         if funding + fees > available {
@@ -828,7 +873,8 @@ impl<'m> Kernel<'m> {
         }
         match self.position.as_mut() {
             Some(p) => {
-                if !(size > 0.0) || !(p.size > 0.0) {
+                // `add_to_position`: only on the position's own side.
+                if !(size > 0.0) || !(p.size > 0.0) || p.short != short {
                     return Open::Rejected;
                 }
                 p.entry_price = (p.entry_price * p.size + price * size) / (p.size + size);
@@ -840,6 +886,7 @@ impl<'m> Kernel<'m> {
             }
             None => {
                 self.position = Some(Position {
+                    short,
                     entry_price: price,
                     size,
                     entry_fees: fees,
@@ -860,6 +907,7 @@ impl<'m> Kernel<'m> {
     fn trade(&self, p: &Position, exit_ts: i64, end_of_data: bool) -> Trade {
         let total_fees = p.entry_fees + p.closing.fees;
         Trade {
+            short: p.short,
             entry_time: p.entry_ts,
             exit_time: exit_ts,
             entry_price: p.entry_price,
@@ -878,7 +926,7 @@ impl<'m> Kernel<'m> {
         let Some(mut p) = self.position.take() else { return };
         let (ts, close) = (self.m.ts[i], self.m.close[i]);
         let filled = p.size;
-        let gross = (close - p.entry_price) * filled * (1.0 * 1.0);
+        let gross = (close - p.entry_price) * filled * (p.direction().multiplier() * 1.0);
         let closing = &mut p.closing;
         closing.price = if closing.size > 0.0 {
             (closing.price * closing.size + close * filled) / (closing.size + filled)

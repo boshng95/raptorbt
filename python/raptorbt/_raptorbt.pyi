@@ -12,6 +12,7 @@ import numpy.typing as npt
 
 _F64 = npt.NDArray[np.float64]
 _I64 = npt.NDArray[np.int64]
+_I32 = npt.NDArray[np.int32]
 _Bool = npt.NDArray[np.bool_]
 _I8 = npt.NDArray[np.int8]
 
@@ -1058,6 +1059,9 @@ class PortfolioSession:
     # Apply schedule entries with timestamp < ts_ns. Stops immediately after
     # the first non-empty event batch and returns that batch's timestamp.
     def run_until(self, ts_ns: int) -> tuple[list[EngineEvent], int | None]: ...
+    def walk_book(
+        self, instrument: int, ts_now: int, drain: bool = ...
+    ) -> list[EngineEvent]: ...
     def submit_order(self, instrument: int, *args: Any, **kwargs: Any) -> int: ...
     def cancel_order(self, instrument: int, idx: int, order_id: int) -> bool: ...
     def cancel_all_orders(self, instrument: int, idx: int) -> list[int]: ...
@@ -1196,11 +1200,14 @@ class ReplayLedger:
 class CrossoverRuleSession:
     # Whether this build takes condition trees and level rules.
     LEVEL_RULES: bool
+    # The decision rules this build transcribes (`RULE_SESSION_VERSION`).
+    VERSION: int
     def __init__(
         self,
         reg_slots: list[int],
         reg_stream_index: list[int],
         reg_rank: list[int],
+        reg_built: list[bool],
         reg_timestamps: list[_I64],
         reg_labels: list[_I64 | None],
         slot_close: list[_F64],
@@ -1231,9 +1238,35 @@ class CrossoverRuleSession:
         entry_roots: list[int] | None = ...,
         # (two_sided, size_increment, minimum_notional) of the contract.
         level: tuple[bool, float, float] | None = ...,
+        # A two-sided run keeps no pending-close latch.
+        two_sided: bool = ...,
+        # The side an entry opens: 1, or -1 for a short node's rules.
+        entry_side: int = ...,
+        # Every crossing worked out once per evaluated bar, before any rule
+        # reads it (`StrategySpec.crossings` "each_bar").
+        each_bar: bool = ...,
+        # The run's risk exits: (fee rate, close with limit orders,
+        # (stop %, take-profit %) or None,
+        # (slot, ATR values, ATR ready, stop, take profit, trailing) or None,
+        # (slot, bars) or None). Every bar is then a callback.
+        policies: tuple[
+            float,
+            bool,
+            tuple[float, float] | None,
+            tuple[int, _F64, _Bool, float, float, bool] | None,
+            tuple[int, int] | None,
+        ]
+        | None = ...,
+        # The open short's borrow the trade and ATR exits charge (policies
+        # only): per primary bar its market date and the date a short opened
+        # on it settles, both in days from the epoch; the first of those
+        # dates; and one share's fee for each later day, summed, in units of
+        # 1e-10 (`open_short_borrow`).
+        borrow: tuple[_I32, _I32, int, _I64] | None = ...,
     ) -> None: ...
     # (processed, None or (side, reference price, None or (is exit, rule),
-    # policies after fill)).
+    # the risk exit that acted or None, the model close placed before it or
+    # None, order style "default" | "market" | "limit")).
     def advance(
         self,
         now: int,
@@ -1241,7 +1274,23 @@ class CrossoverRuleSession:
         has_position: bool,
         net_position: float,
         pending_target: float | None = ...,
-    ) -> tuple[bool, tuple[int, float | None, tuple[bool, int] | None, bool] | None]: ...
+        *,
+        # The account's raw position and its entry price (risk exits).
+        quantity: float = ...,
+        entry: float = ...,
+        apply_policies: bool = ...,
+    ) -> tuple[
+        bool,
+        tuple[
+            int,
+            float | None,
+            tuple[bool, int] | None,
+            str | None,
+            float | None,
+            str,
+        ]
+        | None,
+    ]: ...
     def reopens_exits_before_dispatch(
         self,
         idx: int,
@@ -1261,8 +1310,33 @@ class CrossoverRuleSession:
         halted: bool,
         pending_target: float | None,
         quiet: tuple[int, float, float, float, float, float, float, float],
+        *,
+        quantity: float = ...,
+        entry: float = ...,
     ) -> bool: ...
-    def on_fill(self) -> None: ...
+    # The fill's side (+1 buy, -1 sell), size and commission, and whether the
+    # account is flat after it (risk exits book what the position paid); a
+    # run that borrows names the primary bar the fill is stamped at and the
+    # position it left.
+    def on_fill(
+        self,
+        side: float = ...,
+        quantity: float = ...,
+        commission: float = ...,
+        flat: bool = ...,
+        *,
+        bar: int | None = ...,
+        position: float = ...,
+    ) -> None: ...
+    @property
+    def has_policies(self) -> bool: ...
+    @property
+    def has_borrow(self) -> bool: ...
+    # `NativeAccountView.accrued_borrow`: the open short's borrow so far.
+    @property
+    def accrued_borrow(self) -> float: ...
+    @property
+    def policy_resampled(self) -> bool: ...
     @property
     def visit_primary_after_fill(self) -> bool: ...
     @property
@@ -1273,9 +1347,10 @@ class CrossoverRuleSession:
     def last_reached(self) -> bool: ...
     @property
     def last_ready(self) -> bool: ...
-    def snapshot(self) -> tuple[tuple, tuple, tuple]: ...
+    def snapshot(self) -> tuple[tuple, tuple, tuple, tuple]: ...
 
 class KernelSession:
+    REPLAY_VERSION: int
     def __init__(
         self,
         symbol: str = ...,
@@ -1354,6 +1429,9 @@ class KernelSession:
     # does not transcribe, leaving the session spent. Given `book` --
     # (balance, currency precision, size increment, size precision, price
     # precision, currency) -- it returns that record booked, a ReplayLedger.
+    # Given `shorts` -- (cover at market, short attempts, stale bars, the
+    # short gate's refusal, the loan clock's cover bar, its admission) -- it
+    # is a short node's replay (REPLAY_VERSION 2).
     def replay_rules(
         self,
         timestamps: _I64,
@@ -1376,6 +1454,15 @@ class KernelSession:
         gate: _Bool | None = ...,
         money: MoneyModel | None = ...,
         book: tuple[float, int, float, int, int, str] | None = ...,
+        shorts: tuple[
+            bool,
+            int,
+            int,
+            Callable[[int, float, float, int | None], bool] | None,
+            Callable[[int], int] | None,
+            _Bool | None,
+        ]
+        | None = ...,
     ) -> list[tuple[Any, ...]] | ReplayLedger: ...
     def walk_book(self, ts_now: int) -> list[EngineEvent]: ...
     def submit_order(
@@ -1448,10 +1535,12 @@ def resolve_atr_period(
 
 # The canonical report of a single-name replay, as the engine's
 # PerformanceReportService writes it (execution_lane None), with the number
-# of order fills report rows and the closed trade rows' realized P&L in
-# order; None where the result must be built in Python instead. symbol is
-# the name the ledger booked; offsets are the (utc_ns, offset_ns)
-# transitions of timezone, known through offsets_until_ns.
+# of order fills report rows, the closed trade rows' realized P&L in order
+# and the borrow fee charged; None where the result must be built in Python
+# instead. symbol is the name the ledger booked; offsets are the (utc_ns,
+# offset_ns) transitions of timezone, known through offsets_until_ns.
+# financing is a run that may short: its primary bars' timestamps and its
+# borrow terms on them, charged to the daily curve before the report.
 def canonical_report(
     result: BacktestResult,
     ledger: ReplayLedger,
@@ -1462,7 +1551,11 @@ def canonical_report(
     offsets: list[tuple[int, int]],
     offsets_until_ns: int,
     risk_free_rate: float = ...,
-) -> tuple[dict[str, Any], int, list[float]] | None: ...
+    financing: tuple[_I64, _Financing] | None = ...,
+) -> tuple[dict[str, Any], int, list[float], float] | None: ...
+
+# 2 from the build whose canonical_report charges a short's borrow.
+CANONICAL_REPORT_VERSION: int
 
 def indicator_twin(
     kind: str,
@@ -1475,10 +1568,16 @@ def indicator_twin(
 ) -> tuple[_Bool, dict[str, _F64]] | str: ...
 
 # The lean lane: the account-coupled native replay of a library cell (a
-# legacy spec of crossovers or level rules over one resample, long only),
-# run on a market and frame shared by every cell of a stream. Its answers
-# are that lane's to the bit; a cell outside the shape is named, never run.
+# legacy spec of crossovers or level rules over one resample, its crossings
+# worked out as each rule checks them or each bar, long, or short under its
+# borrow terms), run on a market and frame shared by every cell of
+# a stream. Its answers are that lane's to the bit; a cell outside the shape
+# is named, never run.
 class LeanDeclined(RuntimeError): ...
+
+# 2 from the build whose lean replay takes a short node's terms; 3 from the
+# one that works crossings out each bar (`each_bar`).
+LEAN_REPLAY_VERSION: int
 
 class LeanMarket:
     def __init__(
@@ -1522,6 +1621,15 @@ _Tree = tuple[
 _Terms = tuple[float, float, float | None, int | None, float, float, float, float]
 _Venue = tuple[int, bool, bool, bool, float, float, float, float, float, str, int, int]
 _Book = tuple[float, int, float, int, int, str]
+# A short node's terms: (cover_market, max_attempts, max_stale_bars, admitted,
+# loan, admission), admitted per bar whether a short from flat clears the
+# borrow gate, loan a capped loan's (days, block_age, cover_bars).
+_Shorts = tuple[
+    bool, int, int, _Bool | None, tuple[_I32, int, _I64] | None, _Bool | None
+]
+# Its borrow: (dates, settles, priced, first_day, end_day, units, terminal_ns),
+# days counted from the epoch.
+_Financing = tuple[_I32, _I32, bool, int, int, _I64, int]
 
 def lean_replay(
     frame: LeanFrame,
@@ -1543,10 +1651,16 @@ def lean_replay(
     jumps: bool = ...,
     log: bool = ...,
     tree: _Tree | None = ...,
+    shorts: _Shorts | None = ...,
+    financing: _Financing | None = ...,
+    # `StrategySpec.crossings` "each_bar": every crossing once per evaluated
+    # bar, before any rule reads one.
+    each_bar: bool = ...,
 ) -> dict[str, Any]: ...
 
 # Per cell, the dict lean_replay returns without its log (a str naming why
-# where the cell leaves the lean shape); with screen, one dict of arrays.
+# where the cell leaves the lean shape), borrow_fee the borrow it was charged;
+# with screen, one dict of arrays.
 def lean_replay_many(
     frame: LeanFrame,
     gate: _Bool | None,
@@ -1567,6 +1681,10 @@ def lean_replay_many(
     curve: bool = ...,
     timings: bool = ...,
     trees: list[_Tree | None] | None = ...,
+    shorts: _Shorts | None = ...,
+    financing: _Financing | None = ...,
+    # Per cell, whether it works its crossings out each bar.
+    each_bar: list[bool] | None = ...,
 ) -> Any: ...
 
 # Exact-arithmetic probes: Python's float arithmetic as the report uses it.

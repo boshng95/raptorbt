@@ -275,6 +275,17 @@ pub struct Order {
     /// the book the submission bar leaves behind.
     #[serde(default)]
     pub arrives_before_bar: bool,
+    /// The order has met a book at the venue.
+    ///
+    /// A venue looks at a new order twice at the instant it arrives: once
+    /// as it drains the order in, then again as it walks every book it keeps
+    /// once that batch is in. Every later walk at the same instant is one
+    /// more look, and a bar that prints matches it as a resting order. So
+    /// how many bites of a standing book an order takes depends on whether
+    /// this look is its arrival, and only this flag can say -- the step, the
+    /// walk or the bar it rests into, whichever met it first, sets it.
+    #[serde(default)]
+    pub arrived: bool,
     /// Reject fills that would open a position (closing fills only).
     pub reduce_only: bool,
     /// One-triggers-other: held (not matched) until the parent order fills;
@@ -460,6 +471,7 @@ impl Order {
             target_price: None,
             post_only: false,
             arrives_before_bar: false,
+            arrived: false,
             reduce_only: false,
             parent_id: None,
             algo_id: None,

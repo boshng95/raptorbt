@@ -10,7 +10,7 @@
 use crate::core::types::{
     BacktestConfig, BacktestMetrics, BacktestResult, Direction, InstrumentConfig, Trade,
 };
-use crate::execution::orders::OrderRecord;
+use crate::execution::orders::{OrderRecord, WalkPhase};
 use crate::execution::{FeeModel, FillPrice, SlippageModel};
 use crate::instruments::InstrumentSpec;
 use crate::metrics::streaming::StreamingMetrics;
@@ -309,7 +309,7 @@ impl SingleRunner {
     pub fn walk_book(&mut self, ts_now: i64) -> Vec<EngineEvent> {
         let Some((idx, last)) = self.last_bar else { return Vec::new() };
         let bar = KernelBar { timestamp: ts_now, ..last };
-        let events = self.kernel.walk_book(idx, &bar);
+        let events = self.kernel.walk_book(idx, &bar, WalkPhase::Walk);
 
         for event in &events {
             if let EngineEvent::Exited { trade, .. } = event {

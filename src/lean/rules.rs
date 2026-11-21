@@ -26,16 +26,18 @@ use std::hash::Hash;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use super::Declined;
-use crate::python::rule_session::Latch;
+use crate::python::rule_session::{
+    delivery_step, Latch, PHASE_CLOSED_BY_GAP, PHASE_COMPLETED, PHASE_PRECLOSE, PHASE_PRIMARY,
+};
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Operand {
     Key(usize),
     Const(f64),
 }
 
 /// One compiled `CrossoverCondition`.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Cross {
     pub fast: Operand,
     pub slow: Operand,
@@ -144,6 +146,21 @@ impl Tree {
         Ok(Self { conditions, exits, entries, clocks, level })
     }
 
+    /// Each clock's crossing, in clock order: what `each_bar` steps on every
+    /// evaluated bar (`rule_session::clock_crossings`).
+    fn clock_crosses(&self) -> Result<Vec<Cross>, Declined> {
+        let mut found: Vec<Option<Cross>> = vec![None; self.clocks];
+        for condition in &self.conditions {
+            let Condition::Cross { clock, cross } = condition else { continue };
+            match found[*clock] {
+                None => found[*clock] = Some(*cross),
+                Some(seen) if seen == *cross => {}
+                Some(_) => return Err(Declined("one clock names two crossings")),
+            }
+        }
+        found.into_iter().map(|cross| cross.ok_or(Declined("a clock no crossing names"))).collect()
+    }
+
     fn operands(&self) -> impl Iterator<Item = Operand> + '_ {
         self.conditions.iter().flat_map(|condition| match condition {
             Condition::Zone { value, .. } => vec![*value],
@@ -171,9 +188,13 @@ pub struct Dispatch {
     pub ts: Vec<i64>,
     pub pos: Vec<usize>,
     pub close: Vec<f64>,
-    /// A resample bar labelled after its timestamp sorts before the primary
-    /// bar at that timestamp, otherwise after it.
-    pub first: Vec<bool>,
+    /// Each resample bar's dispatch phase (`rule_session::PHASE_*`). A lean
+    /// frame is a single instrument's leg, which the strategy builds from
+    /// its primary bars: a bar labelled after its timestamp is a pre-close
+    /// window and one labelled before it a window a gap closed, both decided
+    /// ahead of the primary bar at that timestamp ([`Dispatch::ahead`]);
+    /// any other follows it.
+    pub phase: Vec<i64>,
     /// The lowest resample close, NaN where any is.
     pub lowest_close: f64,
     /// Whether the labels rise, so no resample visit repeats the label
@@ -197,10 +218,29 @@ impl Dispatch {
         {
             return Err(Declined("dispatches that do not rise"));
         }
-        let first = labels.iter().zip(&ts).map(|(&l, &t)| l > t).collect();
+        let phase = labels
+            .iter()
+            .zip(&ts)
+            .map(|(&label, &dispatched)| {
+                if label > dispatched {
+                    PHASE_PRECLOSE
+                } else if label < dispatched {
+                    PHASE_CLOSED_BY_GAP
+                } else {
+                    PHASE_COMPLETED
+                }
+            })
+            .collect();
         let lowest_close = lowest(&close);
         let labels_rise = labels.windows(2).all(|pair| pair[0] < pair[1]);
-        Ok(Self { ts, pos, close, first, lowest_close, labels_rise })
+        Ok(Self { ts, pos, close, phase, lowest_close, labels_rise })
+    }
+
+    /// Whether resample bar `r` is decided ahead of the primary bar it is
+    /// dispatched with (`ScheduledBar.ahead_of_primary`).
+    #[inline]
+    pub fn ahead(&self, r: usize) -> bool {
+        self.phase[r] < PHASE_PRIMARY
     }
 
     #[inline]
@@ -336,6 +376,15 @@ pub struct Stream<'a> {
     pub has_instrument: bool,
     pub size_increment: f64,
     pub minimum_notional: f64,
+    /// The side the cell's entries open: 1 buys, -1 sells short
+    /// (`ComposableStrategy` under SHORT_ONLY). Its exits close either.
+    pub entry_side: i32,
+    /// `StrategySpec.crossings` ``each_bar``: every crossing worked out once
+    /// per evaluated bar, ahead of every rule ([`Stream::work_each_bar`]).
+    pub each_bar: bool,
+    /// Under level rules worked out each bar, each clock's crossing in clock
+    /// order; empty otherwise.
+    clock_crosses: Vec<Cross>,
 }
 
 impl<'a> Stream<'a> {
@@ -415,7 +464,27 @@ impl<'a> Stream<'a> {
             has_instrument,
             size_increment,
             minimum_notional,
+            entry_side: 1,
+            each_bar: false,
+            clock_crosses: Vec::new(),
         })
+    }
+
+    /// Work every crossing out once per evaluated bar, before any rule reads
+    /// one (`StrategySpec.crossings` ``each_bar``).
+    ///
+    /// A crossover a side then reads its exit as it reads its entry: each
+    /// evaluated bar steps both clocks, flat or held, so the exit crosses
+    /// where its operands cross from the admitted bar before -- the shared
+    /// bit -- and a primary visit, which holds the operands its resample
+    /// bar left, crosses nothing. Level rules step every clock first, in
+    /// clock order, and their conditions read what each one did.
+    pub fn work_each_bar(&mut self) -> Result<(), Declined> {
+        if let Some(tree) = self.tree {
+            self.clock_crosses = tree.clock_crosses()?;
+        }
+        self.each_bar = true;
+        Ok(())
     }
 
     #[inline]
@@ -448,6 +517,14 @@ impl<'a> Stream<'a> {
         r > self.ready && self.entry_crossings[r]
     }
 
+    /// Whether resample bar `r`'s visit exits, its crossings worked out each
+    /// bar: `exit` crosses there from the admitted bar before, on an admitted
+    /// bar after the first ready one.
+    #[inline]
+    pub fn exit_bit(&self, r: usize) -> bool {
+        r > self.ready && self.exit_crossings[r]
+    }
+
     /// The first resample bar from `from` whose visit enters, or the bar
     /// count.
     #[inline]
@@ -469,13 +546,11 @@ impl<'a> Stream<'a> {
     }
 }
 
-/// What `advance` decided: a target side, the price it was decided at, and
-/// whether it was decided by a primary bar's visit after a fill.
+/// What `advance` decided: a target side, and the price it was decided at.
 #[derive(Clone, Copy, Debug)]
 pub struct Target {
     pub side: i32,
     pub reference: Option<f64>,
-    pub policies_after_fill: bool,
 }
 
 /// The rule cursor's state.
@@ -492,11 +567,14 @@ pub struct Cursor {
     // changed sides in the current visit, whether the last visit reached
     // its keys, and the last evaluation's place in the dispatch order.
     clocks: Vec<Option<(f64, f64)>>,
+    /// Under `each_bar`, whether each clock crossed on the visit evaluating.
+    fired: Vec<bool>,
     flipped: bool,
     last_reached: bool,
-    last_sort_key: Option<(i64, u8)>,
-    /// The pending-close latch's last bar, or -1 ([`Latch`]). A lean replay
-    /// is long-only, so it always keeps one.
+    last_sort_key: Option<(i64, i64)>,
+    /// The pending-close latch's last bar, or -1 ([`Latch`]). A lean cell's
+    /// exits are latched closes of the one side it opens, so it always keeps
+    /// one.
     close_bar: i64,
 }
 
@@ -516,6 +594,7 @@ impl Cursor {
             current: None,
             last_primary_label: None,
             clocks: Vec::new(),
+            fired: Vec::new(),
             flipped: false,
             last_reached: false,
             last_sort_key: None,
@@ -525,7 +604,8 @@ impl Cursor {
 
     /// A fresh cursor for `s`'s rules.
     pub fn of(s: &Stream) -> Self {
-        Self { clocks: vec![None; s.tree.map_or(0, |tree| tree.clocks)], ..Self::new() }
+        let clocks = s.tree.map_or(0, |tree| tree.clocks);
+        Self { clocks: vec![None; clocks], fired: vec![false; clocks], ..Self::new() }
     }
 
     /// `_DeclarativeNode.decision_position`.
@@ -636,17 +716,22 @@ impl Cursor {
     }
 
     /// Holding a lot no close reads as dust, with the exit clock on the bar
-    /// last visited: the first resample bar whose visit can act -- the next
-    /// that exits. None where the cursor is not in that steady state.
+    /// last visited (under `each_bar`, always): the first resample bar whose
+    /// visit can act -- the next that exits. None where the cursor is not in
+    /// that steady state.
     pub fn quiet_held(&self, s: &Stream) -> Option<usize> {
         let current = self.current?;
         if self.visit_primary_after_fill
-            || self.last_position != 1
+            || self.last_position != s.entry_side
             || current >= self.next_dispatch
             || s.last_admitted(current + 1, self.next_dispatch).is_some()
             || current < s.ready
         {
             return None;
+        }
+        if s.each_bar {
+            // Every visit steps the exit clock: each exits on its own bit.
+            return Some(s.next_exit(self.next_dispatch));
         }
         let (a, b) = s.operands(&s.exit, current);
         let (p0, p1) = self.exit_clock?;
@@ -668,10 +753,10 @@ impl Cursor {
             // Each dispatch's events step the latch as `advance` would: flat,
             // it clears; held, it carries to the dispatch's bar.
             let mut latch = Latch::new(self.close_bar);
-            let side = i32::from(held);
+            let side = if held { s.entry_side } else { 0 };
             for r in from..to {
                 let bar = s.d.pos[r] as i64;
-                if s.d.first[r] {
+                if s.d.ahead(r) {
                     latch.step(bar, true, side);
                 }
                 latch.step(bar, false, side);
@@ -688,7 +773,7 @@ impl Cursor {
         if last >= s.ready {
             if held {
                 self.exit_clock = Some(s.operands(&s.exit, last));
-                self.last_position = 1;
+                self.last_position = s.entry_side;
             } else {
                 self.last_position = 0;
             }
@@ -774,7 +859,9 @@ impl Cursor {
             (bar, s.entry_bit(bar))
         };
         let mut exit = false;
-        if position != 0 {
+        if s.each_bar {
+            exit = position != 0 && !primary && s.exit_bit(r);
+        } else if position != 0 {
             let (a, b) = s.operands(&s.exit, r);
             if let Some(previous) = self.exit_clock {
                 exit = crossed(previous, a, b, s.exit.above);
@@ -817,7 +904,6 @@ impl Cursor {
         let mut target = start_side;
         let mut reference: Option<f64> = None;
         let mut entry_timestamp: Option<i64> = None;
-        let mut policies_after_fill = false;
         let res = (due && next_dispatch == now).then(|| {
             self.next_dispatch += 1;
             self.next_dispatch - 1
@@ -829,7 +915,7 @@ impl Cursor {
         }
         let events: [(bool, usize); 2];
         let events: &[(bool, usize)] = match res {
-            Some(r) if s.d.first[r] => {
+            Some(r) if s.d.ahead(r) => {
                 events = [(false, r), (true, idx)];
                 &events
             }
@@ -845,7 +931,7 @@ impl Cursor {
         let mut latch = Latch::new(self.close_bar);
         for &(primary, bar) in events {
             // Every event of a lean callback is on its clock, at `idx`.
-            let early = !primary && s.d.first[bar];
+            let early = !primary && s.d.ahead(bar);
             latch.step(idx as i64, early, start_side);
             if primary
                 && !self.visit_primary_after_fill
@@ -858,25 +944,21 @@ impl Cursor {
             if primary {
                 self.visit_primary_after_fill = false;
             }
-            if entry_timestamp == Some(now) {
-                policies_after_fill = true;
-            }
             let intent = self.visit(s, close, primary, bar, now, start_side, quantity, pending);
-            let previous = target;
             let Some((wants_entry, wants_exit, price)) = intent else { continue };
-            if !(wants_entry || wants_exit) {
+            let entering = entry_timestamp == Some(now);
+            let Some(moved) = delivery_step(
+                wants_entry,
+                wants_exit,
+                s.entry_side,
+                target,
+                start_side,
+                entering,
+                &latch,
+            ) else {
                 continue;
-            }
-            if wants_exit && target != 0 {
-                target = 0;
-            }
-            if wants_entry && target == 0 {
-                if latch.holds() {
-                    // Refused as ``PENDING_CLOSE``.
-                    continue;
-                }
-                target = 1;
-            }
+            };
+            let previous = std::mem::replace(&mut target, moved);
             if previous == 0 && target != 0 {
                 entry_timestamp = Some(now);
             }
@@ -889,7 +971,7 @@ impl Cursor {
         if target == start_side {
             return Ok((true, None));
         }
-        Ok((true, Some(Target { side: target, reference, policies_after_fill })))
+        Ok((true, Some(Target { side: target, reference })))
     }
 
     /// `rule_session::advance_level`: the events of one `advance` past its
@@ -924,10 +1006,9 @@ impl Cursor {
         let mut target = start_side;
         let mut reference: Option<f64> = None;
         let mut entry_timestamp: Option<i64> = None;
-        let mut policies_after_fill = false;
         let events: [(bool, usize); 2];
         let events: &[(bool, usize)] = match res {
-            Some(r) if s.d.first[r] => {
+            Some(r) if s.d.ahead(r) => {
                 events = [(false, r), (true, idx)];
                 &events
             }
@@ -942,11 +1023,8 @@ impl Cursor {
         };
         let mut latch = Latch::new(self.close_bar);
         for &(primary, bar) in events {
-            let early = !primary && s.d.first[bar];
+            let early = !primary && s.d.ahead(bar);
             latch.step(idx as i64, early, start_side);
-            if entry_timestamp == Some(now) {
-                policies_after_fill = true;
-            }
             self.flipped = false;
             let intent =
                 self.level_visit(s, tree, close, primary, bar, now, held_side, quantity, pending)?;
@@ -956,21 +1034,20 @@ impl Cursor {
             if self.flipped {
                 self.visit_primary_after_fill = true;
             }
-            let previous = target;
             let Some((wants_entry, wants_exit, price)) = intent else { continue };
-            if !(wants_entry || wants_exit) {
+            let entering = entry_timestamp == Some(now);
+            let Some(moved) = delivery_step(
+                wants_entry,
+                wants_exit,
+                s.entry_side,
+                target,
+                start_side,
+                entering,
+                &latch,
+            ) else {
                 continue;
-            }
-            if wants_exit && target != 0 {
-                target = 0;
-            }
-            if wants_entry && target == 0 {
-                if latch.holds() {
-                    // Refused as ``PENDING_CLOSE``.
-                    continue;
-                }
-                target = 1;
-            }
+            };
+            let previous = std::mem::replace(&mut target, moved);
             if previous == 0 && target != 0 {
                 entry_timestamp = Some(now);
             }
@@ -987,7 +1064,7 @@ impl Cursor {
             return Ok(None);
         }
         self.visit_primary_after_fill = true;
-        Ok(Some(Target { side: target, reference, policies_after_fill }))
+        Ok(Some(Target { side: target, reference }))
     }
 
     /// `visit` + `DecisionProgram.evaluate` of one event under level rules:
@@ -1027,11 +1104,12 @@ impl Cursor {
                 return Ok(None);
             }
             self.last_primary_label = Some(now);
-            (self.current, 1)
+            (self.current, PHASE_PRIMARY)
         } else {
             self.current = Some(bar);
-            (Some(bar), if s.d.first[bar] { 0 } else { 2 })
+            (Some(bar), s.d.phase[bar])
         };
+
         let order = (now, phase);
         if self.last_sort_key.is_some_and(|key| order < key) {
             return Err(Declined("events out of dispatch order"));
@@ -1043,6 +1121,11 @@ impl Cursor {
             return Ok(None);
         };
         self.last_reached = true;
+        // Every crossing, once, before any rule reads one -- flat or not, and
+        // whichever rules match first.
+        for (clock, cross) in s.clock_crosses.iter().enumerate() {
+            self.fired[clock] = self.step_clock(s, clock, cross, r);
+        }
         let exit_rule = if position != 0 {
             tree.exits.iter().position(|&root| self.holds(s, tree, r, root))
         } else {
@@ -1069,16 +1152,27 @@ impl Cursor {
                 compare.holds(s.operand(*left, r), s.operand(*right, r))
             }
             Condition::Cross { clock, cross } => {
-                let (a, b) = s.operands(cross, r);
-                match self.clocks[*clock].replace((a, b)) {
-                    None => false,
-                    Some((p0, p1)) => {
-                        if (p0 > p1) != (a > b) || (p0 < p1) != (a < b) {
-                            self.flipped = true;
-                        }
-                        crossed((p0, p1), a, b, cross.above)
-                    }
+                if s.each_bar {
+                    self.fired[*clock]
+                } else {
+                    self.step_clock(s, *clock, cross, r)
                 }
+            }
+        }
+    }
+
+    /// Step clock `clock` to `cross`'s operands on resample bar `r`: whether
+    /// it crossed from the bar it last stepped on.
+    #[inline]
+    fn step_clock(&mut self, s: &Stream, clock: usize, cross: &Cross, r: usize) -> bool {
+        let (a, b) = s.operands(cross, r);
+        match self.clocks[clock].replace((a, b)) {
+            None => false,
+            Some((p0, p1)) => {
+                if (p0 > p1) != (a > b) || (p0 < p1) != (a < b) {
+                    self.flipped = true;
+                }
+                crossed((p0, p1), a, b, cross.above)
             }
         }
     }
@@ -1245,5 +1339,25 @@ mod tests {
         assert!(!Level { two_sided: true, ..level }.reads_dust_as_flat(0.005, None, 100.0));
         let no_notional = Level { minimum_notional: 0.0, ..level };
         assert!(!no_notional.reads_dust_as_flat(0.04, None, 100.0));
+    }
+
+    #[test]
+    fn each_bar_steps_each_clock_once_in_clock_order() {
+        // `rule_session::clock_crossings`: a clock checked twice is stepped
+        // once; one naming two crossings, or none, declines.
+        let level = Level { two_sided: false, size_increment: 1.0, minimum_notional: 0.0 };
+        let up = Cross { fast: Operand::Key(0), slow: Operand::Const(1.0), above: true };
+        let down = Cross { above: false, ..up };
+        let other = Cross { fast: Operand::Key(1), ..up };
+        let arena = |crosses: &[(usize, Cross)]| -> Vec<Condition> {
+            crosses.iter().map(|&(clock, cross)| Condition::Cross { clock, cross }).collect()
+        };
+        let tree = Tree::new(arena(&[(1, other), (0, up), (0, up)]), vec![0], vec![1, 2], 2, level)
+            .unwrap();
+        assert_eq!(tree.clock_crosses().unwrap(), vec![up, other]);
+        let two = Tree::new(arena(&[(0, up), (0, down)]), vec![0], vec![1], 1, level).unwrap();
+        assert!(two.clock_crosses().is_err());
+        let none = Tree::new(arena(&[(0, up)]), vec![0], vec![0], 2, level).unwrap();
+        assert!(none.clock_crosses().is_err());
     }
 }

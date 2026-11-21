@@ -312,14 +312,14 @@ def run_strategy_backtest(
     # A strategy whose whole run the kernel can drive names it here: a
     # zero-argument hook answering with the rule session it executes, the
     # quiet bound, its venue terms, its money functions, its order gate and,
-    # optionally, a `MoneyModel` of the same functions and the terms of the
-    # strategy's book (see `KernelSession.replay_rules`), or None while its
-    # run is one the kernel does not transcribe. The kernel then runs every
-    # bar and hands the strategy what it booked, in order, through
-    # `on_replay` -- as a `ReplayLedger` that booked it too, given the book's
-    # terms; a branch the kernel does not transcribe raises `ReplayDeclined`
-    # with the session spent, for the caller to run a fresh strategy in its
-    # stead.
+    # optionally, a `MoneyModel` of the same functions, the terms of the
+    # strategy's book and a short node's terms (see
+    # `KernelSession.replay_rules`), or None while its run is one the kernel
+    # does not transcribe. The kernel then runs every bar and hands the
+    # strategy what it booked, in order, through `on_replay` -- as a
+    # `ReplayLedger` that booked it too, given the book's terms; a branch the
+    # kernel does not transcribe raises `ReplayDeclined` with the session
+    # spent, for the caller to run a fresh strategy in its stead.
     replay_rules = (
         getattr(strategy, "replay_rules", None)
         if fast_forward_rules is not None and hasattr(session, "replay_rules")
@@ -339,6 +339,7 @@ def run_strategy_backtest(
         rules, quiet, venue, units, snap, affordable, exhausted, gate = replay[:8]
         money = replay[8] if len(replay) > 8 else None
         book = replay[9] if len(replay) > 9 else None
+        shorts = replay[10] if len(replay) > 10 else None
         tag = getattr(strategy.config, "order_id_tag", None) or "O"
         arguments = (
             timestamps,
@@ -364,6 +365,7 @@ def run_strategy_backtest(
             gate,
             money,
             book,
+            shorts,
         )
         # A strategy may be shown the replay before the kernel runs it, with
         # the terms its session was opened on: one that raises there ends the

@@ -14,13 +14,17 @@
 //! is not a whole second, an amount Python would refuse -- and the caller
 //! builds the result instead.
 
+use std::borrow::Cow;
 use std::cmp::Ordering;
 
+use numpy::PyReadonlyArray1;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
 use super::bindings::{PyBacktestResult, PyTrade};
 use super::fill_ledger::{money, py_round, PyReplayLedger};
+use super::lean_bindings::{schedule, FinancingTuple};
+use crate::lean::financing::{charge, daily_fees};
 use crate::metrics::canonical::{calculate, LocalClock, ReportInputs, TradeRow, Value};
 use crate::metrics::exact;
 
@@ -199,17 +203,30 @@ pub(crate) fn to_python(py: Python<'_>, value: &Value) -> PyResult<PyObject> {
     })
 }
 
+/// `canonical_report`'s answer: the report, its order count, the closed
+/// trades' P&Ls and the borrow fee.
+type CanonicalReport = (PyObject, usize, Py<PyList>, f64);
+
 /// The canonical report of a replay, as `PerformanceReportService.calculate`
 /// writes it with `execution_lane` None; the number of order fills report
-/// rows (`total_trades`); and the realized P&L of each closed trade row, in
-/// order. None where the result must be built in Python instead.
+/// rows (`total_trades`); the realized P&L of each closed trade row, in
+/// order; and the borrow fee the run was charged. None where the result
+/// must be built in Python instead.
 ///
 /// *symbol* is the name *ledger* booked, and every round trip's. *offsets* are `timezone_transition_schedule` of *timezone* over the run's
 /// window, known through *offsets_until_ns*.
+///
+/// *financing* is a run that may short: its primary bars' timestamps and
+/// its borrow terms on them (`short_financing_terms`). Its fills are
+/// charged as `charge_short_financing` charges them, before the report is
+/// written: the fee each day's settled shorts cost posts to the daily
+/// curve, and the end value the curve may close on is net of the whole
+/// fee. A fill moving the shares short, or a daily point, that is not at
+/// one of the bars is declined.
 #[pyfunction]
 #[pyo3(signature = (
     result, ledger, *, symbol, starting, timezone, offsets, offsets_until_ns,
-    risk_free_rate = 0.0
+    risk_free_rate = 0.0, financing = None
 ))]
 #[allow(clippy::too_many_arguments)]
 pub fn canonical_report(
@@ -222,30 +239,57 @@ pub fn canonical_report(
     offsets: Vec<(i64, i64)>,
     offsets_until_ns: i64,
     risk_free_rate: f64,
-) -> PyResult<Option<(PyObject, usize, Py<PyList>)>> {
+    financing: Option<(PyReadonlyArray1<'_, i64>, FinancingTuple<'_>)>,
+) -> PyResult<Option<CanonicalReport>> {
+    let financed = match &financing {
+        Some((timestamps, terms)) => {
+            let bars = timestamps.as_slice()?;
+            Some((bars, schedule(terms, bars.len())?))
+        }
+        None => None,
+    };
     let built = (|| {
         let precision = ledger.currency_precision()?;
         let rows = trade_rows(&result.trades, symbol, &ledger.reduction_times()?, precision)?;
         let fills = ledger.report_amounts()?;
         let clock = LocalClock::new(&offsets, offsets_until_ns)?;
+        let mut day_ns = Cow::Borrowed(result.daily_performance_timestamps.as_slice());
+        let mut day_equity = Cow::Borrowed(result.daily_performance_equity.as_slice());
+        let mut borrow_fee = 0.0;
+        if let Some((bars, schedule)) = &financed {
+            let bar_of = |ns: i64| bars.binary_search(&ns).ok();
+            let fees = daily_fees(schedule, &ledger.short_deltas(bar_of)?);
+            if !fees.is_empty() {
+                let day_bars: Vec<usize> =
+                    day_ns.iter().map(|&ns| bar_of(ns)).collect::<Option<_>>()?;
+                borrow_fee = charge(
+                    schedule,
+                    &fees,
+                    &day_bars,
+                    day_ns.to_mut(),
+                    day_equity.to_mut(),
+                    result.metrics.end_value,
+                );
+            }
+        }
         let report = calculate(&ReportInputs {
             starting,
             risk_free_rate,
             timezone,
             clock: &clock,
-            day_ns: &result.daily_performance_timestamps,
-            day_equity: &result.daily_performance_equity,
+            day_ns: &day_ns,
+            day_equity: &day_equity,
             trades: &rows,
             fills: &fills,
         })?;
         let closed: Vec<f64> =
             rows.iter().filter(|row| row.closed_s.is_some()).map(|row| row.realized).collect();
-        Some((report, fills.price.len(), closed))
+        Some((report, fills.price.len(), closed, borrow_fee))
     })();
     match built {
         None => Ok(None),
-        Some((report, orders, closed)) => {
-            Ok(Some((to_python(py, &report)?, orders, PyList::new(py, closed).into())))
+        Some((report, orders, closed, borrow_fee)) => {
+            Ok(Some((to_python(py, &report)?, orders, PyList::new(py, closed).into(), borrow_fee)))
         }
     }
 }

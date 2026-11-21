@@ -19,7 +19,7 @@ use crate::data::{DepthTick, OrderBook, QuoteTick, TradeTick};
 use crate::execution::algos::AlgoEngine;
 use crate::execution::fill::{FillDepth, FillRng, Tail};
 use crate::execution::orders::{
-    MatchOutcome, OrderEngine, OrderKind, OrderStatus, QtySpec, TimeInForce,
+    MatchOutcome, OrderEngine, OrderKind, OrderStatus, QtySpec, TimeInForce, WalkPhase,
 };
 // Re-exported for `kernel_tests.rs`, which pulls this module in with `use
 // super::*`; the kernel itself does not name these types.
@@ -730,6 +730,13 @@ impl EngineKernel {
 
     pub fn rejected_entries(&self) -> usize {
         self.risk.rejected_entries()
+    }
+
+    /// Leave the venue's walk behind a step's arrivals to the driver
+    /// ([`OrderEngine::set_host_walks`]), which walks every book itself
+    /// after each step it routes into.
+    pub fn set_host_walks(&mut self, host_walks: bool) {
+        self.orders.set_host_walks(host_walks);
     }
 
     /// Overwrite available cash.
@@ -1466,13 +1473,15 @@ impl EngineKernel {
     /// sampling all stay with the step that owns them: no bar arrived here.
     /// `bar` is the last one this instrument stepped, dated to the instant
     /// the walk happens, since that is when any fill it produces occurred.
-    pub fn walk_book(&mut self, idx: usize, bar: &KernelBar) -> Vec<EngineEvent> {
+    /// `phase` says which half of the venue's pass this is
+    /// ([`OrderEngine::walk_book`]).
+    pub fn walk_book(&mut self, idx: usize, bar: &KernelBar, phase: WalkPhase) -> Vec<EngineEvent> {
         self.stepping_trade = false;
         // Acknowledgments queued since the last step lead the list, exactly
         // as they do on the step path: the venue accepts an order when it
         // drains it, which is this pass.
         let mut events = std::mem::take(&mut self.pending_events);
-        for outcome in self.orders.walk_book() {
+        for outcome in self.orders.walk_book(phase) {
             self.apply_match_outcome(idx, bar, outcome, &mut events);
         }
         // A market order arriving here crosses the same book, and it has to

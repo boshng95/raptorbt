@@ -24,6 +24,26 @@ enum MatchMode {
     Trade,
 }
 
+/// Which half of a venue's settlement pass a walk of one book plays.
+///
+/// After every data item and every timer, a venue that has commands
+/// pending drains them -- each new order matched against its book as it
+/// arrives, an order a fill provokes meanwhile joining the same drain --
+/// and only then walks every book it keeps once, for what rests there. It
+/// repeats that while fills keep provoking orders. A driver keeping several
+/// books plays the two halves apart, so each order takes the bites it would
+/// have: one on arrival, one per walk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WalkPhase {
+    /// The drain: an order that has not met a book meets this one, once.
+    /// An order already at the venue is left alone.
+    Drain,
+    /// The walk: one more look for every order resting here. An order that
+    /// has not met a book yet -- no drain ran for it -- arrives now, and
+    /// takes the walk behind its arrival as well, as the step would give it.
+    Walk,
+}
+
 /// What happened to one order during a bar.
 #[derive(Debug, Clone, PartialEq)]
 pub enum MatchOutcome {
@@ -115,6 +135,15 @@ pub struct OrderEngine {
     /// Opt-in compatibility for decisions made by a composite callback just
     /// before the primary close with the same timestamp.
     same_bar_marketable_limit_on_close: bool,
+    /// Whether the driver walks this book after every step it routes into.
+    ///
+    /// A venue looks at an order it drains in, then walks every book once
+    /// the batch is in. A step that is the whole settlement of its batch --
+    /// one instrument, nothing walking after it -- owes the order both looks.
+    /// A driver that walks every book itself after the step (see
+    /// [`WalkPhase`]) owns the second, so the step gives the first alone;
+    /// taking both here as well hands the order a third bite of the book.
+    host_walks: bool,
     /// The venue's tape: what last traded and the size showing there. It
     /// carries across bars because a bar that never leaves the last traded
     /// price prints nothing and leaves the book untouched.
@@ -151,6 +180,13 @@ impl OrderEngine {
     /// An engine whose DAY orders expire on a trading date offset from UTC.
     pub fn with_tz_offset(tz_offset_ns: i64, same_bar_marketable_limit_on_close: bool) -> Self {
         Self { tz_offset_ns, same_bar_marketable_limit_on_close, ..Self::default() }
+    }
+
+    /// Leave the venue's walk behind a step's arrivals to the driver, which
+    /// walks every book itself after each step it routes into (see
+    /// `host_walks`).
+    pub fn set_host_walks(&mut self, host_walks: bool) {
+        self.host_walks = host_walks;
     }
 
     /// Size the venue's book is showing, unbounded until something trades.
@@ -360,17 +396,23 @@ impl OrderEngine {
         self.match_events(idx, tick, fill_model, MatchMode::Trade)
     }
 
-    /// Walk the standing book once for every order resting on it.
+    /// Play one half of a venue settlement pass over the standing book.
     ///
     /// This is the venue settling, not a bar arriving: nothing is replayed
     /// onto the tape, no bar phase is read and nothing expires -- the market
-    /// has not moved, only the order flow has. A venue walks every book it
-    /// keeps each time it drains a batch of commands, so an order resting
-    /// here meets the same book again whenever the strategy acts on *any*
-    /// instrument the venue lists. [`BarTape::offered`] already carries the
-    /// walk that belongs to the order's own batch; this is for the batches
-    /// that arrive with somebody else's bar, which is why a portfolio needs
-    /// it and a single instrument does not.
+    /// has not moved, only the order flow has. After every data item and
+    /// timer with commands pending, a venue drains them, matching each new
+    /// order against its book, then walks every book it keeps once (see
+    /// [`WalkPhase`]). So the bites an order takes of a book that has not
+    /// moved are counted, not assumed: one on arrival, and one for every
+    /// walk -- including the walks the strategy provokes by acting on *any*
+    /// instrument the venue lists.
+    ///
+    /// An order meets the book in [`WalkPhase::Drain`] only if it has not
+    /// met one yet. In [`WalkPhase::Walk`] every order resting here takes one
+    /// bite, and one that has not met a book yet arrives as the step would
+    /// let it arrive, [`BarTape::offered`]: on its own, a single instrument's
+    /// pass is the arrival with the walk behind it.
     ///
     /// Only a plain limit crosses a standing book: a stop is armed by a
     /// print and there is none here, and a market order was swept when it
@@ -382,7 +424,7 @@ impl OrderEngine {
     /// The caller dates the walk by the bar it hands the kernel, so the
     /// outcomes are never `on_arrival`: the fill happens now, not when the
     /// order was sent.
-    pub fn walk_book(&mut self) -> Vec<MatchOutcome> {
+    pub fn walk_book(&mut self, phase: WalkPhase) -> Vec<MatchOutcome> {
         self.materialize_book();
         let book = self.tape;
         let Some((at, _)) = book.book() else { return Vec::new() };
@@ -395,7 +437,7 @@ impl OrderEngine {
         let parent_state = self.parent_states();
         let mut actions = Vec::new();
         for slot in 0..self.working.len() {
-            let order = &self.orders[self.working[slot] as usize];
+            let order = &mut self.orders[self.working[slot] as usize];
             // A child whose parent has not filled is not at the venue yet.
             // One whose parent died is dead with it, but the bar pass owns
             // that transition; this pass only declines to match it.
@@ -405,15 +447,20 @@ impl OrderEngine {
                 }
             }
             let OrderKind::Limit { price } = order.kind else { continue };
-            let depth = book.offered_once(price, order.side == OrderSide::Buy);
+            let buying = order.side == OrderSide::Buy;
+            let immediate = matches!(order.tif, TimeInForce::Ioc | TimeInForce::Fok);
+            let depth = match (order.arrived, phase) {
+                (true, WalkPhase::Drain) => continue,
+                (true, WalkPhase::Walk) | (false, WalkPhase::Drain) => {
+                    book.offered_once(price, buying)
+                }
+                (false, WalkPhase::Walk) => book.offered(price, buying, immediate),
+            };
+            order.arrived = true;
             if depth.is_empty() {
-                let id = order.id;
-                let immediate = matches!(order.tif, TimeInForce::Ioc | TimeInForce::Fok);
                 if immediate {
-                    if let Some(order) = self.orders.get_mut(id as usize) {
-                        let _ = order.transition(OrderStatus::Canceled);
-                    }
-                    actions.push(MatchOutcome::Cancel { order_id: id });
+                    let _ = order.transition(OrderStatus::Canceled);
+                    actions.push(MatchOutcome::Cancel { order_id: order.id });
                 }
                 continue;
             }
@@ -663,6 +710,7 @@ impl OrderEngine {
         let parent_state = self.parent_states();
 
         let same_bar_close = self.same_bar_marketable_limit_on_close;
+        let host_walks = self.host_walks;
         for slot in 0..self.working.len() {
             let order = &mut self.orders[self.working[slot] as usize];
             // The index is a superset between prunes, so status is checked
@@ -737,6 +785,16 @@ impl OrderEngine {
                 })
             };
 
+            // Whether this is the order's arrival. A walk that ran since it
+            // was sent has met it already: then it was resting by the time
+            // this bar reached the venue -- or, sent from this bar's close,
+            // the range is behind it, and it waits for the next bar.
+            let arriving = !order.arrived;
+            order.arrived = true;
+            if submitted_this_bar && !arriving && !order.arrives_before_bar {
+                continue;
+            }
+
             // An order that reached the venue while this bar was being
             // observed meets a standing book, not the bar: only a plain
             // limit which crosses that book participates here. This bar's
@@ -744,7 +802,7 @@ impl OrderEngine {
             // the order, for one sent from this bar's close, or ahead of
             // it, for one that beat the bar; neither is a book it could
             // have crossed on arrival.
-            if submitted_this_bar {
+            if submitted_this_bar && arriving {
                 // Whichever book was standing when the order reached the
                 // venue: the one this step leaves behind, or -- for an
                 // order sent before this bar arrived -- the one before it.
@@ -753,9 +811,15 @@ impl OrderEngine {
                     // The standing book is what is in front of such an
                     // order. It crosses that book, so it fills at the
                     // book's price, not at its own limit, and a limit
-                    // strictly through it empties the level beneath.
+                    // strictly through it empties the level beneath. The
+                    // venue's walk behind the arrival is the driver's when
+                    // it walks every book after the step, and this step's
+                    // otherwise.
                     OrderKind::Limit { price } => {
-                        let depth = standing.offered(price, buying, immediate);
+                        let depth = match host_walks {
+                            true => standing.offered_once(price, buying),
+                            false => standing.offered(price, buying, immediate),
+                        };
                         let at = standing.book().map(|(price, _)| price);
                         match (depth.is_empty(), at) {
                             (false, Some(at)) => Some(MatchOutcome::Fill {
@@ -1191,8 +1255,10 @@ mod tests {
             depth: FillDepth::single(1_000.0, Tail::Rests),
             on_arrival: false,
         };
-        assert_eq!(engine.walk_book(), vec![bite.clone()]);
-        assert_eq!(engine.walk_book(), vec![bite], "the book does not deplete");
+        assert_eq!(engine.walk_book(WalkPhase::Walk), vec![bite.clone()]);
+        assert_eq!(engine.walk_book(WalkPhase::Walk), vec![bite], "the book does not deplete");
+        // The bar met it, so no drain is its arrival.
+        assert_eq!(engine.walk_book(WalkPhase::Drain), vec![]);
     }
 
     #[test]
@@ -1203,12 +1269,12 @@ mod tests {
         let (mut engine, _) =
             engine_with(OrderKind::Limit { price: 9.0 }, OrderSide::Buy, TimeInForce::Gtc);
         engine.match_bar(1, &quiet(1, 10.0, 4_000.0), &fm);
-        assert_eq!(engine.walk_book(), vec![]);
+        assert_eq!(engine.walk_book(WalkPhase::Walk), vec![]);
 
         let (mut engine, _) =
             engine_with(OrderKind::StopMarket { trigger: 10.0 }, OrderSide::Buy, TimeInForce::Gtc);
         engine.match_bar(1, &quiet(1, 10.0, 4_000.0), &fm);
-        assert_eq!(engine.walk_book(), vec![]);
+        assert_eq!(engine.walk_book(WalkPhase::Walk), vec![]);
     }
 
     #[test]
@@ -1228,8 +1294,138 @@ mod tests {
         let _ = order.transition(OrderStatus::Accepted);
         let id = engine.submit(order);
 
-        assert_eq!(engine.walk_book(), vec![MatchOutcome::Cancel { order_id: id }]);
+        assert_eq!(engine.walk_book(WalkPhase::Walk), vec![MatchOutcome::Cancel { order_id: id }]);
         assert_eq!(engine.get(id).map(|order| order.status), Some(OrderStatus::Canceled));
+    }
+
+    /// An accepted plain limit for `units`, sent between bars or from bar
+    /// `submitted_idx`.
+    fn limit(side: OrderSide, units: f64, price: f64, submitted_idx: usize) -> Order {
+        let mut order =
+            Order::plain(side, QtySpec::Units(units), OrderKind::Limit { price }, TimeInForce::Gtc);
+        order.submitted_idx = submitted_idx;
+        let _ = order.transition(OrderStatus::Accepted);
+        order
+    }
+
+    #[test]
+    fn a_walk_meeting_an_order_first_is_its_arrival_and_the_walk_behind_it() {
+        // An order placed between bars -- from a timer, or on hearing a fill
+        // -- reaches the venue at a walk, not at a step. The venue drains it
+        // in against the book, then walks that book once more, so at its
+        // own price it takes two bites at once; every walk after is one.
+        let fm = FillModel::default().with_bar_liquidity(BarLiquidity::NAUTILUS);
+        let mut engine = OrderEngine::new();
+        engine.match_bar(0, &quiet(0, 10.0, 4_000.0), &fm);
+        let id = engine.submit(limit(OrderSide::Buy, 5_000.0, 10.0, 0));
+        let fill =
+            |depth| MatchOutcome::Fill { order_id: id, price: 10.0, depth, on_arrival: false };
+
+        assert_eq!(
+            engine.walk_book(WalkPhase::Walk),
+            vec![fill(FillDepth::repeated(1_000.0, 2, Tail::Rests))]
+        );
+        assert_eq!(
+            engine.walk_book(WalkPhase::Walk),
+            vec![fill(FillDepth::single(1_000.0, Tail::Rests))]
+        );
+    }
+
+    #[test]
+    fn the_drain_meets_only_orders_new_to_the_venue_and_only_once() {
+        // A driver keeping several books plays a pass's two halves apart:
+        // the drain gives each order new to the venue its arrival, and the
+        // walk after it gives every order resting here one more look.
+        let fm = FillModel::default().with_bar_liquidity(BarLiquidity::NAUTILUS);
+        let mut engine = OrderEngine::new();
+        let resting = engine.submit(limit(OrderSide::Buy, 5_000.0, 10.0, 0));
+        engine.match_bar(1, &quiet(1, 10.0, 4_000.0), &fm);
+        let fresh = engine.submit(limit(OrderSide::Buy, 5_000.0, 10.0, 1));
+        let bite = |order_id| MatchOutcome::Fill {
+            order_id,
+            price: 10.0,
+            depth: FillDepth::single(1_000.0, Tail::Rests),
+            on_arrival: false,
+        };
+
+        assert_eq!(engine.walk_book(WalkPhase::Drain), vec![bite(fresh)]);
+        assert_eq!(engine.walk_book(WalkPhase::Drain), vec![], "an order arrives once");
+        assert_eq!(engine.walk_book(WalkPhase::Walk), vec![bite(resting), bite(fresh)]);
+    }
+
+    #[test]
+    fn a_step_its_driver_walks_after_gives_an_arrival_one_bite() {
+        // An order sent from a bar's close meets the book that bar leaves.
+        // When the step is the whole settlement it takes the arrival and the
+        // walk behind it; when the driver walks every book after the step,
+        // that walk is the second bite, and the step gives the first alone.
+        for (host_walks, depth) in [
+            (false, FillDepth::repeated(1_000.0, 2, Tail::Rests)),
+            (true, FillDepth::single(1_000.0, Tail::Rests)),
+        ] {
+            let fm = FillModel::default().with_bar_liquidity(BarLiquidity::NAUTILUS);
+            let mut engine = OrderEngine::with_tz_offset(0, true);
+            engine.set_host_walks(host_walks);
+            engine.match_bar(0, &quiet(0, 10.0, 4_000.0), &fm);
+            let id = engine.submit(limit(OrderSide::Buy, 5_000.0, 10.0, 1));
+
+            assert_eq!(
+                engine.match_bar(1, &quiet(1, 10.0, 4_000.0), &fm),
+                vec![MatchOutcome::Fill { order_id: id, price: 10.0, depth, on_arrival: false }],
+                "host_walks={host_walks}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_order_a_walk_met_rests_into_the_bar_it_beat() {
+        // Placed ahead of its bar and drained in then, against the book the
+        // last bar left: when its own bar comes it is resting, so the bar's
+        // prints reach it. Meeting that old book a second time, as if
+        // arriving, would hand it bites it has already taken.
+        let fm = FillModel::default().with_bar_liquidity(BarLiquidity::NAUTILUS);
+        let mut engine = OrderEngine::new();
+        engine.match_bar(0, &quiet(0, 10.0, 4_000.0), &fm);
+        let mut order = limit(OrderSide::Buy, 50_000.0, 10.0, 1);
+        order.arrives_before_bar = true;
+        let id = engine.submit(order);
+
+        assert_eq!(
+            engine.walk_book(WalkPhase::Drain),
+            vec![MatchOutcome::Fill {
+                order_id: id,
+                price: 10.0,
+                depth: FillDepth::single(1_000.0, Tail::Rests),
+                on_arrival: false,
+            }]
+        );
+        // A bar that trades down through the order's price.
+        let outcomes = engine.match_bar(1, &bar(1, 10.2, 10.5, 9.5, 10.0), &fm);
+        assert!(
+            matches!(
+                outcomes.as_slice(),
+                [MatchOutcome::Fill { order_id, on_arrival: false, .. }] if *order_id == id
+            ),
+            "a resting fill off the bar, not a second arrival: {outcomes:?}"
+        );
+    }
+
+    #[test]
+    fn an_order_sent_from_a_bar_and_walked_waits_for_the_next_bar() {
+        // Sent from a bar's close, and met by a walk before the step applied
+        // that bar: the bar's range is behind it, and the step owes it no
+        // second arrival. It rests into the bar after.
+        let fm = FillModel::default();
+        let mut engine = OrderEngine::with_tz_offset(0, true);
+        engine.match_bar(0, &bar(0, 99.0, 100.0, 98.5, 99.5), &fm);
+        let id = engine.submit(limit(OrderSide::Buy, 1.0, 99.0, 1));
+
+        assert_eq!(engine.walk_book(WalkPhase::Walk), vec![]);
+        assert!(engine.match_bar(1, &bar(1, 100.0, 102.0, 98.0, 100.5), &fm).is_empty());
+        assert_eq!(
+            engine.match_bar(2, &bar(2, 100.0, 101.0, 98.0, 99.0), &fm),
+            vec![filled(id, 99.0)]
+        );
     }
 
     #[test]

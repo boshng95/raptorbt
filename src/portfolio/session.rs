@@ -39,6 +39,7 @@ use crate::data::{
     tick_data_to_events, DepthRef, DepthTick, EventFeed, EventPayload, MarketEvent, QuoteTick,
     TradeTick,
 };
+use crate::execution::orders::WalkPhase;
 use crate::instruments::InstrumentSpec;
 use crate::metrics::streaming::StreamingMetrics;
 use crate::portfolio::curve::InstantCurve;
@@ -239,6 +240,10 @@ impl EventSession {
         }
         // The account owns all capital; kernels borrow it per step.
         kernel.set_cash(0.0);
+        // The driver walks every book after each step it routes into
+        // (`walk_book`), so that walk -- not the step -- is the venue's look
+        // behind an order the step meets on arrival.
+        kernel.set_host_walks(true);
         self.kernels.push(kernel);
         self.symbols.push(symbol);
         self.bars.push(Arc::default());
@@ -877,17 +882,18 @@ impl EventSession {
     /// Settle one instrument's resting orders against the market it last
     /// saw, at `ts_now`, without consuming a schedule entry.
     ///
-    /// A venue walks every book it keeps each time it drains a batch of
-    /// commands, so an order resting on one instrument meets the book again
-    /// whenever the strategy acts on another. The driver calls this for
-    /// every instrument it lists, once per batch it routes -- including the
-    /// one whose bar is in hand. That instrument's step settled the batch
-    /// standing when its bar arrived, but an order the strategy places in
-    /// answer to that bar's own fills reaches the venue afterwards and has
-    /// met no book at all; leaving it out would hold it to the next bar's
-    /// range while every other name's equivalent order crossed at once.
-    /// Re-walking an order that already had its chance costs nothing: one
-    /// that could cross the standing book would have crossed it then.
+    /// A venue settles each batch of commands it drains in two halves: it
+    /// matches every new order against its book as it arrives, then walks
+    /// every book it keeps once (see [`WalkPhase`]). So an order resting on
+    /// one instrument meets the book again whenever the strategy acts on
+    /// another, and how much of a book an order takes is counted in looks:
+    /// one on arrival, one per walk. The driver plays both halves: for each
+    /// batch it routes, [`WalkPhase::Drain`] for the instruments ordered on
+    /// -- again while the fills it reports keep ordering -- then
+    /// [`WalkPhase::Walk`] for every instrument it lists, the one whose bar
+    /// is in hand included. That instrument's step met the orders standing
+    /// when its bar arrived, giving each new one its arrival alone, because
+    /// every session kernel leaves the walk behind it to this.
     ///
     /// The account is shared exactly as it is on the step path: the kernel
     /// is lent the portfolio's capital, walked, then drained back. The cursor
@@ -897,7 +903,12 @@ impl EventSession {
     ///
     /// An instrument that has not seen a bar yet has no book for its orders
     /// to meet, and yields nothing.
-    pub fn walk_book(&mut self, instrument: usize, ts_now: i64) -> Vec<EngineEvent> {
+    pub fn walk_book(
+        &mut self,
+        instrument: usize,
+        ts_now: i64,
+        phase: WalkPhase,
+    ) -> Vec<EngineEvent> {
         let Some((idx, last)) = self.last_seen.get(instrument).copied().flatten() else {
             return Vec::new();
         };
@@ -920,7 +931,7 @@ impl EventSession {
         };
         kernel.set_cash(injected);
         kernel.set_external_open_count(portfolio_open);
-        let events = kernel.walk_book(idx, &bar);
+        let events = kernel.walk_book(idx, &bar, phase);
         let delta_cash = kernel.cash() - injected;
         let delta_locked = kernel.locked_margin() - locked_before;
         kernel.set_cash(0.0);

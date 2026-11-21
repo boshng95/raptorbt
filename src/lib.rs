@@ -91,10 +91,16 @@ fn _raptorbt(py: Python<'_>, m: &PyModule) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(python::lean_bindings::lean_replay, m)?)?;
     m.add_function(wrap_pyfunction!(python::lean_bindings::lean_replay_many, m)?)?;
     m.add("LeanDeclined", py.get_type::<python::lean_bindings::LeanDeclined>())?;
+    // 2: the lean replay takes a short node's terms (`shorts`, `financing`).
+    // 3: it works crossings out each bar (`each_bar`).
+    m.add("LEAN_REPLAY_VERSION", 3_u32)?;
     m.add_function(wrap_pyfunction!(python::strategy_bindings::resolve_atr_period, m)?)?;
 
     // Register the canonical report of a replay and its exact-arithmetic probes
     m.add_function(wrap_pyfunction!(python::report_bindings::canonical_report, m)?)?;
+    // 2: `canonical_report` charges a short's borrow (`financing`) and
+    // answers the fee with the report.
+    m.add("CANONICAL_REPORT_VERSION", 2_u32)?;
     m.add_function(wrap_pyfunction!(python::report_bindings::exact_fsum, m)?)?;
     m.add_function(wrap_pyfunction!(python::report_bindings::exact_sum, m)?)?;
     m.add_function(wrap_pyfunction!(python::report_bindings::exact_np_sum, m)?)?;

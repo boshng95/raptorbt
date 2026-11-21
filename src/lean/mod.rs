@@ -9,6 +9,7 @@
 //! branch the lane transcribes and this does not, it returns [`Declined`]
 //! and the caller runs the cell on the full lane.
 
+pub mod financing;
 pub mod kernel;
 pub mod market;
 pub mod replay;

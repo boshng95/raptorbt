@@ -8,10 +8,12 @@
 //! (`exact`), so every number is Python's to the bit and every key is where
 //! Python puts it.
 //!
-//! Instants are whole UTC seconds: the report reads them as Python
-//! `datetime`s, which keep microseconds, and only a whole second reads the
-//! same in both. Anything this does not transcribe, or that Python would
-//! raise on, answers `None`, and the caller builds the report in Python.
+//! The curve's instants are whole UTC microseconds: the report reads them as
+//! Python `datetime`s, which keep microseconds and no finer, so only those
+//! read the same in both (a financed short's closing mark is one, at
+//! 23:59:59.999999 on the last date). Trade rows are whole seconds. Anything
+//! this does not transcribe, or that Python would raise on, answers `None`,
+//! and the caller builds the report in Python.
 
 use std::cmp::Ordering;
 
@@ -21,6 +23,9 @@ pub const SCHEMA: &str = "canonical_daily_mtm_v1";
 
 const DAY_SECONDS: i64 = 86_400;
 const NS_PER_SECOND: i64 = 1_000_000_000;
+const NS_PER_MICRO: i64 = 1_000;
+const MICROS_PER_SECOND: i64 = 1_000_000;
+const DAY_MICROS: i64 = DAY_SECONDS * MICROS_PER_SECOND;
 /// `calendar_returns.YEAR_DAYS`.
 const YEAR_DAYS: f64 = 365.2425;
 /// `calendar_returns._SECONDS_PER_YEAR`.
@@ -91,11 +96,12 @@ pub struct FillAmounts {
 }
 
 /// A timezone as `timezone_transition_schedule` writes it down: the offset
-/// in force from each UTC second on, known up to `until_s`.
+/// in force from each UTC second on, known up to `until_us`. Kept, and read,
+/// in microseconds.
 #[derive(Clone, Debug)]
 pub struct LocalClock {
     offsets: Vec<(i64, i64)>,
-    until_s: i64,
+    until_us: i64,
 }
 
 impl LocalClock {
@@ -107,32 +113,32 @@ impl LocalClock {
             if from % NS_PER_SECOND != 0 || offset % NS_PER_SECOND != 0 {
                 return None;
             }
-            let entry = (from / NS_PER_SECOND, offset / NS_PER_SECOND);
+            let entry = (from / NS_PER_MICRO, offset / NS_PER_MICRO);
             if offsets.last().is_some_and(|&(last, _): &(i64, i64)| last >= entry.0) {
                 return None;
             }
             offsets.push(entry);
         }
-        Some(Self { offsets, until_s: until_ns.div_euclid(NS_PER_SECOND) })
+        Some(Self { offsets, until_us: until_ns.div_euclid(NS_PER_MICRO) })
     }
 
-    /// Local wall-clock seconds at a UTC second, inside the schedule.
-    fn local(&self, utc_s: i64) -> Option<i64> {
-        if utc_s > self.until_s {
+    /// Local wall-clock microseconds at a UTC microsecond, inside the schedule.
+    fn local(&self, utc_us: i64) -> Option<i64> {
+        if utc_us > self.until_us {
             return None;
         }
-        let at = self.offsets.partition_point(|&(from, _)| from <= utc_s);
-        (at > 0).then(|| utc_s + self.offsets[at - 1].1)
+        let at = self.offsets.partition_point(|&(from, _)| from <= utc_us);
+        (at > 0).then(|| utc_us + self.offsets[at - 1].1)
     }
 
     /// `calendar_returns.close_date`: the local day an instant closes, the
     /// day before at the stroke of midnight. The reference `close_dates` is
     /// held to.
     #[cfg(test)]
-    fn close_date(&self, utc_s: i64) -> Option<Date> {
-        let local = self.local(utc_s)?;
-        let mut days = local.div_euclid(DAY_SECONDS);
-        if local.rem_euclid(DAY_SECONDS) == 0 {
+    fn close_date(&self, utc_us: i64) -> Option<Date> {
+        let local = self.local(utc_us)?;
+        let mut days = local.div_euclid(DAY_MICROS);
+        if local.rem_euclid(DAY_MICROS) == 0 {
             days -= 1;
         }
         Some(Date::of_days(days))
@@ -145,19 +151,19 @@ impl LocalClock {
         // How many offsets are in force by the stamp: `local`'s partition point.
         let mut at = 0;
         let mut previous: Option<(i64, Date)> = None;
-        for &utc_s in stamps {
-            if utc_s > self.until_s {
+        for &utc_us in stamps {
+            if utc_us > self.until_us {
                 return None;
             }
-            while at < self.offsets.len() && self.offsets[at].0 <= utc_s {
+            while at < self.offsets.len() && self.offsets[at].0 <= utc_us {
                 at += 1;
             }
             if at == 0 {
                 return None;
             }
-            let local = utc_s + self.offsets[at - 1].1;
-            let mut days = local.div_euclid(DAY_SECONDS);
-            if local.rem_euclid(DAY_SECONDS) == 0 {
+            let local = utc_us + self.offsets[at - 1].1;
+            let mut days = local.div_euclid(DAY_MICROS);
+            if local.rem_euclid(DAY_MICROS) == 0 {
                 days -= 1;
             }
             let date = match previous {
@@ -175,8 +181,8 @@ impl LocalClock {
     }
 
     /// The local date of an instant.
-    fn date(&self, utc_s: i64) -> Option<Date> {
-        Some(Date::of_days(self.local(utc_s)?.div_euclid(DAY_SECONDS)))
+    fn date(&self, utc_us: i64) -> Option<Date> {
+        Some(Date::of_days(self.local(utc_us)?.div_euclid(DAY_MICROS)))
     }
 }
 
@@ -208,11 +214,18 @@ impl Date {
     }
 }
 
-/// `datetime.isoformat()` of a UTC instant at a whole second.
-fn utc_iso(utc_s: i64) -> String {
-    let date = Date::of_days(utc_s.div_euclid(DAY_SECONDS));
-    let second = utc_s.rem_euclid(DAY_SECONDS);
-    format!("{}T{:02}:{:02}:{:02}+00:00", date.iso(), second / 3_600, second / 60 % 60, second % 60)
+/// `datetime.isoformat()` of a UTC instant at a whole microsecond: its
+/// fraction only where it has one.
+fn utc_iso(utc_us: i64) -> String {
+    let date = Date::of_days(utc_us.div_euclid(DAY_MICROS));
+    let micros = utc_us.rem_euclid(DAY_MICROS);
+    let (second, fraction) = (micros / MICROS_PER_SECOND, micros % MICROS_PER_SECOND);
+    let clock = format!("{:02}:{:02}:{:02}", second / 3_600, second / 60 % 60, second % 60);
+    if fraction == 0 {
+        format!("{}T{clock}+00:00", date.iso())
+    } else {
+        format!("{}T{clock}.{fraction:06}+00:00", date.iso())
+    }
 }
 
 /// What the report is built from.
@@ -242,15 +255,17 @@ pub fn calculate(inputs: &ReportInputs<'_>) -> Option<Value> {
     {
         return None;
     }
+    // In microseconds, which `timedelta.total_seconds` divides by 10**6 as
+    // one correctly rounded quotient, as this does.
     let mut stamps = Vec::with_capacity(inputs.day_ns.len());
     for &ns in inputs.day_ns {
-        if ns % NS_PER_SECOND != 0 || stamps.last().is_some_and(|&last| last > ns / NS_PER_SECOND) {
+        if ns % NS_PER_MICRO != 0 || stamps.last().is_some_and(|&last| last > ns / NS_PER_MICRO) {
             return None;
         }
-        stamps.push(ns / NS_PER_SECOND);
+        stamps.push(ns / NS_PER_MICRO);
     }
-    let (start_s, end_s) = (stamps[0], stamps[stamps.len() - 1]);
-    let elapsed = positive((end_s - start_s) as f64);
+    let (start_us, end_us) = (stamps[0], stamps[stamps.len() - 1]);
+    let elapsed = positive(seconds_between(start_us, end_us));
     let years = elapsed / SECONDS_PER_YEAR;
     let elapsed_months = elapsed / MONTH_SECONDS;
     let drawdown = Drawdown::of(equity, starting);
@@ -258,13 +273,13 @@ pub fn calculate(inputs: &ReportInputs<'_>) -> Option<Value> {
 
     let mut metrics = return_metrics(equity, starting, years, inputs.risk_free_rate, &drawdown)?;
     metrics.extend(trade_metrics(inputs.trades, elapsed_months)?);
-    metrics.extend(turnover_metrics(inputs, years, start_s, end_s)?);
+    metrics.extend(turnover_metrics(inputs, years, start_us, end_us)?);
     metrics.extend(month_metrics(&calendar, starting)?);
     metrics.extend(year_metrics(&calendar.yearly));
 
     let first_active = match inputs.trades.iter().map(|trade| trade.opened_s).min() {
         Some(opened) => {
-            let date = inputs.clock.date(opened)?;
+            let date = inputs.clock.date(opened.checked_mul(MICROS_PER_SECOND)?)?;
             Value::Text(format!("{:04}-{:02}", date.year, date.month))
         }
         None => Value::None,
@@ -278,8 +293,8 @@ pub fn calculate(inputs: &ReportInputs<'_>) -> Option<Value> {
         entry("raptor_source_path", Value::None),
         entry("raptor_version", Value::None),
         entry("timezone", Value::Text(inputs.timezone.to_string())),
-        entry("effective_start_timestamp", Value::Text(utc_iso(start_s))),
-        entry("effective_end_timestamp", Value::Text(utc_iso(end_s))),
+        entry("effective_start_timestamp", Value::Text(utc_iso(start_us))),
+        entry("effective_end_timestamp", Value::Text(utc_iso(end_us))),
         entry("risk_free_rate", Value::Float(inputs.risk_free_rate)),
         entry("metrics", Value::Map(metrics)),
         entry(
@@ -707,8 +722,8 @@ fn trade_metrics(trades: &[TradeRow], elapsed_months: f64) -> Option<Vec<(String
 fn turnover_metrics(
     inputs: &ReportInputs<'_>,
     years: f64,
-    start_s: i64,
-    end_s: i64,
+    start_us: i64,
+    end_us: i64,
 ) -> Option<Vec<(String, Value)>> {
     let fills = inputs.fills;
     if fills.quantity.len() != fills.price.len() || fills.commission.len() != fills.price.len() {
@@ -730,7 +745,7 @@ fn turnover_metrics(
         ),
         entry(
             "exposure_pct",
-            Value::finite(Some(trade_exposure_pct(inputs.trades, start_s, end_s))),
+            Value::finite(Some(trade_exposure_pct(inputs.trades, start_us, end_us)?)),
         ),
         entry("average_leverage", Value::None),
         entry("maximum_leverage", Value::None),
@@ -738,15 +753,23 @@ fn turnover_metrics(
 }
 
 /// `_trade_exposure_pct`: the share of the curve's span some trade was
-/// open, overlapping trades counted once.
-fn trade_exposure_pct(trades: &[TradeRow], start_s: i64, end_s: i64) -> f64 {
-    let mut intervals: Vec<(i64, i64)> = trades
-        .iter()
-        .map(|trade| (trade.opened_s.max(start_s), trade.closed_s.unwrap_or(end_s).min(end_s)))
-        .filter(|(opened, closed)| closed > opened)
-        .collect();
-    if intervals.is_empty() || end_s <= start_s {
-        return 0.0;
+/// open, overlapping trades counted once. The span's ends in microseconds;
+/// None for a trade's instant past what they hold.
+fn trade_exposure_pct(trades: &[TradeRow], start_us: i64, end_us: i64) -> Option<f64> {
+    let micros = |seconds: i64| seconds.checked_mul(MICROS_PER_SECOND);
+    let mut intervals: Vec<(i64, i64)> = Vec::with_capacity(trades.len());
+    for trade in trades {
+        let opened = micros(trade.opened_s)?.max(start_us);
+        let closed = match trade.closed_s {
+            Some(closed) => micros(closed)?.min(end_us),
+            None => end_us,
+        };
+        if closed > opened {
+            intervals.push((opened, closed));
+        }
+    }
+    if intervals.is_empty() || end_us <= start_us {
+        return Some(0.0);
     }
     intervals.sort_unstable();
     let mut merged: Vec<(i64, i64)> = Vec::with_capacity(intervals.len());
@@ -756,8 +779,16 @@ fn trade_exposure_pct(trades: &[TradeRow], start_s: i64, end_s: i64) -> f64 {
             _ => merged.push((opened, closed)),
         }
     }
-    let spans: Vec<f64> = merged.iter().map(|(opened, closed)| (closed - opened) as f64).collect();
-    100.0 * py_sum(&spans) / (end_s - start_s) as f64
+    let spans: Vec<f64> =
+        merged.iter().map(|&(opened, closed)| seconds_between(opened, closed)).collect();
+    Some(100.0 * py_sum(&spans) / seconds_between(start_us, end_us))
+}
+
+/// `(end - start).total_seconds()` of two microsecond instants: the
+/// microseconds over 10**6, one correctly rounded quotient (exact below 2**53
+/// microseconds, some 285 years).
+fn seconds_between(start_us: i64, end_us: i64) -> f64 {
+    (end_us - start_us) as f64 / MICROS_PER_SECOND as f64
 }
 
 fn month_metrics(calendar: &Calendar, starting: f64) -> Option<Vec<(String, Value)>> {
@@ -864,17 +895,24 @@ mod tests {
         assert_eq!(Date::of_days(0).iso(), "1970-01-01");
         assert_eq!(Date::of_days(19_052).iso(), "2022-03-01");
         assert_eq!(Date::of_days(-1).iso(), "1969-12-31");
-        assert_eq!(utc_iso(1_640_995_200 + 3_661), "2022-01-01T01:01:01+00:00");
+        let us = |seconds: i64| seconds * MICROS_PER_SECOND;
+        assert_eq!(utc_iso(us(1_640_995_200 + 3_661)), "2022-01-01T01:01:01+00:00");
+        // `isoformat` writes a fraction only where there is one.
+        assert_eq!(utc_iso(us(1_640_995_200) - 1), "2021-12-31T23:59:59.999999+00:00");
+        assert_eq!(utc_iso(us(1_640_995_200) + 1_000), "2022-01-01T00:00:00.001000+00:00");
     }
 
     #[test]
     fn midnight_closes_the_day_before() {
         let clock = utc();
-        assert_eq!(clock.close_date(1_640_995_200).unwrap().iso(), "2021-12-31");
-        assert_eq!(clock.close_date(1_640_995_201).unwrap().iso(), "2022-01-01");
+        let us = |seconds: i64| seconds * MICROS_PER_SECOND;
+        assert_eq!(clock.close_date(us(1_640_995_200)).unwrap().iso(), "2021-12-31");
+        assert_eq!(clock.close_date(us(1_640_995_200) + 1).unwrap().iso(), "2022-01-01");
+        assert_eq!(clock.close_date(us(1_640_995_200) - 1).unwrap().iso(), "2021-12-31");
+        assert_eq!(clock.close_date(us(1_640_995_201)).unwrap().iso(), "2022-01-01");
         // Sydney at +11: 13:00 UTC is local midnight.
         let sydney = LocalClock::new(&[(0, 39_600 * NS_PER_SECOND)], i64::MAX).unwrap();
-        assert_eq!(sydney.close_date(1_640_955_600).unwrap().iso(), "2021-12-31");
+        assert_eq!(sydney.close_date(us(1_640_955_600)).unwrap().iso(), "2021-12-31");
         assert!(LocalClock::new(&[(10, 0)], 0).is_none());
     }
 
@@ -900,13 +938,25 @@ mod tests {
         }
         stamps.retain(|&at| (1_615_705_200..=1_680_000_000).contains(&at));
         stamps.sort_unstable();
+        // In microseconds, with the instants a microsecond either side too.
+        let stamps: Vec<i64> = stamps
+            .iter()
+            .flat_map(|&at| {
+                let at = at * MICROS_PER_SECOND;
+                [at - 1, at, at + 1]
+            })
+            .filter(|&at| {
+                (1_615_705_200 * MICROS_PER_SECOND..=1_680_000_000 * MICROS_PER_SECOND)
+                    .contains(&at)
+            })
+            .collect();
         let walked = clock.close_dates(&stamps).unwrap();
         for (stamp, date) in stamps.iter().zip(&walked) {
             assert_eq!(Some(*date), clock.close_date(*stamp), "{stamp}");
         }
         // Before the first offset or past the schedule, as `local` gives.
-        assert!(clock.close_dates(&[1_615_705_199]).is_none());
-        assert!(clock.close_dates(&[1_680_000_001]).is_none());
+        assert!(clock.close_dates(&[1_615_705_200 * MICROS_PER_SECOND - 1]).is_none());
+        assert!(clock.close_dates(&[1_680_000_000 * MICROS_PER_SECOND + 1]).is_none());
     }
 
     #[test]
@@ -934,7 +984,15 @@ mod tests {
             TradeRow { opened_s: 0, closed_s: Some(50), realized: 1.0, duration_hours: None },
             TradeRow { opened_s: 25, closed_s: Some(75), realized: 1.0, duration_hours: None },
         ];
-        assert_eq!(trade_exposure_pct(&rows, 0, 100), 75.0);
+        assert_eq!(trade_exposure_pct(&rows, 0, 100 * MICROS_PER_SECOND), Some(75.0));
+        // A span ending on a fraction of a second, as a financed short's
+        // does: measured in microseconds, as `timedelta` measures it.
+        let end = 100 * MICROS_PER_SECOND - 1;
+        let expected = 100.0 * 50.0 / (99_999_999.0 / 1e6);
+        assert_eq!(trade_exposure_pct(&rows[..1], 0, end), Some(expected));
+        let open = [TradeRow { opened_s: 50, closed_s: None, realized: 1.0, duration_hours: None }];
+        let to_end = 100.0 * (99_999_999.0 / 1e6 - 50.0) / (99_999_999.0 / 1e6);
+        assert_eq!(trade_exposure_pct(&open, 0, end), Some(to_end));
     }
 
     #[test]
@@ -964,5 +1022,32 @@ mod tests {
             report.get("effective_start_timestamp"),
             Some(&Value::Text("2022-01-02T00:00:00+00:00".into()))
         );
+        // A last mark a microsecond short of a midnight closes the day it
+        // ends, over the span Python's `timedelta` measures; a nanosecond
+        // fraction is not one a `datetime` holds.
+        let mut day_ns = day_ns;
+        let mut day_equity = day_equity;
+        day_ns.push(start + 41 * day - NS_PER_MICRO);
+        day_equity.push(100_500.0);
+        let inputs = ReportInputs {
+            starting: 100_000.0,
+            risk_free_rate: 0.0,
+            timezone: "UTC",
+            clock: &clock,
+            day_ns: &day_ns,
+            day_equity: &day_equity,
+            trades: &[],
+            fills: &fills,
+        };
+        let report = calculate(&inputs).unwrap();
+        let metrics = report.get("metrics").unwrap();
+        assert_eq!(metrics.get("observed_trading_days"), Some(&Value::Int(41)));
+        assert_eq!(
+            report.get("effective_end_timestamp"),
+            Some(&Value::Text("2022-02-11T23:59:59.999999+00:00".into()))
+        );
+        let finer: Vec<i64> = day_ns.iter().copied().chain([start + 42 * day + 1]).collect();
+        let more: Vec<f64> = day_equity.iter().copied().chain([100_500.0]).collect();
+        assert!(calculate(&ReportInputs { day_ns: &finer, day_equity: &more, ..inputs }).is_none());
     }
 }

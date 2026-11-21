@@ -2848,7 +2848,7 @@ fn a_market_order_arriving_after_the_step_is_swept_by_the_walk() {
         None,
     );
 
-    let events = kernel.walk_book(0, &bar(0, 100.0));
+    let events = kernel.walk_book(0, &bar(0, 100.0), WalkPhase::Walk);
 
     assert!(
         events.iter().any(|e| matches!(e, EngineEvent::OrderAccepted { .. })),
@@ -2897,7 +2897,7 @@ fn a_deferred_market_order_is_not_swept_by_the_walk() {
     );
 
     assert!(kernel
-        .walk_book(0, &bar(0, 100.0))
+        .walk_book(0, &bar(0, 100.0), WalkPhase::Walk)
         .iter()
         .all(|e| !matches!(e, EngineEvent::OrderFilled { .. })));
     assert!(!kernel.is_in_position());

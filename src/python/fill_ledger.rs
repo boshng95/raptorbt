@@ -27,6 +27,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyString};
 
 use super::money::{fixed, round_to};
+use crate::lean::replay::WHOLE_SHARES;
 use crate::metrics::canonical::FillAmounts;
 
 /// `10**p` for the precisions `_money` is asked for, as exact doubles.
@@ -36,7 +37,7 @@ const POW10: [f64; 23] = [
 ];
 
 /// `x or 0.0`: a zero of either sign is falsy, a NaN is not.
-fn or_zero(x: f64) -> f64 {
+pub(crate) fn or_zero(x: f64) -> f64 {
     if x == 0.0 {
         0.0
     } else {
@@ -547,6 +548,49 @@ impl Ledger {
         )
     }
 
+    /// What each booked fill changed of the shares held short, on the bar
+    /// `bar_of` finds at its time, as `build_backtest_financing_report`
+    /// replays the fills report (`fills_report`): one row per execution,
+    /// in order of its time to the microsecond and else of the fills, each
+    /// moving a signed position by its side and quantity. Its arithmetic is
+    /// decimal; on whole shares a double's is the same.
+    ///
+    /// None without a booking, or where a fill moving the shares short
+    /// falls on no bar or the book holds shares that are not whole.
+    pub(crate) fn short_deltas(
+        &self,
+        bar_of: impl Fn(i64) -> Option<usize>,
+    ) -> Option<Vec<(usize, i64)>> {
+        let booking = self.booking.as_ref()?;
+        let mut rows: Vec<(i64, bool, f64)> = self
+            .fills
+            .iter()
+            .enumerate()
+            .map(|(index, fill)| {
+                (booking.ts[index], self.orders[fill.order as usize].buy, booking.size[index])
+            })
+            .collect();
+        // `to_pydatetime` keeps microseconds; the sort is stable.
+        rows.sort_by_key(|&(ts, _, _)| ts.div_euclid(1_000));
+        let (mut held, mut deltas) = (0.0_f64, Vec::new());
+        for (ts, buy, size) in rows {
+            if size.is_nan() || size.fract() != 0.0 || size > WHOLE_SHARES {
+                return None;
+            }
+            // A row of no quantity is skipped.
+            if size <= 0.0 {
+                continue;
+            }
+            let before = held;
+            held = if buy { before + size } else { before - size };
+            let delta = (-held).max(0.0) - (-before).max(0.0);
+            if delta != 0.0 {
+                deltas.push((bar_of(ts)?, delta as i64));
+            }
+        }
+        Some(deltas)
+    }
+
     /// [`amounts`] of `order_fills_report`'s rows, in their order. None
     /// without a booking, or where Python refuses an infinite amount.
     pub(crate) fn report_amounts(&self) -> Option<FillAmounts> {
@@ -635,9 +679,9 @@ impl Ledger {
                     (
                         "submit",
                         order.client_id.as_str(),
-                        if order.buy { "BUY" } else { "SELL" },
-                        if order.market { "MARKET" } else { "LIMIT" },
-                        order.time_in_force,
+                        side_name(py, order.buy),
+                        type_name(py, order.market),
+                        tif_name(py, order.time_in_force),
                         order.units,
                         order.limit_price,
                         order.expire_ns,
@@ -684,6 +728,29 @@ fn status_name(py: Python<'_>, status: EndStatus) -> &PyString {
     }
 }
 
+/// An order's side, type and time in force, interned as the Python loop
+/// interns its tickets' words: every ticket and report row then holds one
+/// object per word, whichever route built it.
+fn side_name(py: Python<'_>, buy: bool) -> &PyString {
+    if buy {
+        pyo3::intern!(py, "BUY")
+    } else {
+        pyo3::intern!(py, "SELL")
+    }
+}
+
+fn type_name(py: Python<'_>, market: bool) -> &PyString {
+    if market {
+        pyo3::intern!(py, "MARKET")
+    } else {
+        pyo3::intern!(py, "LIMIT")
+    }
+}
+
+fn tif_name<'py>(py: Python<'py>, time_in_force: &str) -> &'py PyString {
+    PyString::intern(py, time_in_force)
+}
+
 /// One `order_fills_report` row, before it is spelled.
 struct ReportRow {
     order: u32,
@@ -727,9 +794,9 @@ impl PyReplayLedger {
             let order = &self.ledger.orders[index as usize];
             *slot = Some([
                 PyString::new(py, &order.client_id).into(),
-                PyString::new(py, if order.buy { "BUY" } else { "SELL" }).into(),
-                PyString::new(py, if order.market { "MARKET" } else { "LIMIT" }).into(),
-                PyString::new(py, order.time_in_force).into(),
+                side_name(py, order.buy).into(),
+                type_name(py, order.market).into(),
+                tif_name(py, order.time_in_force).into(),
             ]);
         }
         slot.as_ref().map(|names| names.clone()).unwrap_or_else(|| unreachable!())
@@ -761,6 +828,14 @@ impl PyReplayLedger {
     /// `report()`, row for row.
     pub(crate) fn report_amounts(&self) -> Option<FillAmounts> {
         self.ledger.report_amounts()
+    }
+
+    /// [`Ledger::short_deltas`].
+    pub(crate) fn short_deltas(
+        &self,
+        bar_of: impl Fn(i64) -> Option<usize>,
+    ) -> Option<Vec<(usize, i64)>> {
+        self.ledger.short_deltas(bar_of)
     }
 }
 
@@ -1061,6 +1136,48 @@ mod tests {
         assert_eq!(booking.peak_size, vec![2.0]);
         assert_eq!(booking.held, 0.0);
         assert!(booking.leaves[1].is_sign_positive());
+    }
+
+    #[test]
+    fn short_deltas_replay_the_fills_in_time_order() {
+        const US: i64 = 1_000;
+        let mut ledger = Ledger::new(Some(terms()));
+        let at = |buy: bool, decided_ns: i64, arrived_on_ns: i64| OrderRecord {
+            buy,
+            decided_ns,
+            arrived_on_ns,
+            ..order(buy)
+        };
+        // Sold 3 short, then 2 more; a buy of 4 decided before the second
+        // sale fills after it, stamped when decided, so the report has it
+        // first: it covers the 3 and goes long 1, which the sale takes short
+        // again by 1.
+        let sold = ledger.submit(at(false, 100 * US, 100 * US));
+        ledger.fill(sold, 100 * US, 1, 3.0, 10.0, 0.0, 0.0, 0.0);
+        let more = ledger.submit(at(false, 200 * US, 200 * US));
+        ledger.fill(more, 200 * US, 2, 2.0, 10.0, 0.0, 0.0, 0.0);
+        let bought = ledger.submit(at(true, 150 * US, 250 * US));
+        ledger.fill(bought, 250 * US, 3, 4.0, 10.0, 0.0, 0.0, 0.0);
+        let bars = [100 * US, 150 * US, 200 * US, 250 * US];
+        let bar_of = |ns: i64| bars.binary_search(&ns).ok();
+        assert_eq!(ledger.short_deltas(bar_of), Some(vec![(0, 3), (1, -3), (2, 1)]));
+        // A fill moving the shares short at no bar is declined.
+        assert_eq!(ledger.short_deltas(|ns| (ns != 200 * US).then_some(0)), None);
+
+        // Instants within one microsecond keep the fills' order, as the
+        // report's `datetime`s, which keep no finer, do.
+        let mut ledger = Ledger::new(Some(terms()));
+        let sold = ledger.submit(at(false, 101, 101));
+        ledger.fill(sold, 101, 1, 3.0, 10.0, 0.0, 0.0, 0.0);
+        let bought = ledger.submit(at(true, 100, 100));
+        ledger.fill(bought, 100, 2, 3.0, 10.0, 0.0, 0.0, 0.0);
+        assert_eq!(ledger.short_deltas(|ns| Some(ns as usize)), Some(vec![(101, 3), (100, -3)]));
+
+        // Shares that are not whole are declined.
+        let mut ledger = Ledger::new(Some(terms()));
+        let sold = ledger.submit(at(false, 100 * US, 100 * US));
+        ledger.fill(sold, 100 * US, 1, 1.5, 10.0, 0.0, 0.0, 0.0);
+        assert_eq!(ledger.short_deltas(bar_of), None);
     }
 
     #[test]

@@ -25,9 +25,10 @@ use super::money::PyMoneyModel;
 use super::replay_session::Venue;
 use super::report_bindings::{to_python, trip_rows, Trip};
 use super::rule_session::{QuietParams, QuietTuple};
+use crate::lean::financing::{charge, daily_fees, Schedule};
 use crate::lean::kernel::{Terms, Trade};
 use crate::lean::market::Market;
-use crate::lean::replay::{replay, Cell, Frame, Outcome};
+use crate::lean::replay::{replay, Cell, Frame, Loan, Outcome, Shorts};
 use crate::lean::rules::{
     Compare, Condition, Cross, Dispatch, Level, Operand, Signals, Stream, Tree,
 };
@@ -99,6 +100,85 @@ type ConditionTuple = (u8, Vec<usize>, i64, f64, i64, f64, usize, f64, f64);
 /// size_increment, minimum_notional))`, the arena and `level` arguments
 /// `CrossoverRuleSession` takes.
 type TreeTuple = (Vec<ConditionTuple>, Vec<usize>, Vec<usize>, usize, (bool, f64, f64));
+
+/// A short node's terms (`crate::lean::replay::Shorts`): `(cover_market,
+/// max_attempts, max_stale_bars, admitted, loan, admission)`, the loan
+/// `(days, block_age, cover_bars)` or None where it carries no term.
+type ShortsTuple<'py> = (
+    bool,
+    u32,
+    i64,
+    Option<PyReadonlyArray1<'py, bool>>,
+    Option<(PyReadonlyArray1<'py, i32>, i32, PyReadonlyArray1<'py, i64>)>,
+    Option<PyReadonlyArray1<'py, bool>>,
+);
+
+/// A short node's borrow terms (`crate::lean::financing::Schedule`):
+/// `(dates, settles, priced, first_day, end_day, units, terminal_ns)`.
+pub(crate) type FinancingTuple<'py> = (
+    PyReadonlyArray1<'py, i32>,
+    PyReadonlyArray1<'py, i32>,
+    bool,
+    i32,
+    i32,
+    PyReadonlyArray1<'py, i64>,
+    i64,
+);
+
+/// The slices of a [`ShortsTuple`] and a [`FinancingTuple`], checked
+/// against a market of `bars` bars: a short node runs with both.
+fn short_terms<'a>(
+    shorts: &'a Option<ShortsTuple<'_>>,
+    financing: &'a Option<FinancingTuple<'_>>,
+    bars: usize,
+) -> PyResult<(Option<Shorts<'a>>, Option<Schedule<'a>>)> {
+    let (Some(shorts), Some(financing)) = (shorts, financing) else {
+        if shorts.is_some() || financing.is_some() {
+            return Err(PyValueError::new_err("a short node runs with its borrow terms"));
+        }
+        return Ok((None, None));
+    };
+    let (cover_market, max_attempts, max_stale_bars, admitted, loan, admission) = shorts;
+    let loan = match loan {
+        Some((days, block_age, cover_bars)) => Some(Loan {
+            days: days.as_slice()?,
+            block_age: *block_age,
+            cover_bars: cover_bars.as_slice()?,
+        }),
+        None => None,
+    };
+    let shorts = Shorts {
+        cover_market: *cover_market,
+        max_attempts: *max_attempts,
+        max_stale_bars: *max_stale_bars,
+        admitted: admitted.as_ref().map(|a| a.as_slice()).transpose()?,
+        loan,
+        admission: admission.as_ref().map(|a| a.as_slice()).transpose()?,
+    };
+    Ok((Some(shorts), Some(schedule(financing, bars)?)))
+}
+
+/// The [`Schedule`] of a [`FinancingTuple`], checked against a market of
+/// `bars` bars.
+pub(crate) fn schedule<'a>(
+    financing: &'a FinancingTuple<'_>,
+    bars: usize,
+) -> PyResult<Schedule<'a>> {
+    let (dates, settles, priced, first_day, end_day, units, terminal_ns) = financing;
+    let schedule = Schedule {
+        dates: dates.as_slice()?,
+        settles: settles.as_slice()?,
+        priced: *priced,
+        first_day: *first_day,
+        end_day: *end_day,
+        units: units.as_slice()?,
+        terminal_ns: *terminal_ns,
+    };
+    if !schedule.fits(bars) {
+        return Err(PyValueError::new_err("borrow terms that do not fit the market"));
+    }
+    Ok(schedule)
+}
 
 /// One symbol's primary bars and the book each leaves, shared by every cell
 /// replayed on them.
@@ -273,6 +353,10 @@ struct Shared<'a> {
     jumps: bool,
     /// What the cells share on the frame's dispatch.
     signals: Signals<'a>,
+    /// A short node's terms and borrow, the cells all short; None for a
+    /// long node.
+    shorts: Option<Shorts<'a>>,
+    financing: Option<Schedule<'a>>,
 }
 
 impl<'a> Shared<'a> {
@@ -290,8 +374,11 @@ impl<'a> Shared<'a> {
         offsets: &[(i64, i64)],
         offsets_until_ns: i64,
         jumps: bool,
+        (shorts, financing): (Option<Shorts<'a>>, Option<Schedule<'a>>),
     ) -> Self {
         Self {
+            shorts,
+            financing,
             frame,
             gate,
             terms: Terms {
@@ -352,6 +439,8 @@ struct Spec<'a> {
     /// Level rules, in place of `entry` and `exit`.
     tree: Option<Tree>,
     flags: RuleFlags,
+    /// `StrategySpec.crossings` ``each_bar`` ([`Stream::work_each_bar`]).
+    each_bar: bool,
 }
 
 impl<'a> Spec<'a> {
@@ -361,6 +450,7 @@ impl<'a> Spec<'a> {
         exit: CrossTuple,
         tree: Option<Tree>,
         flags: RuleFlags,
+        each_bar: bool,
     ) -> PyResult<Self> {
         let (values, init, admits, primary_admits) = keys;
         Ok(Self {
@@ -372,12 +462,18 @@ impl<'a> Spec<'a> {
             exit,
             tree,
             flags,
+            each_bar,
         })
     }
 
     /// A batch cell's, off the pool's slices; ValueError where it names a
     /// place the pool does not have.
-    fn pooled(pool: &Pool<'a>, cell: &CellTuple, tree: Option<Tree>) -> PyResult<Self> {
+    fn pooled(
+        pool: &Pool<'a>,
+        cell: &CellTuple,
+        tree: Option<Tree>,
+        each_bar: bool,
+    ) -> PyResult<Self> {
         let (keys, admits, primary_admits, entry, exit, flags) = cell;
         let outside =
             || PyValueError::new_err("a cell names a key or admits the pool does not have");
@@ -403,6 +499,7 @@ impl<'a> Spec<'a> {
             exit: *exit,
             tree,
             flags: *flags,
+            each_bar,
         })
     }
 }
@@ -430,7 +527,10 @@ impl<'a> Pool<'a> {
 
 /// A cell's replay, with the report built from it.
 struct Ran {
+    /// Financed, for a short node.
     end_value: f64,
+    /// What its shorts paid to borrow; 0 for a long node.
+    borrow_fee: f64,
     day_ns: Vec<i64>,
     day_equity: Vec<f64>,
     /// Bars stepped one by one, jumps taken, callbacks.
@@ -451,12 +551,14 @@ fn run(
     log: bool,
     keep: impl FnOnce(&Outcome),
 ) -> Result<Ran, Declined> {
-    if spec.tree.is_none() && spec.entry.5 == spec.exit.5 {
+    // Worked out where each rule checks it, a clock both sides share steps
+    // as the book moves; worked out each bar, both sides read one answer.
+    if spec.tree.is_none() && !spec.each_bar && spec.entry.5 == spec.exit.5 {
         return Err(Declined("a clock both sides share"));
     }
     let frame = shared.frame;
     let entered = Instant::now();
-    let stream = Stream::new(
+    let mut stream = Stream::new(
         &shared.signals,
         spec.values.clone(),
         &spec.init,
@@ -471,6 +573,13 @@ fn run(
         spec.flags.3,
         spec.flags.4,
     )?;
+    if shared.shorts.is_some() {
+        // A short node's entries sell to open.
+        stream.entry_side = -1;
+    }
+    if spec.each_bar {
+        stream.work_each_bar()?;
+    }
     let cell = Cell {
         frame: &frame.frame,
         gate: shared.gate,
@@ -479,20 +588,46 @@ fn run(
         money: shared.money,
         day_ends: &frame.day_ends,
         jumps: shared.jumps,
+        shorts: shared.shorts.as_ref(),
     };
     let started = Instant::now();
     let outcome = replay(&frame.market, &shared.terms, &stream, &cell, Some(shared.book()), log)?;
     let reported = Instant::now();
     keep(&outcome);
-    let Outcome { ledger, trades, day_ns, day_equity, end_value, stepped, jumped, callbacks } =
-        outcome;
+    let Outcome {
+        ledger,
+        trades,
+        mut day_ns,
+        mut day_equity,
+        mut end_value,
+        short_deltas,
+        stepped,
+        jumped,
+        callbacks,
+    } = outcome;
+    let mut borrow_fee = 0.0;
+    if let Some(schedule) = &shared.financing {
+        // `_finance`: charged after the run, before its report is written.
+        let fees = daily_fees(schedule, &short_deltas);
+        borrow_fee =
+            charge(schedule, &fees, &frame.day_ends, &mut day_ns, &mut day_equity, end_value);
+        end_value -= borrow_fee;
+    }
     let report = report(shared, ledger, &trades, &day_ns, &day_equity);
     let secs = (
         started.duration_since(entered).as_secs_f64(),
         reported.duration_since(started).as_secs_f64(),
         reported.elapsed().as_secs_f64(),
     );
-    Ok(Ran { end_value, day_ns, day_equity, stats: (stepped, jumped, callbacks), report, secs })
+    Ok(Ran {
+        end_value,
+        borrow_fee,
+        day_ns,
+        day_equity,
+        stats: (stepped, jumped, callbacks),
+        report,
+        secs,
+    })
 }
 
 /// `canonical_report` of a replay: the report, its order count and the
@@ -515,7 +650,7 @@ fn report(
         pnl: trade.pnl,
         entry_fees: trade.entry_fees,
         exit_fees: trade.exit_fees,
-        short: false,
+        short: trade.short,
         end_of_data: trade.end_of_data,
     });
     let rows = trip_rows(trips, &ledger.reduction_times()?, precision)?;
@@ -608,6 +743,7 @@ fn to_dict(py: Python<'_>, ran: &Ran, curve: bool) -> PyResult<PyObject> {
         }
     }
     out.set_item("end_value", ran.end_value)?;
+    out.set_item("borrow_fee", ran.borrow_fee)?;
     if curve {
         out.set_item("day_ns", &ran.day_ns)?;
         out.set_item("day_equity", &ran.day_equity)?;
@@ -776,19 +912,25 @@ fn screen_dict(py: Python<'_>, axes: &Axes, rows: &[Result<Row, Declined>]) -> P
 /// Replay one cell on *frame*.
 ///
 /// *jumps* false steps every bar, the reference the jumps are diffed
-/// against. *log* false leaves the replay log out.
+/// against. *log* false leaves the replay log out. *shorts* and *financing*
+/// make the cell a short node's ([`ShortsTuple`], [`FinancingTuple`]): it
+/// enters short, and its borrow is charged to its curve and end value.
+/// *each_bar* works every crossing out once per evaluated bar
+/// (`StrategySpec.crossings` ``each_bar``).
 ///
 /// Returns a dict: `log` (the replay log as `replay_rules` returns it, None
 /// without *log*), `report` (the canonical report as `canonical_report`
 /// builds it, None where that declines), `total_trades`,
-/// `closed_trade_pnls`, `end_value`, `day_ns` and `day_equity` (the daily
-/// curve), `secs` (the replay's), `split` (the stream's setup and the
-/// report's seconds) and `stats` (bars stepped, jumps, callbacks).
-/// Raises [`LeanDeclined`] where the cell leaves the lean shape.
+/// `closed_trade_pnls`, `end_value`, `borrow_fee`, `day_ns` and
+/// `day_equity` (the daily curve), `secs` (the replay's), `split` (the
+/// stream's setup and the report's seconds) and `stats` (bars stepped,
+/// jumps, callbacks). Raises [`LeanDeclined`] where the cell leaves the
+/// lean shape.
 #[pyfunction]
 #[pyo3(signature = (
     frame, gate, terms, quiet, venue, money, book, keys, entry, exit, flags,
-    *, starting, timezone, offsets, offsets_until_ns, jumps = true, log = true, tree = None
+    *, starting, timezone, offsets, offsets_until_ns, jumps = true, log = true, tree = None,
+    shorts = None, financing = None, each_bar = false
 ))]
 #[allow(clippy::too_many_arguments)]
 pub fn lean_replay(
@@ -811,6 +953,9 @@ pub fn lean_replay(
     jumps: bool,
     log: bool,
     tree: Option<TreeTuple>,
+    shorts: Option<ShortsTuple<'_>>,
+    financing: Option<FinancingTuple<'_>>,
+    each_bar: bool,
 ) -> PyResult<PyObject> {
     let gate = gate.as_ref().map(|gate| gate.as_slice()).transpose()?;
     let shared = Shared::new(
@@ -826,8 +971,10 @@ pub fn lean_replay(
         &offsets,
         offsets_until_ns,
         jumps,
+        short_terms(&shorts, &financing, frame.market.len())?,
     );
-    let spec = Spec::of(&keys, entry, exit, tree.as_ref().map(self::tree).transpose()?, flags)?;
+    let spec =
+        Spec::of(&keys, entry, exit, tree.as_ref().map(self::tree).transpose()?, flags, each_bar)?;
     let mut entries = None;
     let ran = run(&shared, &spec, log, |outcome| {
         if log {
@@ -897,7 +1044,8 @@ fn replay_all<T: Send>(
 /// list of `(keys, admits, primary_admits, entry, exit, flags)` naming its
 /// keys and admits by place (-1: none). *trees*, where given, holds per cell
 /// None or its level rules as a [`TreeTuple`], which stand in for its
-/// `entry` and `exit`.
+/// `entry` and `exit`; *each_bar*, where given, per cell whether it works
+/// every crossing out once per evaluated bar.
 ///
 /// Returns, in the cells' order, per cell the dict [`lean_replay`] returns
 /// without `log` (and without the daily curve unless *curve*), or, where
@@ -912,7 +1060,8 @@ fn replay_all<T: Send>(
 #[pyo3(signature = (
     frame, gate, terms, quiet, venue, money, book, keys, cells,
     *, starting, timezone, offsets, offsets_until_ns, threads = 0, screen = false,
-    curve = false, timings = false, trees = None
+    curve = false, timings = false, trees = None, shorts = None, financing = None,
+    each_bar = None
 ))]
 #[allow(clippy::too_many_arguments)]
 pub fn lean_replay_many(
@@ -935,6 +1084,9 @@ pub fn lean_replay_many(
     curve: bool,
     timings: bool,
     trees: Option<Vec<Option<TreeTuple>>>,
+    shorts: Option<ShortsTuple<'_>>,
+    financing: Option<FinancingTuple<'_>>,
+    each_bar: Option<Vec<bool>>,
 ) -> PyResult<PyObject> {
     let entered = Instant::now();
     let gate = gate.as_ref().map(|gate| gate.as_slice()).transpose()?;
@@ -951,17 +1103,22 @@ pub fn lean_replay_many(
         &offsets,
         offsets_until_ns,
         true,
+        short_terms(&shorts, &financing, frame.market.len())?,
     );
     let keys = Pool::of(&keys)?;
     if trees.as_ref().is_some_and(|trees| trees.len() != cells.len()) {
         return Err(PyValueError::new_err("trees and cells of different counts"));
+    }
+    if each_bar.as_ref().is_some_and(|each_bar| each_bar.len() != cells.len()) {
+        return Err(PyValueError::new_err("each_bar and cells of different counts"));
     }
     let specs: Vec<Spec<'_>> = cells
         .iter()
         .enumerate()
         .map(|(at, cell)| {
             let tree = trees.as_ref().and_then(|trees| trees[at].as_ref()).map(tree).transpose()?;
-            Spec::pooled(&keys, cell, tree)
+            let each_bar = each_bar.as_ref().is_some_and(|each_bar| each_bar[at]);
+            Spec::pooled(&keys, cell, tree, each_bar)
         })
         .collect::<PyResult<_>>()?;
     let pool = (threads > 1).then(|| threads_pool(threads)).transpose()?;

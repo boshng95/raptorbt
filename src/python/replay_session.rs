@@ -7,8 +7,13 @@
 //! other bar -- a composite that decides, a target being chased, a fill, a
 //! flat account near its cash halt -- still crosses into Python and back.
 //! This is that driver loop and that strategy, for the shape the rule session
-//! covers: a long-only replay whose targets are flat or long, with no
-//! policies, no borrow and no window callbacks.
+//! covers: a replay whose targets are flat or long -- or, for a short node,
+//! flat or short ([`Shorts`]) -- with no window callbacks. Its risk policies
+//! are the rule session's: their closes come back as its targets, sent
+//! outside the bar's decision (`risk_exit`) in their own order style.
+//! A short's borrow is the caller's too: its entry gate and its loan clock
+//! are Python functions, called where the strategy calls them, and what the
+//! loan costs is charged afterwards from the fills, as for any run.
 //!
 //! Like the rule session it is a transcription, not a model. Each branch
 //! mirrors a line of `raptorbt/strategy/runner.py` or of the caller's
@@ -31,11 +36,11 @@ use pyo3::create_exception;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 
-use super::fill_ledger::{EndStatus, Ledger, OrderRecord};
+use super::fill_ledger::{money, or_zero, EndStatus, Ledger, OrderRecord};
 use super::money::PyMoneyModel;
-use super::rule_session::{money_as_double, QuietParams, RuleStepper, Target};
+use super::rule_session::{money_as_double, Account, OrderStyle, QuietParams, RuleStepper, Target};
 use super::strategy_bindings::{
-    held_position, step_rules_until, step_until_event, submit_order_on, BarArrays,
+    held_position, policy_account, step_rules_until, step_until_event, submit_order_on, BarArrays,
 };
 
 create_exception!(
@@ -104,6 +109,35 @@ pub(crate) struct Money<'a> {
     pub model: Option<&'a PyMoneyModel>,
 }
 
+/// A short node's terms, beyond [`Venue`]'s: `SignalReplay` under
+/// `short_entries`, whose entries sell to open through a durable short
+/// target and whose exits buy to cover.
+///
+/// A short entry is always a limit: the caller hands over no short node
+/// whose entry `reference_order_type` sends at market, which `SignalReplay`
+/// refuses itself.
+pub(crate) struct Shorts<'a> {
+    /// Whether `reference_order_type` sends a buy close -- a cover -- at
+    /// market.
+    pub cover_market: bool,
+    /// `_MAX_SIGNED_SHORT_ATTEMPTS`: the short orders one target may send.
+    pub max_attempts: u32,
+    /// `_MAX_SIGNED_TARGET_STALE_BARS`: the bars a target may go unfilled
+    /// before its expansion is given up.
+    pub max_stale_bars: i64,
+    /// `(decided_ns, units, position, opened_ns) -> bool`: whether
+    /// `short_gate.refusal` refuses a short of `units` added to `position`,
+    /// `opened_ns` being when the short held was opened, or None. None where
+    /// the run has no gate.
+    pub refusal: Option<&'a PyAny>,
+    /// `(filled_ns) -> int`: `loan_clock.cover_bar`, the bar a short opened
+    /// at `filled_ns` is first due its forced cover on, -1 for none. None
+    /// where the instrument's loans carry no term.
+    pub cover_bar: Option<&'a PyAny>,
+    /// `loan_admission`: the bars `handle_bar` admits, None for every bar.
+    pub admission: Option<&'a [bool]>,
+}
+
 /// One order `SignalReplay` queued, as `apply_commands` sends it.
 struct Submit {
     client_id: String,
@@ -127,13 +161,17 @@ struct Replay<'a> {
     quiet: QuietParams,
     venue: Venue,
     money: Money<'a>,
+    shorts: Option<Shorts<'a>>,
 
     // `SignalReplay`'s own state, under its own names.
     working_entry: bool,
     /// `_orders`: the kernel ids of the orders sent, rising, each with where
-    /// the ledger keeps its terms.
-    orders: Vec<(u64, u32)>,
+    /// the ledger keeps its terms and whether it buys.
+    orders: Vec<(u64, u32, bool)>,
     pending_target: Option<f64>,
+    /// `_pending_order_style`: the shape every order chasing the pending
+    /// target takes.
+    pending_order_style: OrderStyle,
     target_bars: i64,
     target_bar_ts: i64,
     pending_reference: f64,
@@ -146,6 +184,16 @@ struct Replay<'a> {
     account_quantity: f64,
     /// The last [`Self::reads_held_from`] asked: `(held, from, until)`.
     held_reads: (f64, usize, usize),
+    /// `_short_attempts`: short orders the pending target has sent.
+    short_attempts: u32,
+    /// `_exit_gated`: whether the last close met a venue shut to orders
+    /// after it had passed instrument preflight.
+    exit_gated: bool,
+    /// `_short_opened_ns` and `_loan_cover_bar`: when the short held was
+    /// opened, and the bar its loan's forced cover is due on, -1 for none.
+    /// Kept only where a loan has a term.
+    short_opened_ns: Option<i64>,
+    loan_cover_bar: i64,
 
     // The driver's: `Strategy._order_seq`, the queued commands and the
     // per-timestamp action budget.
@@ -179,9 +227,13 @@ pub(crate) fn replay<'a>(
     quiet: QuietParams,
     venue: Venue,
     money: Money<'a>,
+    shorts: Option<Shorts<'a>>,
     ledger: Ledger,
 ) -> PyResult<Ledger> {
     let order_seq = venue.first_order_seq;
+    if shorts.as_ref().and_then(|s| s.admission).is_some_and(|a| a.len() != bars.len()) {
+        return Err(pyo3::exceptions::PyValueError::new_err("invalid replay array lengths"));
+    }
     let mut replay = Replay {
         runner,
         bars,
@@ -191,9 +243,11 @@ pub(crate) fn replay<'a>(
         quiet,
         venue,
         money,
+        shorts,
         working_entry: false,
         orders: Vec::new(),
         pending_target: None,
+        pending_order_style: OrderStyle::Default,
         target_bars: 0,
         target_bar_ts: -1,
         pending_reference: 0.0,
@@ -205,6 +259,10 @@ pub(crate) fn replay<'a>(
         bar_callback_required: true,
         account_quantity: 0.0,
         held_reads: (0.0, 0, 0),
+        short_attempts: 0,
+        exit_gated: false,
+        short_opened_ns: None,
+        loan_cover_bar: -1,
         order_seq,
         commands: Vec::new(),
         budget_ts: None,
@@ -320,12 +378,12 @@ impl Replay<'_> {
                 None,
             )?;
             let at = match self.orders.last() {
-                Some(&(last, _)) if last >= order_id => {
-                    self.orders.partition_point(|&(id, _)| id < order_id)
+                Some(&(last, ..)) if last >= order_id => {
+                    self.orders.partition_point(|&(id, ..)| id < order_id)
                 }
                 _ => self.orders.len(),
             };
-            self.orders.insert(at, (order_id, command.ledger_index));
+            self.orders.insert(at, (order_id, command.ledger_index, command.buy));
         }
         Ok(!commands.is_empty())
     }
@@ -413,7 +471,9 @@ impl Replay<'_> {
         if self.cash_halted {
             return Some((true, self.pending_target, n));
         }
-        if self.pending_target.is_some() || self.working_orders != 0 {
+        if self.pending_target.is_some() || self.working_orders != 0 || self.loan_cover_bar >= 0 {
+            // A capped short's cover bar has to reach the strategy, and the
+            // kernel's quiet stepping would take it as any other.
             return None;
         }
         let held = self.account_quantity;
@@ -487,16 +547,32 @@ impl Replay<'_> {
             return Err(declined("an exit outlived the bar it met"));
         }
         if self.cash_halted {
-            self.advance(i)?;
-            // A halted replay acts on nothing: `not _defer_quiet_primary`.
+            self.advance(i, false)?;
+            // A halted replay acts on nothing, so the kernel takes its bars
+            // wherever it steps them at all.
             self.bar_callback_required = false;
             return Ok(());
         }
         let reconciled =
             if self.pending_target.is_some() { self.reconcile_target(i)? } else { false };
-        let target = self.advance(i)?;
-        if !reconciled {
-            self.submit_native_intent(i, target)?;
+        let target = self.advance(i, true)?;
+        // Reconciling stands in for the bar's own decision, not for its risk
+        // checks: `handle_bar` runs those whatever the reconcile chased.
+        let policy_acted = target.is_some_and(|t| t.policy.is_some());
+        if !reconciled || policy_acted {
+            let preceding = if reconciled { None } else { target.and_then(|t| t.preceding) };
+            self.submit_native_intent(i, target, preceding, policy_acted)?;
+        } else if self.shorts.is_some() && target.is_some_and(|t| t.side == 0) {
+            // Composable buys to cover without asking `has_pending_exit()`,
+            // which only its long exit asks: a close this bar's reconcile
+            // already sent does not hold back the rules' own.
+            self.submit_native_intent(i, target, None, false)?;
+        }
+        // `_check_risk_exits` asks a capped loan its age after the bar's
+        // decision, and ahead of the cash halt -- which a cover that filled
+        // at once leaves flat.
+        if self.loan_due(i) {
+            self.check_short_loan(i)?;
         }
         let (has_position, net_position) = held_position(self.runner);
         let flat = !has_position;
@@ -516,22 +592,37 @@ impl Replay<'_> {
             }
             flat_cash_safe = funds >= q.need_at_highest;
         }
+        // What the bars a sparse callback steps past before the next
+        // composite can do is asked only of a run that defers them: one with
+        // risk checks has every bar called back, each asked on its own.
+        let defers = !self.rules.has_policies();
         self.bar_callback_required = (self.pending_target.is_some()
-            && !self.flat_target_rests_before_dispatch(i, has_position, net_position))
+            && !(defers && self.flat_target_rests_before_dispatch(i, has_position, net_position)))
             || self.working_orders != 0
             || (cash_flat
                 && !self.cash_halted
                 && !flat_cash_safe
-                && !self.flat_cash_holds_before_dispatch(i)?)
+                && !(defers && self.flat_cash_holds_before_dispatch(i)?))
             || self.rules.visit_primary_after_fill()
-            || (!flat
-                && self.rules.held_reopens(i, has_position, net_position, self.pending_target));
+            || (defers
+                && !flat
+                && self.rules.held_reopens(i, has_position, net_position, self.pending_target))
+            || self.loan_due(i);
         Ok(())
     }
 
-    /// `RustRuleSession.advance`.
-    fn advance(&mut self, i: usize) -> PyResult<Option<Target>> {
-        let (mut has_position, mut quantity) = held_position(self.runner);
+    /// `0 <= _loan_cover_bar <= idx`: a loan past its cover bar, still held.
+    fn loan_due(&self, i: usize) -> bool {
+        usize::try_from(self.loan_cover_bar).is_ok_and(|at| at <= i)
+    }
+
+    /// `RustRuleSession.advance`; `apply_policies` false for a halted run.
+    fn advance(&mut self, i: usize, apply_policies: bool) -> PyResult<Option<Target>> {
+        let (held, net) = held_position(self.runner);
+        // The account the risk checks read (`_position`).
+        let account =
+            if self.rules.has_policies() { policy_account(self.runner) } else { Account::FLAT };
+        let (mut has_position, mut quantity) = (held, net);
         // Level rules read dust themselves, on the venue's own lot.
         if !self.rules.level()
             && has_position
@@ -540,8 +631,15 @@ impl Replay<'_> {
             has_position = false;
             quantity = 0.0;
         }
-        let (processed, target) =
-            self.rules.advance(self.bars.ts[i], i, has_position, quantity, self.pending_target)?;
+        let (processed, target) = self.rules.advance(
+            self.bars.ts[i],
+            i,
+            has_position,
+            quantity,
+            self.pending_target,
+            account,
+            apply_policies,
+        )?;
         if processed {
             self.refresh()?;
         }
@@ -555,11 +653,20 @@ impl Replay<'_> {
         self.strategy_cash().map(|_| ())
     }
 
-    fn submit_native_intent(&mut self, i: usize, target: Option<Target>) -> PyResult<()> {
+    /// `_submit_native_intent`: `preceding` is the model's own close to send
+    /// ahead of a risk close (`preceding_exit`), and `risk_exit` marks a
+    /// target a risk policy decided, outside the bar's decision.
+    fn submit_native_intent(
+        &mut self,
+        i: usize,
+        target: Option<Target>,
+        preceding: Option<f64>,
+        risk_exit: bool,
+    ) -> PyResult<()> {
         let Some(target) = target else {
             return Ok(());
         };
-        let target_side = target.side;
+        let (target_side, style) = (target.side, target.style);
         let (has_position, net_position) = held_position(self.runner);
         let held = if has_position { net_position } else { 0.0 };
         let mut held_side = side_of(held);
@@ -576,13 +683,49 @@ impl Replay<'_> {
             if target_side != 0 {
                 return Err(declined("a reversal"));
             }
-            let previous =
-                (self.pending_target, self.pending_reference, self.target_bars, self.target_bar_ts);
+            if self.shorts.is_some() && self.pending_target.is_some_and(|t| t != 0.0) {
+                // A cover beside a short target still pending: an entry that
+                // filled in part. `create_order` latches no `_pending_flat`
+                // while a signed target is out -- the target owns the
+                // retries -- so nothing is retargeted here. Once the cover
+                // fills, the target's continuation sells its residual again,
+                // priced off this bar.
+                if self.submit_exit(i, reference, None, style)? {
+                    self.pending_reference = reference;
+                }
+                return Ok(());
+            }
+            let previous = (
+                self.pending_target,
+                self.pending_reference,
+                self.pending_order_style,
+                self.target_bars,
+                self.target_bar_ts,
+                self.short_attempts,
+            );
             self.pending_reference = reference;
+            self.pending_order_style = style;
             self.target_bars = 0;
             self.target_bar_ts = -1;
             self.retarget(Some(0.0));
-            if !self.submit_exit(i, reference)? {
+            self.exit_gated = false;
+            let preceded = match preceding {
+                Some(at) => self.submit_exit(i, at, None, OrderStyle::Default)?,
+                None => false,
+            };
+            let submitted = self.submit_exit(i, reference, None, style)? || preceded;
+            if !submitted
+                && risk_exit
+                && self.exit_gated
+                && (previous.0.is_none() || self.shorts.is_none())
+            {
+                // `run_decision` refuses the bar's own orders on a shut venue
+                // before `create_order` latches anything, but a risk check
+                // runs outside it: its close latches the pending flat, then
+                // `submit_order` meets the bell. The next primary bar's
+                // `_reconcile_exit` resends it in the configured close type.
+                self.pending_order_style = OrderStyle::Default;
+            } else if !submitted {
                 // A rule session's close is one attempt (`create_order`; its
                 // intents do not `persist_if_unsubmitted`): one the venue's
                 // hours refuse, or preflight, is dropped, and whatever target
@@ -590,8 +733,10 @@ impl Replay<'_> {
                 (
                     self.pending_target,
                     self.pending_reference,
+                    self.pending_order_style,
                     self.target_bars,
                     self.target_bar_ts,
+                    self.short_attempts,
                 ) = previous;
             }
             return Ok(());
@@ -602,32 +747,74 @@ impl Replay<'_> {
         if units <= 0.0 {
             return Ok(());
         }
+        if self.shorts.is_some() {
+            // `create_order(SELL)` from flat, which the sell-to-open adapter
+            // turns into `set_target_position(current - qty)`: the target is
+            // the lot held -- dust `is_flat()` reads as flat, or nothing --
+            // less the entry. The same target again keeps its bar and attempt
+            // budgets; a new one starts both.
+            let target = held - units;
+            if Some(target) != self.pending_target {
+                self.target_bars = 0;
+                self.target_bar_ts = -1;
+            }
+            self.retarget(Some(target));
+            self.pending_reference = reference;
+            self.pending_order_style = style;
+            self.submit_entry(i, reference, units, false)?;
+            return Ok(());
+        }
         if target_side < 0 {
             return Err(declined("a short entry"));
         }
-        self.submit_entry(i, reference, units, target.policies_after_fill)?;
+        self.submit_entry(i, reference, units, true)?;
         Ok(())
     }
 
-    fn submit_exit(&mut self, i: usize, reference: f64) -> PyResult<bool> {
+    /// `_submit_exit`: close the position, or `units` of it, at `reference`,
+    /// in `style`: the venue's configured close for `Default`.
+    fn submit_exit(
+        &mut self,
+        i: usize,
+        reference: f64,
+        units: Option<f64>,
+        style: OrderStyle,
+    ) -> PyResult<bool> {
         let decided_ns = self.bars.ts[i];
-        if let Some(gate) = self.gate {
-            if !gate[i] {
-                return Ok(false);
-            }
-        }
         let (_, net_position) = held_position(self.runner);
-        if net_position < 0.0 {
-            // A buy close takes `reference_order_type`'s buy side.
-            return Err(declined("a short position"));
-        }
         let buy = net_position <= 0.0;
         let limit_price = self.snap(reference, net_position < 0.0)?;
-        let units = net_position.abs();
+        let held_units = net_position.abs();
+        // Python's `min`: the first argument unless the second is less.
+        let units = match units {
+            Some(asked) if held_units < asked => held_units,
+            Some(asked) => asked,
+            None => held_units,
+        };
         if units <= 0.0 || !self.tradeable(units, reference) {
             return Ok(false);
         }
-        let market = self.venue.exit_market;
+        if let Some(gate) = self.gate {
+            if !gate[i] {
+                // Past instrument preflight, which is as far as a close gets
+                // in `create_order` before `submit_order` meets the shut
+                // venue. Whether it outlives its order is the caller's to say.
+                self.exit_gated = true;
+                return Ok(false);
+            }
+        }
+        // A buy close takes `reference_order_type`'s buy side: a cover's.
+        let cover_market = match &self.shorts {
+            Some(shorts) => shorts.cover_market,
+            None if buy => return Err(declined("a short position")),
+            None => false,
+        };
+        let market = match style {
+            OrderStyle::Default if buy => cover_market,
+            OrderStyle::Default => self.venue.exit_market,
+            OrderStyle::Market => true,
+            OrderStyle::Limit => false,
+        };
         let tif = if market {
             "gtc"
         } else if self.venue.venue_ioc {
@@ -649,43 +836,70 @@ impl Replay<'_> {
             },
             decided_ns,
             decided_ns,
-            false,
         )?;
         self.last_exit_ts = decided_ns;
         self.working_orders += 1;
         Ok(true)
     }
 
-    fn submit_entry(
-        &mut self,
-        i: usize,
-        reference: f64,
-        units: f64,
-        policies_after_fill: bool,
-    ) -> PyResult<bool> {
+    /// `_submit_entry`: open `units` on `long`'s side, in that side's shape.
+    ///
+    /// A long entry is the configured entry order, a limit resting twelve
+    /// bars; a short entry is `_create_short_entry_ioc`'s, a limit that
+    /// lives on arrival only -- IOC, or DAY where the venue refuses IOC.
+    fn submit_entry(&mut self, i: usize, reference: f64, units: f64, long: bool) -> PyResult<bool> {
         let decided_ns = self.bars.ts[i];
         if let Some(gate) = self.gate {
             if !gate[i] {
                 return Ok(false);
             }
         }
+        // A short against a durable target spends one of its attempts, and
+        // the target is given up when they are gone, ahead of the preflight.
+        let durable_short = !long && self.pending_target.is_some_and(|t| t < 0.0);
+        if !long {
+            let Some(shorts) = &self.shorts else {
+                return Err(declined("a short entry"));
+            };
+            if durable_short && self.short_attempts >= shorts.max_attempts {
+                self.drop_target();
+                return Ok(false);
+            }
+        }
         if units <= 0.0 || !self.tradeable(units, reference) {
             return Ok(false);
         }
-        let market = self.venue.entry_market;
-        let limit_price = self.snap(reference, true)?;
-        let order_price =
-            if market { self.bars.close[i] * self.venue.market_markup } else { limit_price };
-        if !self.affordable(units, order_price)? {
+        if !long && self.short_refused(decided_ns, units)? {
+            // `StrategyBase` retains a signed target after a local short
+            // preflight refusal and retries it on later bars.
             return Ok(false);
         }
-        let tif = if market { "gtc" } else { "gtd" };
-        let expire_ns = (!market).then(|| decided_ns + 12 * self.venue.bar_ns);
+        let market = long && self.venue.entry_market;
+        let limit_price = self.snap(reference, long)?;
+        if long {
+            // `_buy_cash_shortfall`: the order costed at the price it
+            // carries, fee included. A short entry checks no cash.
+            let order_price =
+                if market { self.bars.close[i] * self.venue.market_markup } else { limit_price };
+            if !self.affordable(units, order_price)? {
+                return Ok(false);
+            }
+        }
+        let tif = if market {
+            "gtc"
+        } else if long {
+            "gtd"
+        } else if self.venue.venue_ioc {
+            "ioc"
+        } else {
+            "day"
+        };
+        let expire_ns = (tif == "gtd").then(|| decided_ns + 12 * self.venue.bar_ns);
         self.submit(
             Submit {
                 client_id: String::new(),
                 ledger_index: 0,
-                buy: true,
+                buy: long,
                 market,
                 units,
                 limit_price: (!market).then_some(limit_price),
@@ -695,21 +909,28 @@ impl Replay<'_> {
             },
             decided_ns,
             decided_ns,
-            policies_after_fill,
         )?;
+        if durable_short {
+            self.short_attempts += 1;
+        }
         self.working_entry = true;
         self.working_orders += 1;
         Ok(true)
     }
 
+    /// Whether the run's short gate refuses a short of `units` decided at
+    /// `decided_ns`, added to the position held: `short_gate.refusal`.
+    fn short_refused(&self, decided_ns: i64, units: f64) -> PyResult<bool> {
+        let Some(refusal) = self.shorts.as_ref().and_then(|s| s.refusal) else {
+            return Ok(false);
+        };
+        let (has_position, net_position) = held_position(self.runner);
+        let position = if has_position { net_position } else { 0.0 };
+        refusal.call1((decided_ns, units, position, self.short_opened_ns))?.is_true()
+    }
+
     /// `Strategy.submit_order` and the `_OrderTerms` recorded beside it.
-    fn submit(
-        &mut self,
-        mut order: Submit,
-        decided_ns: i64,
-        arrived_on_ns: i64,
-        policies_after_fill: bool,
-    ) -> PyResult<()> {
+    fn submit(&mut self, mut order: Submit, decided_ns: i64, arrived_on_ns: i64) -> PyResult<()> {
         if let Some(price) = order.limit_price {
             if price <= 0.0 {
                 // `Limit.__post_init__` raises, which the strategy should
@@ -736,19 +957,27 @@ impl Replay<'_> {
             reduce_only: order.reduce_only,
             decided_ns,
             arrived_on_ns,
-            policies_after_fill,
+            // No target asks the risk policies after a fill any more (one step
+            // per instant): every order's terms say so.
+            policies_after_fill: false,
         });
         order.ledger_index = index;
         self.commands.push(order);
         Ok(())
     }
 
+    /// `_retarget`: a different target starts a fresh short-attempt budget,
+    /// and clearing resets it too.
     fn retarget(&mut self, target: Option<f64>) {
+        if target != self.pending_target {
+            self.short_attempts = 0;
+        }
         self.pending_target = target;
     }
 
     fn drop_target(&mut self) {
         self.retarget(None);
+        self.pending_order_style = OrderStyle::Default;
         self.target_bars = 0;
         self.target_bar_ts = -1;
     }
@@ -767,15 +996,50 @@ impl Replay<'_> {
             return Ok(false);
         }
         if held != 0.0 && (target == 0.0 || (held > 0.0) != (target > 0.0)) {
-            let submitted = self.submit_exit(i, reference)?;
+            // Wrong side of the target, or anything held when it is flat:
+            // reduce first, and to flat.
+            let submitted = self.submit_exit(i, reference, None, self.pending_order_style)?;
             if submitted {
                 self.pending_reference = reference;
             }
             return Ok(submitted);
         }
-        // A long-only replay's only target is flat, which the two branches
-        // above settle whatever the book holds.
-        Err(declined("a target other than flat"))
+        if held != 0.0 && target.abs() < held.abs() {
+            let submitted = self.submit_exit(
+                i,
+                reference,
+                Some(held.abs() - target.abs()),
+                self.pending_order_style,
+            )?;
+            if submitted {
+                self.pending_reference = reference;
+            }
+            return Ok(submitted);
+        }
+        // A long-only replay's only target is flat, which the branches above
+        // settle whatever the book holds; a short node's is short of it.
+        let Some(max_stale_bars) = self.shorts.as_ref().map(|s| s.max_stale_bars) else {
+            return Err(declined("a target other than flat"));
+        };
+        // Same side as the target and short of it: the residual, on the
+        // target's own side -- not while its own order is still working.
+        if self.working_entry {
+            return Ok(false);
+        }
+        if self.target_bars > max_stale_bars {
+            self.drop_target();
+            return Ok(false);
+        }
+        let delta = target - held;
+        if delta > 0.0 && target > 0.0 {
+            // `_fund_long_target`, which no short node's target reaches.
+            return Err(declined("a long target"));
+        }
+        if self.pending_order_style != OrderStyle::Default {
+            // Only a risk close carries a style, and it targets flat.
+            return Err(declined("an entry in a close's order style"));
+        }
+        self.submit_entry(i, reference, delta.abs(), delta > 0.0)
     }
 
     fn reconcile_target(&mut self, i: usize) -> PyResult<bool> {
@@ -817,16 +1081,29 @@ impl Replay<'_> {
         gross_realized: f64,
     ) -> PyResult<()> {
         self.working_entry = false;
-        let Some(order) = self.ledger_index(order_id) else {
+        let Some((order, buy)) = self.ledger_index(order_id) else {
             return Err(declined("a fill of an order this replay did not send"));
         };
         let now = self.bars.ts[at];
         self.ledger.fill(order, now, order_id, size, price, leaves, gross_realized, commission);
+        // Every order here is decided on the bar it arrives on, so the fill
+        // is stamped by the clock (`_OrderTerms.stamp`).
+        self.track_short_loan(now)?;
         // `runtime.on_fill`: the account refreshed, the next primary bar a
-        // visit. With no policies and no follow-up, nothing else of the fill
-        // reaches the runtime.
+        // visit, and the fill booked by the risk policies -- at what it cost
+        // as the strategy reads it (`_record_fill`). With no follow-up,
+        // nothing else of the fill reaches the runtime.
         self.refresh()?;
-        self.rules.on_fill();
+        if self.rules.has_policies() {
+            let cost = money(or_zero(commission), self.quiet.currency_precision)
+                .ok_or_else(|| declined("a commission that is not a number"))?;
+            let flat = side_of(self.account_quantity) == 0;
+            // A run that borrows charges the loan on the lot the fill left.
+            let fill = Some((at, self.account_quantity));
+            self.rules.on_fill(if buy { 1.0 } else { -1.0 }, or_zero(size), cost, flat, fill)?;
+        } else {
+            self.rules.on_fill(0.0, 0.0, 0.0, true, None)?;
+        }
         if leaves <= 0.0 {
             self.working_orders = (self.working_orders - 1).max(0);
             self.continue_target(at, self.pending_reference)?;
@@ -835,9 +1112,84 @@ impl Replay<'_> {
         Ok(())
     }
 
+    /// `_track_short_loan`, after every fill where a loan has a term: a loan
+    /// is dated from the fill that left the book short, and ends with the
+    /// fill that leaves it flat or long.
+    fn track_short_loan(&mut self, filled_ns: i64) -> PyResult<()> {
+        let Some(cover_bar) = self.shorts.as_ref().and_then(|s| s.cover_bar) else {
+            return Ok(());
+        };
+        let (has_position, net_position) = held_position(self.runner);
+        if has_position && net_position < 0.0 {
+            if self.short_opened_ns.is_none() {
+                self.short_opened_ns = Some(filled_ns);
+                self.loan_cover_bar = cover_bar.call1((filled_ns,))?.extract()?;
+            }
+        } else {
+            self.short_opened_ns = None;
+            self.loan_cover_bar = -1;
+        }
+        Ok(())
+    }
+
+    /// `_check_short_loan`: `_check_short_loan_age`'s forced cover, on a bar
+    /// it is due on.
+    ///
+    /// Asked on every bar `handle_bar` admits from the cover bar on, while
+    /// nothing of the strategy's own is working. The cover is the whole
+    /// short at this bar's close, latched as the pending close unless a
+    /// target already owns the retries. A cover the instrument cannot trade
+    /// latches nothing and is asked again on the next bar; one a shut venue
+    /// refused keeps its latch for the next bar's reconcile to resend.
+    fn check_short_loan(&mut self, i: usize) -> PyResult<()> {
+        if self.working_orders != 0 {
+            return Ok(());
+        }
+        if let Some(admission) = self.shorts.as_ref().and_then(|s| s.admission) {
+            if !admission[i] {
+                return Ok(());
+            }
+        }
+        let (has_position, net_position) = held_position(self.runner);
+        if !has_position || net_position >= 0.0 {
+            return Ok(());
+        }
+        let reference = self.bars.close[i];
+        let previous = (
+            self.pending_target,
+            self.pending_reference,
+            self.pending_order_style,
+            self.target_bars,
+            self.target_bar_ts,
+            self.short_attempts,
+        );
+        let latches = self.pending_target.is_none();
+        if latches {
+            self.retarget(Some(0.0));
+            self.pending_reference = reference;
+            self.pending_order_style = OrderStyle::Default;
+            self.target_bars = 0;
+            self.target_bar_ts = -1;
+        }
+        self.exit_gated = false;
+        if self.submit_exit(i, reference, None, OrderStyle::Default)? || !latches || self.exit_gated
+        {
+            return Ok(());
+        }
+        (
+            self.pending_target,
+            self.pending_reference,
+            self.pending_order_style,
+            self.target_bars,
+            self.target_bar_ts,
+            self.short_attempts,
+        ) = previous;
+        Ok(())
+    }
+
     /// `on_order_canceled` / `on_order_expired`.
     fn end_order(&mut self, at: usize, order_id: u64, status: EndStatus) {
-        if let Some(order) = self.ledger_index(order_id) {
+        if let Some((order, _)) = self.ledger_index(order_id) {
             self.ledger.end(order, status, self.bars.ts[at]);
         }
         self.working_entry = false;
@@ -846,10 +1198,10 @@ impl Replay<'_> {
     }
 
     /// Where the ledger keeps the terms of the order the kernel calls
-    /// `order_id`, if this replay sent it.
-    fn ledger_index(&self, order_id: u64) -> Option<u32> {
-        let at = self.orders.partition_point(|&(id, _)| id < order_id);
-        self.orders.get(at).filter(|&&(id, _)| id == order_id).map(|&(_, index)| index)
+    /// `order_id`, and whether it buys, if this replay sent it.
+    fn ledger_index(&self, order_id: u64) -> Option<(u32, bool)> {
+        let at = self.orders.partition_point(|&(id, ..)| id < order_id);
+        self.orders.get(at).filter(|&&(id, ..)| id == order_id).map(|&(_, index, buy)| (index, buy))
     }
 
     fn on_order_rejected(&mut self) {
