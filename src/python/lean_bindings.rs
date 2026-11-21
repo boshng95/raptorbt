@@ -30,7 +30,7 @@ use crate::lean::kernel::{Terms, Trade};
 use crate::lean::market::Market;
 use crate::lean::replay::{replay, Cell, Frame, Loan, Outcome, Shorts};
 use crate::lean::rules::{
-    Compare, Condition, Cross, Dispatch, Level, Operand, Signals, Stream, Tree,
+    Compare, Condition, Cross, Dispatch, LegTerms, Level, Operand, Placing, Signals, Stream, Tree,
 };
 use crate::lean::Declined;
 use crate::metrics::canonical::{calculate, LocalClock, ReportInputs, Value};
@@ -90,6 +90,10 @@ type KeyPool<'py> = (
 /// flags)`, its keys places in the pool's values and init alike, an admits
 /// a place in its admits or -1 for none.
 type CellTuple = (Vec<usize>, i64, i64, CrossTuple, CrossTuple, RuleFlags);
+
+/// `(key_legs, admits)`: each pool key's leg of a frame of more than one,
+/// and the admits of every leg after the first by pool place (-1: none).
+type LegsTuple = (Vec<usize>, Vec<i64>);
 
 /// One node of a condition arena, as `CrossoverRuleSession` takes it:
 /// `(kind, children, a_key, a_value, b_key, b_value, code, lower, upper)`
@@ -230,10 +234,22 @@ impl PyLeanMarket {
     }
 }
 
+/// One leg of [`PyLeanFrame::of_legs`]: a stream's `(timestamps, labels,
+/// close, dispatch_rank, built_by_strategy, stream_index)`.
+type LegTuple<'py> = (
+    PyReadonlyArray1<'py, i64>,
+    PyReadonlyArray1<'py, i64>,
+    PyReadonlyArray1<'py, f64>,
+    i64,
+    bool,
+    i64,
+);
+
 /// The cells of one resampled stream on a market: the bars `on_bar` is due
 /// on, as positions (`np.flatnonzero` of the replay mask), and the stream's
 /// `(dispatch_timestamps, dispatch_positions, labels, close)`. Checked once
-/// and shared by every cell whose keys are on the stream.
+/// and shared by every cell whose keys are on the stream. A frame of more
+/// than one of the symbol's streams is [`PyLeanFrame::of_legs`]'s.
 #[pyclass(name = "LeanFrame", module = "raptorbt", frozen)]
 pub struct PyLeanFrame {
     market: Arc<Market>,
@@ -252,13 +268,6 @@ impl PyLeanFrame {
         labels: PyReadonlyArray1<'_, i64>,
         close: PyReadonlyArray1<'_, f64>,
     ) -> PyResult<Self> {
-        let positions = |array: &PyReadonlyArray1<'_, i64>, what: &str| -> PyResult<Vec<usize>> {
-            let array = array.as_array();
-            if array.iter().any(|&at| at < 0) {
-                return Err(PyValueError::new_err(format!("{what} before the first bar")));
-            }
-            Ok(array.iter().map(|&at| at as usize).collect())
-        };
         let dispatch = Dispatch::new(
             dispatch_timestamps.as_array().to_vec(),
             positions(&dispatch_positions, "a dispatch")?,
@@ -266,18 +275,71 @@ impl PyLeanFrame {
             close.as_array().to_vec(),
         )
         .map_err(declined)?;
-        let frame = Frame::new(&market.market, positions(&due, "a due bar")?, dispatch)
-            .map_err(declined)?;
+        Self::framed(&market, &due, dispatch)
+    }
+
+    /// A frame of the symbol's resampled streams *legs* in slot order, each
+    /// a `(timestamps, labels, close, dispatch_rank, built_by_strategy,
+    /// stream_index)`, dispatched at `dispatch_timestamps` -- every instant
+    /// one of them dispatches at (`NativeExecutionSession`'s
+    /// `_dispatch_timestamps`) -- on the primary bars `dispatch_positions`.
+    /// Only level rules read a frame of more than one leg.
+    #[staticmethod]
+    fn of_legs(
+        market: PyRef<'_, PyLeanMarket>,
+        due: PyReadonlyArray1<'_, i64>,
+        dispatch_timestamps: PyReadonlyArray1<'_, i64>,
+        dispatch_positions: PyReadonlyArray1<'_, i64>,
+        legs: Vec<LegTuple<'_>>,
+    ) -> PyResult<Self> {
+        let legs = legs
+            .into_iter()
+            .map(|(ts, labels, close, rank, built, stream_index)| LegTerms {
+                ts: ts.as_array().to_vec(),
+                labels: labels.as_array().to_vec(),
+                close: close.as_array().to_vec(),
+                rank,
+                built,
+                stream_index,
+            })
+            .collect();
+        let dispatch = Dispatch::of_legs(
+            dispatch_timestamps.as_array().to_vec(),
+            positions(&dispatch_positions, "a dispatch")?,
+            legs,
+        )
+        .map_err(declined)?;
+        Self::framed(&market, &due, dispatch)
+    }
+
+    fn __len__(&self) -> usize {
+        self.frame.dispatch.len()
+    }
+}
+
+impl PyLeanFrame {
+    fn framed(
+        market: &PyLeanMarket,
+        due: &PyReadonlyArray1<'_, i64>,
+        dispatch: Dispatch,
+    ) -> PyResult<Self> {
+        let frame =
+            Frame::new(&market.market, positions(due, "a due bar")?, dispatch).map_err(declined)?;
         Ok(Self {
             market: Arc::clone(&market.market),
             day_ends: Arc::clone(&market.day_ends),
             frame,
         })
     }
+}
 
-    fn __len__(&self) -> usize {
-        self.frame.dispatch.len()
+/// Bar places off a Python array; ValueError where one is negative.
+fn positions(array: &PyReadonlyArray1<'_, i64>, what: &str) -> PyResult<Vec<usize>> {
+    let array = array.as_array();
+    if array.iter().any(|&at| at < 0) {
+        return Err(PyValueError::new_err(format!("{what} before the first bar")));
     }
+    Ok(array.iter().map(|&at| at as usize).collect())
 }
 
 fn operand(key: i64, value: f64) -> Operand {
@@ -432,7 +494,10 @@ impl<'a> Shared<'a> {
 struct Spec<'a> {
     values: Vec<&'a [f64]>,
     init: Vec<&'a [bool]>,
-    admits: Option<&'a [bool]>,
+    /// Each key's leg of the frame.
+    key_leg: Vec<usize>,
+    /// Each leg's session filter.
+    admits: Vec<Option<&'a [bool]>>,
     primary_admits: Option<&'a [bool]>,
     entry: CrossTuple,
     exit: CrossTuple,
@@ -456,7 +521,8 @@ impl<'a> Spec<'a> {
         Ok(Self {
             values: values.iter().map(|key| key.as_slice()).collect::<Result<_, _>>()?,
             init: init.iter().map(|flags| flags.as_slice()).collect::<Result<_, _>>()?,
-            admits: admits.as_ref().map(|admits| admits.as_slice()).transpose()?,
+            key_leg: vec![0; values.len()],
+            admits: vec![admits.as_ref().map(|admits| admits.as_slice()).transpose()?],
             primary_admits: primary_admits.as_ref().map(|admits| admits.as_slice()).transpose()?,
             entry,
             exit,
@@ -467,10 +533,13 @@ impl<'a> Spec<'a> {
     }
 
     /// A batch cell's, off the pool's slices; ValueError where it names a
-    /// place the pool does not have.
+    /// place the pool does not have. On a frame of more than one leg,
+    /// *legs* is each pool key's leg and the other legs' admits by place:
+    /// the cell's own `admits` are its first leg's.
     fn pooled(
         pool: &Pool<'a>,
         cell: &CellTuple,
+        legs: Option<&LegsTuple>,
         tree: Option<Tree>,
         each_bar: bool,
     ) -> PyResult<Self> {
@@ -484,6 +553,18 @@ impl<'a> Spec<'a> {
                 Err(_) => Err(outside()),
             }
         };
+        let (key_leg, admits) = match legs {
+            None => (vec![0; keys.len()], vec![admitted(*admits)?]),
+            Some((key_legs, others)) => (
+                keys.iter()
+                    .map(|&key| key_legs.get(key).copied().ok_or_else(outside))
+                    .collect::<PyResult<_>>()?,
+                std::iter::once(*admits)
+                    .chain(others.iter().copied())
+                    .map(admitted)
+                    .collect::<PyResult<_>>()?,
+            ),
+        };
         Ok(Self {
             values: keys
                 .iter()
@@ -493,7 +574,8 @@ impl<'a> Spec<'a> {
                 .iter()
                 .map(|&key| pool.init.get(key).copied().ok_or_else(outside))
                 .collect::<PyResult<_>>()?,
-            admits: admitted(*admits)?,
+            key_leg,
+            admits,
             primary_admits: admitted(*primary_admits)?,
             entry: *entry,
             exit: *exit,
@@ -562,7 +644,7 @@ fn run(
         &shared.signals,
         spec.values.clone(),
         &spec.init,
-        spec.admits,
+        Placing { key_leg: spec.key_leg.clone(), admits: spec.admits.clone() },
         spec.primary_admits,
         cross(spec.entry),
         cross(spec.exit),
@@ -1045,7 +1127,10 @@ fn replay_all<T: Send>(
 /// keys and admits by place (-1: none). *trees*, where given, holds per cell
 /// None or its level rules as a [`TreeTuple`], which stand in for its
 /// `entry` and `exit`; *each_bar*, where given, per cell whether it works
-/// every crossing out once per evaluated bar.
+/// every crossing out once per evaluated bar. *legs*, on a frame of more
+/// than one leg ([`PyLeanFrame::of_legs`]), is `(key_legs, admits)`: each
+/// pool key's leg, and the admits of every leg after the first by place --
+/// a cell's own `admits` are its first leg's.
 ///
 /// Returns, in the cells' order, per cell the dict [`lean_replay`] returns
 /// without `log` (and without the daily curve unless *curve*), or, where
@@ -1061,7 +1146,7 @@ fn replay_all<T: Send>(
     frame, gate, terms, quiet, venue, money, book, keys, cells,
     *, starting, timezone, offsets, offsets_until_ns, threads = 0, screen = false,
     curve = false, timings = false, trees = None, shorts = None, financing = None,
-    each_bar = None
+    each_bar = None, legs = None
 ))]
 #[allow(clippy::too_many_arguments)]
 pub fn lean_replay_many(
@@ -1087,6 +1172,7 @@ pub fn lean_replay_many(
     shorts: Option<ShortsTuple<'_>>,
     financing: Option<FinancingTuple<'_>>,
     each_bar: Option<Vec<bool>>,
+    legs: Option<LegsTuple>,
 ) -> PyResult<PyObject> {
     let entered = Instant::now();
     let gate = gate.as_ref().map(|gate| gate.as_slice()).transpose()?;
@@ -1118,7 +1204,7 @@ pub fn lean_replay_many(
         .map(|(at, cell)| {
             let tree = trees.as_ref().and_then(|trees| trees[at].as_ref()).map(tree).transpose()?;
             let each_bar = each_bar.as_ref().is_some_and(|each_bar| each_bar[at]);
-            Spec::pooled(&keys, cell, tree, each_bar)
+            Spec::pooled(&keys, cell, legs.as_ref(), tree, each_bar)
         })
         .collect::<PyResult<_>>()?;
     let pool = (threads > 1).then(|| threads_pool(threads)).transpose()?;

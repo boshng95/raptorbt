@@ -20,6 +20,12 @@
 //! whose answer holds between composites, so a primary bar's visit can act
 //! again. Their cursor is `python::rule_session`'s `advance_level` and its
 //! condition program, branch for branch; every resample bar steps it.
+//!
+//! Level rules may read keys on more than one of the symbol's resampled
+//! streams -- a filter on a second timeframe ([`Dispatch::of_legs`]). Each
+//! instant of the frame then delivers its legs' bars in dispatch order
+//! around the primary bar, each key holds its leg's last visit, and one not
+//! ready yet holds no value.
 
 use std::collections::HashMap;
 use std::hash::Hash;
@@ -181,68 +187,197 @@ fn crossed(previous: (f64, f64), a: f64, b: f64, above: bool) -> bool {
     }
 }
 
-/// A resampled stream's dispatches on its market: the resample bars, the
-/// primary bar each dispatches on and their closes, shared by every cell
-/// whose keys are on that stream.
-pub struct Dispatch {
+/// What a leg is built from: one of the traded symbol's `ScheduledStream`s
+/// -- its bars' dispatch timestamps, labels and closes, its `dispatch_rank`,
+/// whether the strategy builds it (`built_by_strategy`) and its
+/// `stream_index`.
+pub struct LegTerms {
     pub ts: Vec<i64>,
-    pub pos: Vec<usize>,
+    pub labels: Vec<i64>,
     pub close: Vec<f64>,
-    /// Each resample bar's dispatch phase (`rule_session::PHASE_*`). A lean
-    /// frame is a single instrument's leg, which the strategy builds from
-    /// its primary bars: a bar labelled after its timestamp is a pre-close
-    /// window and one labelled before it a window a gap closed, both decided
-    /// ahead of the primary bar at that timestamp ([`Dispatch::ahead`]);
-    /// any other follows it.
+    pub rank: i64,
+    pub built: bool,
+    pub stream_index: i64,
+}
+
+/// One resampled stream of a frame: its bars' closes, their dispatch phases
+/// and the instants they are dispatched at.
+pub struct Leg {
+    pub close: Vec<f64>,
+    /// Each bar's dispatch phase (`rule_session::PHASE_*`), as
+    /// `ScheduledStream.order` gives it: a bar labelled after its timestamp
+    /// is a pre-close window, and one labelled before it on a leg the
+    /// strategy builds a window a gap closed, both decided ahead of the
+    /// primary bar at that timestamp ([`Leg::ahead`]); any other follows it.
     pub phase: Vec<i64>,
-    /// The lowest resample close, NaN where any is.
-    pub lowest_close: f64,
-    /// Whether the labels rise, so no resample visit repeats the label
-    /// before it (`DecisionProgram.evaluate`'s repeat).
+    /// Each bar's instant, a place in its frame's [`Dispatch::ts`].
+    pub at: Vec<usize>,
+    /// Whether the labels rise, so no visit repeats the label before it
+    /// (`DecisionProgram.evaluate`'s repeat).
     pub labels_rise: bool,
 }
 
+impl Leg {
+    /// Whether bar `r` is decided ahead of the primary bar it is dispatched
+    /// with (`ScheduledBar.ahead_of_primary`).
+    #[inline]
+    pub fn ahead(&self, r: usize) -> bool {
+        self.phase[r] < PHASE_PRIMARY
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.close.len()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.close.is_empty()
+    }
+}
+
+/// A frame's dispatches on its market, shared by every cell on it: each
+/// instant a bar of any of its legs is dispatched at and the primary bar
+/// that delivers it (`NativeExecutionSession._dispatch_timestamps` and
+/// `_dispatch_positions`), the legs, and each instant's bars in the order
+/// `NativeScheduleCursor._select` delivers them.
+///
+/// A frame of one leg -- the shape most of the library has -- has one bar an
+/// instant, at the instant's own place.
+pub struct Dispatch {
+    pub ts: Vec<i64>,
+    pub pos: Vec<usize>,
+    pub legs: Vec<Leg>,
+    /// The lowest close of any leg, NaN where any is.
+    pub lowest_close: f64,
+    /// `(leg, bar)` of every leg's bars, by instant and then in delivery
+    /// order: instant `u`'s are `events[starts[u]..starts[u + 1]]`.
+    events: Vec<(usize, usize)>,
+    starts: Vec<usize>,
+    /// How many of each instant's bars are decided ahead of its primary bar,
+    /// which they lead.
+    ahead: Vec<usize>,
+}
+
 impl Dispatch {
+    /// A frame of one leg the strategy builds: its dispatches, the primary
+    /// bar each reaches, its labels and closes.
     pub fn new(
         ts: Vec<i64>,
         pos: Vec<usize>,
         labels: &[i64],
         close: Vec<f64>,
     ) -> Result<Self, Declined> {
+        let leg = LegTerms {
+            ts: ts.clone(),
+            labels: labels.to_vec(),
+            close,
+            rank: 0,
+            built: true,
+            stream_index: 0,
+        };
+        Self::of_legs(ts, pos, vec![leg])
+    }
+
+    /// A frame of `legs`, dispatched at instants `ts` that reach primary
+    /// bars `pos`: every instant one at least one leg dispatches at, and
+    /// every leg's bar at one of them.
+    ///
+    /// An instant's bars sort as `ScheduledStream.order` sorts them: by
+    /// phase, then by `stream_index` among pre-close windows and by
+    /// `dispatch_rank` among the rest -- an order with no ties among one
+    /// symbol's legs, which the leg's place breaks if it had.
+    pub fn of_legs(ts: Vec<i64>, pos: Vec<usize>, legs: Vec<LegTerms>) -> Result<Self, Declined> {
         let n = ts.len();
-        if pos.len() != n || labels.len() != n || close.len() != n {
+        if pos.len() != n {
             return Err(Declined("stream lengths differ"));
+        }
+        if legs.is_empty() {
+            return Err(Declined("a frame without legs"));
         }
         if !ts.windows(2).all(|pair| pair[0] < pair[1])
             || !pos.windows(2).all(|pair| pair[0] < pair[1])
         {
             return Err(Declined("dispatches that do not rise"));
         }
-        let phase = labels
-            .iter()
-            .zip(&ts)
-            .map(|(&label, &dispatched)| {
-                if label > dispatched {
-                    PHASE_PRECLOSE
-                } else if label < dispatched {
-                    PHASE_CLOSED_BY_GAP
-                } else {
-                    PHASE_COMPLETED
+        let mut counts = vec![0usize; n];
+        // (instant, phase, rank, leg, bar)
+        let mut sorted: Vec<(usize, i64, i64, usize, usize)> = Vec::new();
+        let mut built = Vec::with_capacity(legs.len());
+        for (j, terms) in legs.into_iter().enumerate() {
+            let m = terms.ts.len();
+            if terms.labels.len() != m || terms.close.len() != m {
+                return Err(Declined("stream lengths differ"));
+            }
+            if !terms.ts.windows(2).all(|pair| pair[0] < pair[1]) {
+                return Err(Declined("dispatches that do not rise"));
+            }
+            let mut at = Vec::with_capacity(m);
+            let mut phase = Vec::with_capacity(m);
+            let mut u = 0;
+            for (r, (&dispatched, &label)) in terms.ts.iter().zip(&terms.labels).enumerate() {
+                while u < n && ts[u] < dispatched {
+                    u += 1;
                 }
-            })
-            .collect();
-        let lowest_close = lowest(&close);
-        let labels_rise = labels.windows(2).all(|pair| pair[0] < pair[1]);
-        Ok(Self { ts, pos, close, phase, lowest_close, labels_rise })
+                if u == n || ts[u] != dispatched {
+                    return Err(Declined("a leg's bar at no instant of its frame"));
+                }
+                let (p, rank) = if label > dispatched {
+                    (PHASE_PRECLOSE, terms.stream_index)
+                } else if label < dispatched && terms.built {
+                    (PHASE_CLOSED_BY_GAP, terms.rank)
+                } else {
+                    (PHASE_COMPLETED, terms.rank)
+                };
+                at.push(u);
+                phase.push(p);
+                counts[u] += 1;
+                sorted.push((u, p, rank, j, r));
+            }
+            built.push(Leg {
+                labels_rise: terms.labels.windows(2).all(|pair| pair[0] < pair[1]),
+                close: terms.close,
+                phase,
+                at,
+            });
+        }
+        if counts.contains(&0) {
+            return Err(Declined("an instant no leg dispatches at"));
+        }
+        sorted.sort_unstable_by_key(|&(u, p, rank, j, _)| (u, p, rank, j));
+        let mut starts = Vec::with_capacity(n + 1);
+        let mut total = 0;
+        starts.push(0);
+        for &count in &counts {
+            total += count;
+            starts.push(total);
+        }
+        let mut ahead = vec![0usize; n];
+        for &(u, p, ..) in &sorted {
+            if p < PHASE_PRIMARY {
+                ahead[u] += 1;
+            }
+        }
+        let lowest_close = built.iter().fold(f64::INFINITY, |low, leg| {
+            let leg_low = lowest(&leg.close);
+            if low.is_nan() || leg_low.is_nan() {
+                f64::NAN
+            } else {
+                low.min(leg_low)
+            }
+        });
+        let events = sorted.into_iter().map(|(_, _, _, j, r)| (j, r)).collect();
+        Ok(Self { ts, pos, legs: built, lowest_close, events, starts, ahead })
     }
 
-    /// Whether resample bar `r` is decided ahead of the primary bar it is
-    /// dispatched with (`ScheduledBar.ahead_of_primary`).
+    /// Instant `u`'s bars as `(leg, bar)` in delivery order, and how many of
+    /// them lead its primary bar.
     #[inline]
-    pub fn ahead(&self, r: usize) -> bool {
-        self.phase[r] < PHASE_PRIMARY
+    pub fn events(&self, u: usize) -> (&[(usize, usize)], usize) {
+        (&self.events[self.starts[u]..self.starts[u + 1]], self.ahead[u])
     }
 
+    /// The instants.
     #[inline]
     pub fn len(&self) -> usize {
         self.ts.len()
@@ -279,15 +414,15 @@ type Slots<K, T> = Mutex<HashMap<K, Slot<T>>>;
 type Crossover = (Option<Place>, Side, Side, bool);
 
 /// What the cells of one call on a [`Dispatch`] share, worked out for the
-/// first cell that reads it: each session filter's admitted bars, each key's
-/// first ready bar under a filter, and each crossover's crossings under a
-/// filter. A cell reads a crossing only after its own first ready bar
-/// ([`Stream::entry_bit`]), so one series serves every cell, whatever its
-/// other keys.
+/// first cell that reads it: each leg's admitted bars under each session
+/// filter, each key's first ready bar under a filter, and each crossover's
+/// crossings under a filter. A cell reads a crossing only after its own
+/// first ready bar ([`Stream::entry_bit`]), so one series serves every cell,
+/// whatever its other keys.
 pub struct Signals<'a> {
     pub d: &'a Dispatch,
-    admitted: Slots<Option<Place>, Arc<[bool]>>,
-    ready: Slots<(Option<Place>, Place), Result<usize, Declined>>,
+    admitted: Slots<(usize, Option<Place>), Arc<[bool]>>,
+    ready: Slots<(usize, Option<Place>, Place), Result<usize, Declined>>,
     crossings: Slots<Crossover, Arc<[bool]>>,
 }
 
@@ -348,16 +483,28 @@ fn first_ready(admitted: &[bool], flags: &[bool]) -> Result<usize, Declined> {
     Ok(first)
 }
 
-/// One cell's decision stream: its keys' values on a [`Dispatch`]'s
-/// resample bars, and the crossings it trades.
+/// One cell's decision stream: its keys' values on their legs of a
+/// [`Dispatch`], and the rules it trades.
+///
+/// A crossover a side reads one leg, whose bars are the frame's instants;
+/// level rules read any of the frame's legs.
 pub struct Stream<'a> {
     pub d: &'a Dispatch,
+    /// Each key's values on its leg's bars.
     pub values: Vec<&'a [f64]>,
-    /// Per resample bar, whether the session filter admits its visit.
-    pub admitted: Arc<[bool]>,
+    /// Each key's leg.
+    key_leg: Vec<usize>,
+    /// Each key's first ready bar on its leg, or the leg's bar count.
+    key_ready: Vec<usize>,
+    /// Per leg and bar, whether the session filter admits its visit.
+    pub admitted: Vec<Arc<[bool]>>,
     /// Per primary bar, the same; None where every bar is.
     pub primary_admits: Option<&'a [bool]>,
-    /// The first admitted resample bar on which every key is ready.
+    /// Per leg, the first admitted bar on which every key on it is ready:
+    /// a visit from there reaches its keys (`rule_session::reached`). None
+    /// on a leg no key is on, whose visits reach nothing.
+    leg_ready: Vec<Option<usize>>,
+    /// The first leg's: a crossover's, whose keys are all on it.
     pub ready: usize,
     pub entry: Cross,
     pub exit: Cross,
@@ -387,6 +534,20 @@ pub struct Stream<'a> {
     clock_crosses: Vec<Cross>,
 }
 
+/// Where a cell's keys are on its frame: each key's leg, and each leg's
+/// session filter (None: every bar admitted).
+pub struct Placing<'p> {
+    pub key_leg: Vec<usize>,
+    pub admits: Vec<Option<&'p [bool]>>,
+}
+
+impl<'p> Placing<'p> {
+    /// Every key on a frame's one leg.
+    pub fn one_leg(keys: usize, admits: Option<&'p [bool]>) -> Self {
+        Self { key_leg: vec![0; keys], admits: vec![admits] }
+    }
+}
+
 impl<'a> Stream<'a> {
     /// A cell on `signals`' dispatch, with what it shares with the other
     /// cells there taken from `signals`.
@@ -395,7 +556,7 @@ impl<'a> Stream<'a> {
         signals: &Signals<'a>,
         values: Vec<&'a [f64]>,
         init: &[&[bool]],
-        admits: Option<&[bool]>,
+        placing: Placing<'_>,
         primary_admits: Option<&'a [bool]>,
         entry: Cross,
         exit: Cross,
@@ -407,30 +568,49 @@ impl<'a> Stream<'a> {
         minimum_notional: f64,
     ) -> Result<Self, Declined> {
         let d = signals.d;
-        let n = d.len();
-        if tree.is_some() && !d.labels_rise {
+        let Placing { key_leg, admits } = placing;
+        if admits.len() != d.legs.len() {
+            return Err(Declined("admits for another count of legs"));
+        }
+        if tree.is_none() && d.legs.len() != 1 {
+            return Err(Declined("a crossover a side over more than one leg"));
+        }
+        if tree.is_some() && d.legs.iter().any(|leg| !leg.labels_rise) {
             return Err(Declined("level rules on labels that do not rise"));
         }
-        if values.is_empty() || init.len() != values.len() {
-            return Err(Declined("no keys, or keys without their flags"));
+        if values.is_empty() || init.len() != values.len() || key_leg.len() != values.len() {
+            return Err(Declined("no keys, or keys without their flags or legs"));
         }
-        if admits.is_some_and(|admits| admits.len() != n) {
-            return Err(Declined("admits of another length"));
+        if key_leg.iter().any(|&leg| leg >= d.legs.len()) {
+            return Err(Declined("a key on no leg of its frame"));
         }
-        let filter = admits.map(place);
-        let slot = Signals::slot(&signals.admitted, filter);
-        let admitted =
-            Arc::clone(slot.get_or_init(|| admits.map_or_else(|| vec![true; n].into(), Arc::from)));
-        let mut ready = 0;
+        let mut admitted = Vec::with_capacity(d.legs.len());
+        for (leg, (bars, admits)) in d.legs.iter().zip(&admits).enumerate() {
+            let n = bars.len();
+            if admits.is_some_and(|admits| admits.len() != n) {
+                return Err(Declined("admits of another length"));
+            }
+            let slot = Signals::slot(&signals.admitted, (leg, admits.map(place)));
+            admitted.push(Arc::clone(
+                slot.get_or_init(|| admits.map_or_else(|| vec![true; n].into(), Arc::from)),
+            ));
+        }
+        let mut key_ready = Vec::with_capacity(values.len());
+        let mut leg_ready: Vec<Option<usize>> = vec![None; d.legs.len()];
         for (key, flags) in init.iter().enumerate() {
+            let leg = key_leg[key];
+            let n = d.legs[leg].len();
             if flags.len() != n || values[key].len() != n {
                 return Err(Declined("key lengths differ"));
             }
-            let slot = Signals::slot(&signals.ready, (filter, place(flags)));
-            ready = ready.max((*slot.get_or_init(|| first_ready(&admitted, flags)))?);
+            let filter = admits[leg].map(place);
+            let slot = Signals::slot(&signals.ready, (leg, filter, place(flags)));
+            let ready = (*slot.get_or_init(|| first_ready(&admitted[leg], flags)))?;
+            key_ready.push(ready);
+            leg_ready[leg] = Some(leg_ready[leg].map_or(ready, |at| at.max(ready)));
         }
-        // The first admitted bar from there.
-        let ready = Stream::next_set(&admitted, ready);
+        // The first leg's ready bar, for a crossover: every key is on it.
+        let ready = leg_ready[0].unwrap_or(d.legs[0].len());
         let operands: Vec<Operand> = match tree {
             Some(tree) => tree.operands().collect(),
             None => vec![entry.fast, entry.slow, exit.fast, exit.slow],
@@ -443,16 +623,22 @@ impl<'a> Stream<'a> {
         }
         let (entry_crossings, exit_crossings) = match tree {
             Some(_) => (Arc::from([]), Arc::from([])),
-            None => (
-                signals.crossings(filter, &admitted, &values, &entry),
-                signals.crossings(filter, &admitted, &values, &exit),
-            ),
+            None => {
+                let filter = admits[0].map(place);
+                (
+                    signals.crossings(filter, &admitted[0], &values, &entry),
+                    signals.crossings(filter, &admitted[0], &values, &exit),
+                )
+            }
         };
         Ok(Self {
             d,
             values,
+            key_leg,
+            key_ready,
             admitted,
             primary_admits,
+            leg_ready,
             ready,
             entry,
             exit,
@@ -487,12 +673,44 @@ impl<'a> Stream<'a> {
         Ok(())
     }
 
+    /// A crossover's operand on bar `r` of its one leg.
     #[inline]
     fn operand(&self, operand: Operand, r: usize) -> f64 {
         match operand {
             Operand::Key(key) => self.values[key][r],
             Operand::Const(value) => value,
         }
+    }
+
+    /// A level rule's operand with the legs' last visits at `current`
+    /// (`rule_session`'s `operand`): a key's value there once it is ready,
+    /// None before -- a key is ready on every admitted bar from its first
+    /// ready one.
+    #[inline]
+    fn level_operand(&self, operand: Operand, current: &[Option<usize>]) -> Option<f64> {
+        match operand {
+            Operand::Key(key) => {
+                let r = current[self.key_leg[key]]?;
+                (r >= self.key_ready[key]).then(|| self.values[key][r])
+            }
+            Operand::Const(value) => Some(value),
+        }
+    }
+
+    /// Whether a visit to `leg` at bar `r` reaches its keys.
+    #[inline]
+    fn leg_reached(&self, leg: usize, r: usize) -> bool {
+        self.leg_ready[leg].is_some_and(|ready| r >= ready)
+    }
+
+    /// Whether a primary visit with the legs' last visits at `current`
+    /// reaches its keys: every key is ready.
+    #[inline]
+    fn primary_reached(&self, current: &[Option<usize>]) -> bool {
+        self.leg_ready
+            .iter()
+            .zip(current)
+            .all(|(ready, r)| ready.is_none_or(|ready| r.is_some_and(|r| r >= ready)))
     }
 
     #[inline]
@@ -542,7 +760,13 @@ impl<'a> Stream<'a> {
     /// The last admitted resample bar in `from..to`.
     #[inline]
     pub fn last_admitted(&self, from: usize, to: usize) -> Option<usize> {
-        (from..to).rev().find(|&r| self.admitted[r])
+        (from..to).rev().find(|&r| self.admitted[0][r])
+    }
+
+    /// The one leg a crossover a side reads.
+    #[inline]
+    fn leg(&self) -> &Leg {
+        &self.d.legs[0]
     }
 }
 
@@ -553,23 +777,31 @@ pub struct Target {
     pub reference: Option<f64>,
 }
 
+/// Level rules' crossover clocks.
+#[derive(Clone, Debug)]
+struct Clocks {
+    /// Each clock's last operands.
+    last: Vec<Option<(f64, f64)>>,
+    /// Under `each_bar`, whether each clock crossed on the visit evaluating.
+    fired: Vec<bool>,
+    /// Whether a clock changed sides in the current visit.
+    flipped: bool,
+}
+
 /// The rule cursor's state.
 #[derive(Clone, Debug)]
 pub struct Cursor {
+    /// The next instant to dispatch.
     pub next_dispatch: usize,
     pub visit_primary_after_fill: bool,
     exit_clock: Option<(f64, f64)>,
     last_position: i32,
-    /// The last resample bar visited, whose values the keys hold.
-    current: Option<usize>,
+    /// Per leg, the last bar visited, whose values its keys hold.
+    current: Vec<Option<usize>>,
     last_primary_label: Option<i64>,
-    // Level rules': each crossover clock's last operands, whether one
-    // changed sides in the current visit, whether the last visit reached
-    // its keys, and the last evaluation's place in the dispatch order.
-    clocks: Vec<Option<(f64, f64)>>,
-    /// Under `each_bar`, whether each clock crossed on the visit evaluating.
-    fired: Vec<bool>,
-    flipped: bool,
+    clocks: Clocks,
+    // Level rules': whether the last visit reached its keys, and the last
+    // evaluation's place in the dispatch order.
     last_reached: bool,
     last_sort_key: Option<(i64, i64)>,
     /// The pending-close latch's last bar, or -1 ([`Latch`]). A lean cell's
@@ -578,34 +810,22 @@ pub struct Cursor {
     close_bar: i64,
 }
 
-impl Default for Cursor {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl Cursor {
-    pub fn new() -> Self {
+    /// A fresh cursor for `s`'s rules.
+    pub fn of(s: &Stream) -> Self {
+        let clocks = s.tree.map_or(0, |tree| tree.clocks);
         Self {
             next_dispatch: 0,
             visit_primary_after_fill: false,
             exit_clock: None,
             last_position: 0,
-            current: None,
+            current: vec![None; s.d.legs.len()],
             last_primary_label: None,
-            clocks: Vec::new(),
-            fired: Vec::new(),
-            flipped: false,
+            clocks: Clocks { last: vec![None; clocks], fired: vec![false; clocks], flipped: false },
             last_reached: false,
             last_sort_key: None,
             close_bar: -1,
         }
-    }
-
-    /// A fresh cursor for `s`'s rules.
-    pub fn of(s: &Stream) -> Self {
-        let clocks = s.tree.map_or(0, |tree| tree.clocks);
-        Self { clocks: vec![None; clocks], fired: vec![false; clocks], ..Self::new() }
     }
 
     /// `_DeclarativeNode.decision_position`.
@@ -720,7 +940,7 @@ impl Cursor {
     /// visit can act -- the next that exits. None where the cursor is not in
     /// that steady state.
     pub fn quiet_held(&self, s: &Stream) -> Option<usize> {
-        let current = self.current?;
+        let current = self.current[0]?;
         if self.visit_primary_after_fill
             || self.last_position != s.entry_side
             || current >= self.next_dispatch
@@ -756,7 +976,7 @@ impl Cursor {
             let side = if held { s.entry_side } else { 0 };
             for r in from..to {
                 let bar = s.d.pos[r] as i64;
-                if s.d.ahead(r) {
+                if s.leg().ahead(r) {
                     latch.step(bar, true, side);
                 }
                 latch.step(bar, false, side);
@@ -769,7 +989,7 @@ impl Cursor {
         let Some(last) = s.last_admitted(from, to) else {
             return;
         };
-        self.current = Some(last);
+        self.current[0] = Some(last);
         if last >= s.ready {
             if held {
                 self.exit_clock = Some(s.operands(&s.exit, last));
@@ -826,7 +1046,7 @@ impl Cursor {
         quantity: f64,
         pending: Option<f64>,
     ) -> Option<(bool, bool, f64)> {
-        let price = if primary { close[bar] } else { s.d.close[bar] };
+        let price = if primary { close[bar] } else { s.leg().close[bar] };
         let mut position = side;
         if position != 0 && s.position_required {
             position = Self::decision_position(s, position, quantity, pending, price);
@@ -834,7 +1054,7 @@ impl Cursor {
         let admitted = if primary {
             s.primary_admits.is_none_or(|admits| admits[bar])
         } else {
-            s.admitted[bar]
+            s.admitted[0][bar]
         };
         if !admitted {
             return None;
@@ -845,14 +1065,14 @@ impl Cursor {
             }
             self.last_primary_label = Some(now);
             // Every key is ready once the resample bar they hold is.
-            let r = self.current?;
+            let r = self.current[0]?;
             if r < s.ready {
                 return None;
             }
             // The entry clock already holds these operands.
             (r, false)
         } else {
-            self.current = Some(bar);
+            self.current[0] = Some(bar);
             if bar < s.ready {
                 return None;
             }
@@ -913,9 +1133,10 @@ impl Cursor {
                 self.advance_level(s, tree, close, now, idx, res, start_side, quantity, pending)?;
             return Ok((true, target));
         }
+        // One leg: the instant is its bar.
         let events: [(bool, usize); 2];
         let events: &[(bool, usize)] = match res {
-            Some(r) if s.d.ahead(r) => {
+            Some(r) if s.leg().ahead(r) => {
                 events = [(false, r), (true, idx)];
                 &events
             }
@@ -931,7 +1152,7 @@ impl Cursor {
         let mut latch = Latch::new(self.close_bar);
         for &(primary, bar) in events {
             // Every event of a lean callback is on its clock, at `idx`.
-            let early = !primary && s.d.ahead(bar);
+            let early = !primary && s.leg().ahead(bar);
             latch.step(idx as i64, early, start_side);
             if primary
                 && !self.visit_primary_after_fill
@@ -975,8 +1196,8 @@ impl Cursor {
     }
 
     /// `rule_session::advance_level`: the events of one `advance` past its
-    /// deferral, for level rules -- resample bar `res` where one is due, and
-    /// primary bar `idx`, in dispatch order.
+    /// deferral, for level rules -- instant `res`'s bars where one is due,
+    /// and primary bar `idx`, in dispatch order.
     ///
     /// Every primary event is visited -- a level rule's repeat can act --
     /// and the next primary bar is owed a visit after any event that flipped
@@ -1006,32 +1227,26 @@ impl Cursor {
         let mut target = start_side;
         let mut reference: Option<f64> = None;
         let mut entry_timestamp: Option<i64> = None;
-        let events: [(bool, usize); 2];
-        let events: &[(bool, usize)] = match res {
-            Some(r) if s.d.ahead(r) => {
-                events = [(false, r), (true, idx)];
-                &events
-            }
-            Some(r) => {
-                events = [(true, idx), (false, r)];
-                &events
-            }
-            None => {
-                events = [(true, idx), (true, idx)];
-                &events[..1]
-            }
-        };
+        // The instant's bars decided ahead of the primary bar, the primary
+        // bar (None), and the rest.
+        let (bars, ahead) = res.map_or((&[][..], 0), |u| s.d.events(u));
+        let events = bars[..ahead]
+            .iter()
+            .map(|&event| Some(event))
+            .chain(std::iter::once(None))
+            .chain(bars[ahead..].iter().map(|&event| Some(event)));
         let mut latch = Latch::new(self.close_bar);
-        for &(primary, bar) in events {
-            let early = !primary && s.d.ahead(bar);
+        for event in events {
+            let primary = event.is_none();
+            let early = event.is_some_and(|(leg, bar)| s.d.legs[leg].ahead(bar));
             latch.step(idx as i64, early, start_side);
-            self.flipped = false;
+            self.clocks.flipped = false;
             let intent =
-                self.level_visit(s, tree, close, primary, bar, now, held_side, quantity, pending)?;
+                self.level_visit(s, tree, close, event, idx, now, held_side, quantity, pending)?;
             if primary && self.last_reached {
                 self.visit_primary_after_fill = false;
             }
-            if self.flipped {
+            if self.clocks.flipped {
                 self.visit_primary_after_fill = true;
             }
             let Some((wants_entry, wants_exit, price)) = intent else { continue };
@@ -1068,105 +1283,122 @@ impl Cursor {
     }
 
     /// `visit` + `DecisionProgram.evaluate` of one event under level rules:
-    /// the primary bar `bar`, or the resample bar `bar`. `(wants_entry,
-    /// wants_exit, reference)`, or None where nothing was evaluated.
+    /// bar `bar` of leg `leg` (`event`), or primary bar `idx` (None).
+    /// `(wants_entry, wants_exit, reference)`, or None where nothing was
+    /// evaluated.
     #[allow(clippy::too_many_arguments)]
     fn level_visit(
         &mut self,
         s: &Stream,
         tree: &Tree,
         close: &[f64],
-        primary: bool,
-        bar: usize,
+        event: Option<(usize, usize)>,
+        idx: usize,
         now: i64,
         side: i32,
         quantity: f64,
         pending: Option<f64>,
     ) -> Result<Option<(bool, bool, f64)>, Declined> {
-        let admitted = if primary {
-            s.primary_admits.is_none_or(|admits| admits[bar])
-        } else {
-            s.admitted[bar]
+        let (admitted, price) = match event {
+            None => (s.primary_admits.is_none_or(|admits| admits[idx]), close[idx]),
+            Some((leg, bar)) => (s.admitted[leg][bar], s.d.legs[leg].close[bar]),
         };
         if !admitted {
             self.last_reached = false;
             return Ok(None);
         }
-        let price = if primary { close[bar] } else { s.d.close[bar] };
         let mut position = side;
         if position != 0 && s.position_required {
             position = Self::decision_position(s, position, quantity, pending, price);
         }
-        // `evaluate`: a repeated label evaluates nothing and reaches nothing.
-        let (r, phase) = if primary {
-            if self.last_primary_label == Some(now) {
-                self.last_reached = false;
-                return Ok(None);
+        // `evaluate`: a repeated label evaluates nothing and reaches nothing;
+        // the keys a visit updates are its leg's (the primary bar has none).
+        let (reached, phase) = match event {
+            None => {
+                if self.last_primary_label == Some(now) {
+                    self.last_reached = false;
+                    return Ok(None);
+                }
+                self.last_primary_label = Some(now);
+                (s.primary_reached(&self.current), PHASE_PRIMARY)
             }
-            self.last_primary_label = Some(now);
-            (self.current, PHASE_PRIMARY)
-        } else {
-            self.current = Some(bar);
-            (Some(bar), s.d.phase[bar])
+            Some((leg, bar)) => {
+                self.current[leg] = Some(bar);
+                (s.leg_reached(leg, bar), s.d.legs[leg].phase[bar])
+            }
         };
-
         let order = (now, phase);
         if self.last_sort_key.is_some_and(|key| order < key) {
             return Err(Declined("events out of dispatch order"));
         }
         self.last_sort_key = Some(order);
-        // Every key is ready once the resample bar they hold is.
-        let Some(r) = r.filter(|&r| r >= s.ready) else {
-            self.last_reached = false;
+        self.last_reached = reached;
+        if !reached {
             return Ok(None);
-        };
-        self.last_reached = true;
+        }
+        let current = &self.current;
+        let clocks = &mut self.clocks;
         // Every crossing, once, before any rule reads one -- flat or not, and
         // whichever rules match first.
         for (clock, cross) in s.clock_crosses.iter().enumerate() {
-            self.fired[clock] = self.step_clock(s, clock, cross, r);
+            clocks.fired[clock] = clocks.step(s, clock, cross, current);
         }
         let exit_rule = if position != 0 {
-            tree.exits.iter().position(|&root| self.holds(s, tree, r, root))
+            tree.exits.iter().position(|&root| clocks.holds(s, tree, current, root))
         } else {
             None
         };
-        let entry_rule = tree.entries.iter().position(|&root| self.holds(s, tree, r, root));
+        let entry_rule = tree.entries.iter().position(|&root| clocks.holds(s, tree, current, root));
         self.last_position = position;
         let exiting = exit_rule.is_some() && position != 0;
         Ok(Some((entry_rule.is_some() && !exiting, exiting, price)))
     }
+}
 
-    /// One compiled condition on resample bar `r`'s values, short-circuiting
-    /// as `all` and `any` do: which clocks a bar steps depends on it.
-    fn holds(&mut self, s: &Stream, tree: &Tree, r: usize, node: usize) -> bool {
+impl Clocks {
+    /// One compiled condition with the legs' last visits at `current`,
+    /// short-circuiting as `all` and `any` do: which clocks a bar steps
+    /// depends on it. A key not ready yet holds no value, on which no level
+    /// holds.
+    fn holds(&mut self, s: &Stream, tree: &Tree, current: &[Option<usize>], node: usize) -> bool {
         match &tree.conditions[node] {
-            Condition::All(children) => children.iter().all(|&child| self.holds(s, tree, r, child)),
-            Condition::Any(children) => children.iter().any(|&child| self.holds(s, tree, r, child)),
-            Condition::Not(child) => !self.holds(s, tree, r, *child),
+            Condition::All(children) => {
+                children.iter().all(|&child| self.holds(s, tree, current, child))
+            }
+            Condition::Any(children) => {
+                children.iter().any(|&child| self.holds(s, tree, current, child))
+            }
+            Condition::Not(child) => !self.holds(s, tree, current, *child),
             Condition::Zone { value, lower, upper } => {
-                let v = s.operand(*value, r);
-                *lower <= v && v <= *upper
+                s.level_operand(*value, current).is_some_and(|v| *lower <= v && v <= *upper)
             }
             Condition::Threshold { left, right, compare } => {
-                compare.holds(s.operand(*left, r), s.operand(*right, r))
+                match (s.level_operand(*left, current), s.level_operand(*right, current)) {
+                    (Some(a), Some(b)) => compare.holds(a, b),
+                    _ => false,
+                }
             }
             Condition::Cross { clock, cross } => {
                 if s.each_bar {
                     self.fired[*clock]
                 } else {
-                    self.step_clock(s, *clock, cross, r)
+                    self.step(s, *clock, cross, current)
                 }
             }
         }
     }
 
-    /// Step clock `clock` to `cross`'s operands on resample bar `r`: whether
-    /// it crossed from the bar it last stepped on.
+    /// Step clock `clock` to `cross`'s operands with the legs' last visits
+    /// at `current`: whether it crossed from where it last stepped. An
+    /// operand not ready yet neither steps it nor crosses.
     #[inline]
-    fn step_clock(&mut self, s: &Stream, clock: usize, cross: &Cross, r: usize) -> bool {
-        let (a, b) = s.operands(cross, r);
-        match self.clocks[clock].replace((a, b)) {
+    fn step(&mut self, s: &Stream, clock: usize, cross: &Cross, current: &[Option<usize>]) -> bool {
+        let (Some(a), Some(b)) =
+            (s.level_operand(cross.fast, current), s.level_operand(cross.slow, current))
+        else {
+            return false;
+        };
+        match self.last[clock].replace((a, b)) {
             None => false,
             Some((p0, p1)) => {
                 if (p0 > p1) != (a > b) || (p0 < p1) != (a < b) {
@@ -1339,6 +1571,82 @@ mod tests {
         assert!(!Level { two_sided: true, ..level }.reads_dust_as_flat(0.005, None, 100.0));
         let no_notional = Level { minimum_notional: 0.0, ..level };
         assert!(!no_notional.reads_dust_as_flat(0.04, None, 100.0));
+    }
+
+    fn leg(ts: &[i64], labels: &[i64], rank: i64, built: bool, stream_index: i64) -> LegTerms {
+        LegTerms {
+            ts: ts.to_vec(),
+            labels: labels.to_vec(),
+            close: ts.iter().map(|&t| t as f64).collect(),
+            rank,
+            built,
+            stream_index,
+        }
+    }
+
+    #[test]
+    fn of_legs_delivers_each_instant_in_dispatch_order() {
+        // `ScheduledStream.order`: pre-close windows by stream index, then
+        // windows a gap closed (on legs the strategy builds) and completed
+        // bars by rank, the primary bar between the two.
+        let hourly = leg(&[10, 20, 30, 40, 50], &[10, 20, 30, 40, 50], 1, true, 0);
+        let daily = leg(&[20, 30, 40, 50], &[25, 28, 40, 45], 0, true, 1);
+        let engine = leg(&[50], &[45], 2, false, 2);
+        let d = Dispatch::of_legs(
+            vec![10, 20, 30, 40, 50],
+            vec![0, 2, 4, 6, 8],
+            vec![hourly, daily, engine],
+        )
+        .unwrap();
+        assert_eq!(d.len(), 5);
+        assert_eq!(d.events(0), (&[(0, 0)][..], 0));
+        // A pre-close window leads; a gap's window leads.
+        assert_eq!(d.events(1), (&[(1, 0), (0, 1)][..], 1));
+        assert_eq!(d.events(2), (&[(1, 1), (0, 2)][..], 1));
+        // Both completed: the lower rank first.
+        assert_eq!(d.events(3), (&[(1, 2), (0, 3)][..], 0));
+        // The engine's leg follows the primary bar however it is labelled.
+        assert_eq!(d.events(4), (&[(1, 3), (0, 4), (2, 0)][..], 1));
+        assert_eq!(d.legs[1].at, vec![1, 2, 3, 4]);
+        assert!(d.legs[1].ahead(0) && d.legs[1].ahead(1) && !d.legs[1].ahead(2));
+        assert!(!d.legs[2].ahead(0));
+        assert_eq!(d.lowest_close, 10.0);
+    }
+
+    #[test]
+    fn one_leg_frames_are_their_bars() {
+        let labels = [10, 25, 28, 40];
+        let d = Dispatch::new(
+            vec![10, 20, 30, 40],
+            vec![1, 3, 5, 7],
+            &labels,
+            vec![4.0, 3.0, 2.0, 5.0],
+        )
+        .unwrap();
+        // Labelled after its timestamp, a pre-close window; before it, a
+        // window a gap closed.
+        let phases = [PHASE_COMPLETED, PHASE_PRECLOSE, PHASE_CLOSED_BY_GAP, PHASE_COMPLETED];
+        assert_eq!(d.legs[0].phase, phases);
+        for u in 0..d.len() {
+            let ahead = usize::from(d.legs[0].ahead(u));
+            assert_eq!(d.events(u), (&[(0, u)][..], ahead));
+        }
+        assert_eq!(d.lowest_close, 2.0);
+    }
+
+    #[test]
+    fn of_legs_declines_frames_off_their_instants() {
+        let at = |ts: &[i64]| leg(ts, ts, 0, true, 0);
+        let frame = |legs| Dispatch::of_legs(vec![10, 20, 30], vec![0, 1, 2], legs);
+        assert!(frame(vec![at(&[10, 20, 30])]).is_ok());
+        assert!(frame(vec![at(&[10, 30]), at(&[20])]).is_ok());
+        // A bar at no instant, an instant no bar is at, bars that fall.
+        assert!(frame(vec![at(&[10, 20, 30]), at(&[25])]).is_err());
+        assert!(frame(vec![at(&[10, 30])]).is_err());
+        assert!(frame(vec![at(&[10, 30, 20])]).is_err());
+        assert!(frame(vec![]).is_err());
+        let nan = LegTerms { close: vec![1.0, f64::NAN], ..at(&[10, 20]) };
+        assert!(frame(vec![nan, at(&[30])]).unwrap().lowest_close.is_nan());
     }
 
     #[test]
