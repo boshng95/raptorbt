@@ -94,8 +94,9 @@ fn _raptorbt(py: Python<'_>, m: &PyModule) -> PyResult<()> {
     // 2: the lean replay takes a short node's terms (`shorts`, `financing`).
     // 3: it works crossings out each bar (`each_bar`).
     // 4: level rules read more than one of the symbol's streams
-    // (`LeanFrame.of_legs`, `legs`).
-    m.add("LEAN_REPLAY_VERSION", 4_u32)?;
+    // (`LeanFrame.of_legs`, `legs`). 5: risk exits -- the trade, ATR and
+    // time exits and the borrow they charge (`policies`, `borrow`).
+    m.add("LEAN_REPLAY_VERSION", 5_u32)?;
     m.add_function(wrap_pyfunction!(python::strategy_bindings::resolve_atr_period, m)?)?;
 
     // Register the canonical report of a replay and its exact-arithmetic probes

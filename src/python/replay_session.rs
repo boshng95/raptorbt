@@ -38,10 +38,11 @@ use pyo3::prelude::*;
 
 use super::fill_ledger::{money, or_zero, EndStatus, Ledger, OrderRecord};
 use super::money::PyMoneyModel;
-use super::rule_session::{money_as_double, Account, OrderStyle, QuietParams, RuleStepper, Target};
+use super::rule_session::{money_as_double, OrderStyle, QuietParams, RuleStepper, Target};
 use super::strategy_bindings::{
     held_position, policy_account, step_rules_until, step_until_event, submit_order_on, BarArrays,
 };
+use crate::stops::policies::Account;
 
 create_exception!(
     raptorbt,

@@ -30,10 +30,12 @@ use crate::lean::kernel::{Terms, Trade};
 use crate::lean::market::Market;
 use crate::lean::replay::{replay, Cell, Frame, Loan, Outcome, Shorts};
 use crate::lean::rules::{
-    Compare, Condition, Cross, Dispatch, LegTerms, Level, Operand, Placing, Signals, Stream, Tree,
+    Compare, Condition, Cross, Dispatch, LegTerms, Level, Operand, Placing, Policies, Signals,
+    Stream, Tree,
 };
 use crate::lean::Declined;
 use crate::metrics::canonical::{calculate, LocalClock, ReportInputs, Value};
+use crate::stops::policies::{AtrExit, BorrowView, HoldExit, OrderStyle, Risk, TradeExit};
 
 create_exception!(
     raptorbt,
@@ -128,6 +130,72 @@ pub(crate) type FinancingTuple<'py> = (
     PyReadonlyArray1<'py, i64>,
     i64,
 );
+
+/// The risk exits, as `CrossoverRuleSession` takes them
+/// (`rule_session::PolicyTuple`): `(fee_rate, close_limit, trade, atr,
+/// hold)` -- `trade` `(stop, take_profit)` in per cent, `atr` `(slot,
+/// values, initialized, stop, take_profit, trailing)` in that slot's bars,
+/// `hold` `(slot, bars)` -- a slot the full lane's: 0 the primary, `k` the
+/// frame's leg `k - 1`.
+type PolicyTuple<'py> = (
+    f64,
+    bool,
+    Option<(f64, f64)>,
+    Option<(usize, PyReadonlyArray1<'py, f64>, PyReadonlyArray1<'py, bool>, f64, f64, bool)>,
+    Option<(usize, i64)>,
+);
+
+/// An open short's borrow, which the trade and ATR exits charge, as
+/// `CrossoverRuleSession` takes it: `(days, settles, first_day, charged)`
+/// ([`BorrowView`]).
+type BorrowTuple<'py> =
+    (PyReadonlyArray1<'py, i32>, PyReadonlyArray1<'py, i32>, i32, PyReadonlyArray1<'py, i64>);
+
+/// The [`Policies`] of a [`PolicyTuple`] and its [`BorrowTuple`]; what they
+/// name is checked against the frame by [`Stream::with_policies`].
+fn policies<'a>(
+    policies: &'a Option<PolicyTuple<'_>>,
+    borrow: &'a Option<BorrowTuple<'_>>,
+) -> PyResult<Option<Policies<'a>>> {
+    let Some((fee_rate, close_limit, trade, atr, hold)) = policies else {
+        if borrow.is_some() {
+            return Err(PyValueError::new_err("a borrow only the risk exits read"));
+        }
+        return Ok(None);
+    };
+    let (exit, values) = match atr {
+        Some((slot, values, initialized, stop, take_profit, trailing)) => (
+            Some(AtrExit {
+                slot: *slot,
+                stop: *stop,
+                take_profit: *take_profit,
+                trailing: *trailing,
+            }),
+            Some((values.as_slice()?, initialized.as_slice()?)),
+        ),
+        None => (None, None),
+    };
+    let borrow = match borrow {
+        Some((days, settles, first_day, charged)) => Some(BorrowView {
+            days: days.as_slice()?,
+            settles: settles.as_slice()?,
+            first_day: *first_day,
+            charged: charged.as_slice()?,
+        }),
+        None => None,
+    };
+    Ok(Some(Policies {
+        risk: Risk {
+            trade: trade.map(|(stop, take_profit)| TradeExit { stop, take_profit }),
+            atr: exit,
+            hold: hold.map(|(slot, bars)| HoldExit { slot, bars }),
+            fee_rate: *fee_rate,
+        },
+        atr: values,
+        style: if *close_limit { OrderStyle::Limit } else { OrderStyle::Market },
+        borrow,
+    }))
+}
 
 /// The slices of a [`ShortsTuple`] and a [`FinancingTuple`], checked
 /// against a market of `bars` bars: a short node runs with both.
@@ -419,6 +487,9 @@ struct Shared<'a> {
     /// long node.
     shorts: Option<Shorts<'a>>,
     financing: Option<Schedule<'a>>,
+    /// The risk exits every cell runs under, and an open short's borrow
+    /// they charge; None where the cells have none.
+    policies: Option<Policies<'a>>,
 }
 
 impl<'a> Shared<'a> {
@@ -437,10 +508,12 @@ impl<'a> Shared<'a> {
         offsets_until_ns: i64,
         jumps: bool,
         (shorts, financing): (Option<Shorts<'a>>, Option<Schedule<'a>>),
+        policies: Option<Policies<'a>>,
     ) -> Self {
         Self {
             shorts,
             financing,
+            policies,
             frame,
             gate,
             terms: Terms {
@@ -661,6 +734,9 @@ fn run(
     }
     if spec.each_bar {
         stream.work_each_bar()?;
+    }
+    if let Some(policies) = shared.policies {
+        stream.with_policies(policies, frame.market.len())?;
     }
     let cell = Cell {
         frame: &frame.frame,
@@ -998,7 +1074,9 @@ fn screen_dict(py: Python<'_>, axes: &Axes, rows: &[Result<Row, Declined>]) -> P
 /// make the cell a short node's ([`ShortsTuple`], [`FinancingTuple`]): it
 /// enters short, and its borrow is charged to its curve and end value.
 /// *each_bar* works every crossing out once per evaluated bar
-/// (`StrategySpec.crossings` ``each_bar``).
+/// (`StrategySpec.crossings` ``each_bar``). *policies* are the risk exits
+/// the cell runs under ([`PolicyTuple`]), on a frame due on every primary
+/// bar, and *borrow* an open short's borrow they charge ([`BorrowTuple`]).
 ///
 /// Returns a dict: `log` (the replay log as `replay_rules` returns it, None
 /// without *log*), `report` (the canonical report as `canonical_report`
@@ -1012,7 +1090,7 @@ fn screen_dict(py: Python<'_>, axes: &Axes, rows: &[Result<Row, Declined>]) -> P
 #[pyo3(signature = (
     frame, gate, terms, quiet, venue, money, book, keys, entry, exit, flags,
     *, starting, timezone, offsets, offsets_until_ns, jumps = true, log = true, tree = None,
-    shorts = None, financing = None, each_bar = false
+    shorts = None, financing = None, each_bar = false, policies = None, borrow = None
 ))]
 #[allow(clippy::too_many_arguments)]
 pub fn lean_replay(
@@ -1038,6 +1116,8 @@ pub fn lean_replay(
     shorts: Option<ShortsTuple<'_>>,
     financing: Option<FinancingTuple<'_>>,
     each_bar: bool,
+    policies: Option<PolicyTuple<'_>>,
+    borrow: Option<BorrowTuple<'_>>,
 ) -> PyResult<PyObject> {
     let gate = gate.as_ref().map(|gate| gate.as_slice()).transpose()?;
     let shared = Shared::new(
@@ -1054,6 +1134,7 @@ pub fn lean_replay(
         offsets_until_ns,
         jumps,
         short_terms(&shorts, &financing, frame.market.len())?,
+        self::policies(&policies, &borrow)?,
     );
     let spec =
         Spec::of(&keys, entry, exit, tree.as_ref().map(self::tree).transpose()?, flags, each_bar)?;
@@ -1130,7 +1211,8 @@ fn replay_all<T: Send>(
 /// every crossing out once per evaluated bar. *legs*, on a frame of more
 /// than one leg ([`PyLeanFrame::of_legs`]), is `(key_legs, admits)`: each
 /// pool key's leg, and the admits of every leg after the first by place --
-/// a cell's own `admits` are its first leg's.
+/// a cell's own `admits` are its first leg's. *policies* and *borrow*, the
+/// risk exits and the borrow they charge, are every cell's.
 ///
 /// Returns, in the cells' order, per cell the dict [`lean_replay`] returns
 /// without `log` (and without the daily curve unless *curve*), or, where
@@ -1146,7 +1228,7 @@ fn replay_all<T: Send>(
     frame, gate, terms, quiet, venue, money, book, keys, cells,
     *, starting, timezone, offsets, offsets_until_ns, threads = 0, screen = false,
     curve = false, timings = false, trees = None, shorts = None, financing = None,
-    each_bar = None, legs = None
+    each_bar = None, legs = None, policies = None, borrow = None
 ))]
 #[allow(clippy::too_many_arguments)]
 pub fn lean_replay_many(
@@ -1173,6 +1255,8 @@ pub fn lean_replay_many(
     financing: Option<FinancingTuple<'_>>,
     each_bar: Option<Vec<bool>>,
     legs: Option<LegsTuple>,
+    policies: Option<PolicyTuple<'_>>,
+    borrow: Option<BorrowTuple<'_>>,
 ) -> PyResult<PyObject> {
     let entered = Instant::now();
     let gate = gate.as_ref().map(|gate| gate.as_slice()).transpose()?;
@@ -1190,6 +1274,7 @@ pub fn lean_replay_many(
         offsets_until_ns,
         true,
         short_terms(&shorts, &financing, frame.market.len())?,
+        self::policies(&policies, &borrow)?,
     );
     let keys = Pool::of(&keys)?;
     if trees.as_ref().is_some_and(|trees| trees.len() != cells.len()) {

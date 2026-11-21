@@ -26,9 +26,8 @@ use super::fill_ledger::{or_zero, BookTerms, Ledger, PyReplayLedger};
 use super::instrument_bindings::PyInstrumentSpec;
 use super::money::PyMoneyModel;
 use super::replay_session::{replay, Money, Shorts, Venue};
-use super::rule_session::{
-    Account, PyCrossoverRuleSession, QuietBar, QuietParams, QuietTuple, RuleStepper,
-};
+use super::rule_session::{PyCrossoverRuleSession, QuietBar, QuietParams, QuietTuple, RuleStepper};
+use crate::stops::policies::Account;
 
 /// `replay_rules`' `shorts`: see [`Shorts`].
 type ShortsTuple<'py> =

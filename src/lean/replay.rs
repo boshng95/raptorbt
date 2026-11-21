@@ -12,6 +12,11 @@
 //! `Cell::jumps` turns them off to diff against that loop. The money
 //! questions are the caller's `MoneyModel`; one it leaves to Python declines
 //! the cell.
+//!
+//! A cell with risk exits ([`super::rules::Policies`]) is called back on
+//! every bar, as on the full lane, and defers nothing: its jumps run each
+//! bar's advance on the idle account instead of passing the cursor's visits
+//! unread.
 
 use super::kernel::{Event, Kernel, Terms, Tif, Trade};
 use super::market::Market;
@@ -19,10 +24,11 @@ use std::cell::RefCell;
 
 use super::rules::{segment_highs, side_of, Cursor, Dispatch, Highs, Stream, Target};
 use super::Declined;
-use crate::python::fill_ledger::{BookTerms, EndStatus, Ledger, OrderRecord};
+use crate::python::fill_ledger::{money, or_zero, BookTerms, EndStatus, Ledger, OrderRecord};
 use crate::python::money::PyMoneyModel;
 use crate::python::replay_session::Venue;
 use crate::python::rule_session::{money_as_double, QuietParams};
+use crate::stops::policies::{Account, OrderStyle};
 
 /// What the cells on one resampled stream of a market share, checked once
 /// against it: the bars `on_bar` is due on and the stream's dispatches.
@@ -164,6 +170,8 @@ struct Replay<'a> {
     target_bars: i64,
     target_bar_ts: i64,
     pending_reference: f64,
+    /// `_pending_order_style`: how the pending close is ordered.
+    pending_order_style: OrderStyle,
     last_exit_ts: i64,
     cash_halted: bool,
     working_orders: i64,
@@ -197,6 +205,10 @@ struct Replay<'a> {
     /// Whether every dispatch is due on its own bar, so the cursor's visits
     /// can be passed in a jump.
     far: bool,
+    /// Whether, under risk policies, the bars between two dispatches can be
+    /// taken in one step ([`Replay::inert_run`]): every dispatch due on its
+    /// own bar.
+    inert: bool,
     /// The flat cash check's need at the highest close, where it bounds
     /// the need at every close.
     need_top: Option<f64>,
@@ -254,7 +266,9 @@ pub(crate) fn replay(
         }
     }
     let q = cell.quiet;
-    let far = cell.jumps && cell.frame.dispatches_due;
+    // Passing visits unread skips the risk checks' stream counts.
+    let far = cell.jumps && cell.frame.dispatches_due && s.policies.is_none();
+    let inert = cell.jumps && cell.frame.dispatches_due && s.policies.is_some();
     let need_top = (q.units >= 0.0 && q.markup >= 0.0)
         .then(|| q.units * (m.top_close * q.markup + q.slack) + q.fee);
     let mut replay = Replay {
@@ -276,6 +290,7 @@ pub(crate) fn replay(
         target_bars: 0,
         target_bar_ts: -1,
         pending_reference: 0.0,
+        pending_order_style: OrderStyle::Default,
         last_exit_ts: -1,
         cash_halted: false,
         working_orders: 0,
@@ -298,6 +313,7 @@ pub(crate) fn replay(
         jumped: 0,
         callbacks: 0,
         far,
+        inert,
         need_top,
         advanced: None,
         highs: RefCell::default(),
@@ -460,7 +476,8 @@ impl Replay<'_> {
     ///
     /// Flat, the cash check passes at every close on a balance nothing
     /// moves. Held, a bar's callback is quiet where its close reads no dust
-    /// and its exits stay shut.
+    /// and its exits stay shut. Under risk policies, the bars between two
+    /// dispatches are taken by [`Self::inert_run`] instead.
     #[inline(never)]
     fn quiet_scan(&mut self, mut next_due: usize) -> Result<usize, Declined> {
         let n = self.m.len();
@@ -488,8 +505,29 @@ impl Replay<'_> {
                 return Ok(due);
             }
         }
+        // Whether the last bar's visit was one later bars repeat.
+        let mut repeats = false;
         while let Some(&at) = self.mask_at.get(next_due) {
-            let target = self.advance(at)?;
+            if self.inert {
+                let taken = self.inert_run(next_due, has_position, net_position, repeats);
+                if taken > 0 {
+                    self.callbacks += taken;
+                    next_due += taken;
+                    repeats = false;
+                    continue;
+                }
+            }
+            // Level rules' visit of an admitted primary bar no dispatch
+            // reaches: one later bars repeat where it leaves the clocks as it
+            // finds them.
+            let noted = self.inert
+                && self.s.tree.is_some()
+                && at < self.cursor.next_dispatch_position(self.s, n)
+                && self.s.primary_admits.is_none_or(|admits| admits[at]);
+            if noted {
+                self.cursor.note_clocks();
+            }
+            let target = self.advance(at, true)?;
             let quiet = target.is_none()
                 && !self.cursor.visit_primary_after_fill
                 && !self.loan_due(at)
@@ -509,6 +547,7 @@ impl Replay<'_> {
             }
             self.callbacks += 1;
             next_due += 1;
+            repeats = noted && self.cursor.clocks_repeat();
             // What the next bar would try first: passing the visits unread.
             if self.far {
                 if let Some((r, held)) = self.quiet_visits() {
@@ -521,6 +560,39 @@ impl Replay<'_> {
             }
         }
         Ok(n)
+    }
+
+    /// Of the due bars from `mask_at[next_due]` before the next dispatch and
+    /// the loan's cover bar, how many a cell under risk policies takes as
+    /// quiet in one step ([`Cursor::inert_run`]), on the account the scan
+    /// found -- `has_position` and `net_position` -- which nothing touches.
+    ///
+    /// Each such bar's advance reads the cash, which must convert, and a lot
+    /// no close reads as dust keeps every bar's position the venue's.
+    /// `repeats`: whether the last bar's visit is one level rules repeat.
+    fn inert_run(
+        &mut self,
+        next_due: usize,
+        has_position: bool,
+        net_position: f64,
+        repeats: bool,
+    ) -> usize {
+        let (m, s, mask) = (self.m, self.s, self.mask_at);
+        let mut stop = self.cursor.next_dispatch_position(s, m.len());
+        if let Ok(cover) = usize::try_from(self.loan_cover_bar) {
+            stop = stop.min(cover);
+        }
+        let due = &mask[next_due..];
+        let due = &due[..count_below(due, stop)];
+        if due.is_empty()
+            || self.strategy_cash().is_err()
+            || (has_position && (m.low_close.is_nan() || self.is_dust(net_position, m.low_close)))
+        {
+            return 0;
+        }
+        let side = if has_position { side_of(net_position) } else { 0 };
+        let account = self.policy_account();
+        self.cursor.inert_run(s, &m.ts, &m.close, m.low_close, due, account, side, repeats)
     }
 
     /// The first resample bar whose visit can act, and whether the book is
@@ -675,7 +747,7 @@ impl Replay<'_> {
         };
         if self.cash_halted {
             if advanced.is_none() {
-                self.advance(i)?;
+                self.advance(i, false)?;
             }
             self.bar_callback_required = false;
             return Ok(());
@@ -684,15 +756,19 @@ impl Replay<'_> {
             if self.pending_target.is_some() { self.reconcile_target(i)? } else { false };
         let target = match advanced {
             Some(target) => target,
-            None => self.advance(i)?,
+            None => self.advance(i, true)?,
         };
-        if !reconciled {
-            self.submit_native_intent(i, target)?;
+        // Reconciling stands in for the bar's own decision, not for its risk
+        // checks: `handle_bar` runs those whatever the reconcile chased.
+        let policy_acted = target.is_some_and(|t| t.policy.is_some());
+        if !reconciled || policy_acted {
+            let preceding = if reconciled { None } else { target.and_then(|t| t.preceding) };
+            self.submit_native_intent(i, target, preceding, policy_acted)?;
         } else if self.shorts.is_some() && target.is_some_and(|t| t.side == 0) {
             // Composable buys to cover without asking `has_pending_exit()`,
             // which only its long exit asks: a close this bar's reconcile
             // already sent does not hold back the rules' own.
-            self.submit_native_intent(i, target)?;
+            self.submit_native_intent(i, target, None, false)?;
         }
         // `_check_risk_exits` asks a capped loan its age after the bar's
         // decision, and ahead of the cash halt -- which a cover that filled
@@ -718,15 +794,20 @@ impl Replay<'_> {
             }
             flat_cash_safe = funds >= q.need_at_highest;
         }
+        // What the bars a sparse callback steps past before the next
+        // composite can do is asked only of a run that defers them: one with
+        // risk checks has every bar called back, each asked on its own.
+        let defers = self.s.policies.is_none();
         self.bar_callback_required = (self.pending_target.is_some()
-            && !self.flat_target_rests_before_dispatch(i, has_position, net_position))
+            && !(defers && self.flat_target_rests_before_dispatch(i, has_position, net_position)))
             || self.working_orders != 0
             || (cash_flat
                 && !self.cash_halted
                 && !flat_cash_safe
-                && !self.flat_cash_holds_before_dispatch(i)?)
+                && !(defers && self.flat_cash_holds_before_dispatch(i)?))
             || self.cursor.visit_primary_after_fill
-            || (!flat
+            || (defers
+                && !flat
                 && self.cursor.held_reopens(
                     self.s,
                     &self.m.close,
@@ -744,8 +825,10 @@ impl Replay<'_> {
         usize::try_from(self.loan_cover_bar).is_ok_and(|at| at <= i)
     }
 
-    /// `RustRuleSession.advance`.
-    fn advance(&mut self, i: usize) -> Result<Option<Target>, Declined> {
+    /// `RustRuleSession.advance`; `apply_policies` false for a halted run.
+    fn advance(&mut self, i: usize, apply_policies: bool) -> Result<Option<Target>, Declined> {
+        // The account the risk checks read (`_position`).
+        let account = self.policy_account();
         let (mut has_position, mut quantity) = self.k.net_position();
         // Level rules read dust themselves, on the venue's own lot.
         if self.s.tree.is_none()
@@ -763,11 +846,29 @@ impl Replay<'_> {
             has_position,
             quantity,
             self.pending_target,
+            account,
+            apply_policies,
         )?;
         if processed {
             self.refresh()?;
         }
         Ok(target)
+    }
+
+    /// The account a cell's risk policies read in front of a bar
+    /// (`NativeExecutionSession._position`): the venue's signed lot -- dust
+    /// and all -- and its average entry, each `or 0.0`; flat where nothing
+    /// is held, and for a cell without policies, which reads none.
+    fn policy_account(&self) -> Account {
+        if self.s.policies.is_none() {
+            return Account::FLAT;
+        }
+        let (held, net) = self.k.net_position();
+        if !held {
+            return Account::FLAT;
+        }
+        let entry = self.k.entry_price().unwrap_or(0.0);
+        Account { quantity: or_zero(net), entry: or_zero(entry) }
     }
 
     /// `NativeExecutionSession._refresh`, as far as anything reads it.
@@ -777,11 +878,20 @@ impl Replay<'_> {
         self.strategy_cash().map(|_| ())
     }
 
-    fn submit_native_intent(&mut self, i: usize, target: Option<Target>) -> Result<(), Declined> {
+    /// `_submit_native_intent`: `preceding` is the rules' own close to send
+    /// ahead of a risk close (`preceding_exit`), and `risk_exit` marks a
+    /// target a risk policy decided, outside the bar's decision.
+    fn submit_native_intent(
+        &mut self,
+        i: usize,
+        target: Option<Target>,
+        preceding: Option<f64>,
+        risk_exit: bool,
+    ) -> Result<(), Declined> {
         let Some(target) = target else {
             return Ok(());
         };
-        let target_side = target.side;
+        let (target_side, style) = (target.side, target.style);
         let (has_position, net_position) = self.k.net_position();
         let held = if has_position { net_position } else { 0.0 };
         let mut held_side = side_of(held);
@@ -805,7 +915,7 @@ impl Replay<'_> {
                 // retries -- so nothing is retargeted here. Once the cover
                 // fills, the target's continuation sells its residual again,
                 // priced off this bar.
-                if self.submit_exit(i, reference, None)? {
+                if self.submit_exit(i, reference, None, style)? {
                     self.pending_reference = reference;
                 }
                 return Ok(());
@@ -813,16 +923,34 @@ impl Replay<'_> {
             let previous = (
                 self.pending_target,
                 self.pending_reference,
+                self.pending_order_style,
                 self.target_bars,
                 self.target_bar_ts,
                 self.short_attempts,
             );
             self.pending_reference = reference;
+            self.pending_order_style = style;
             self.target_bars = 0;
             self.target_bar_ts = -1;
             self.retarget(Some(0.0));
             self.exit_gated = false;
-            if !self.submit_exit(i, reference, None)? {
+            let preceded = match preceding {
+                Some(at) => self.submit_exit(i, at, None, OrderStyle::Default)?,
+                None => false,
+            };
+            let submitted = self.submit_exit(i, reference, None, style)? || preceded;
+            if !submitted
+                && risk_exit
+                && self.exit_gated
+                && (previous.0.is_none() || self.shorts.is_none())
+            {
+                // `run_decision` refuses the bar's own orders on a shut venue
+                // before `create_order` latches anything, but a risk check
+                // runs outside it: its close latches the pending flat, then
+                // `submit_order` meets the bell. The next primary bar's
+                // `_reconcile_exit` resends it in the configured close type.
+                self.pending_order_style = OrderStyle::Default;
+            } else if !submitted {
                 // A rule session's close is one attempt (`create_order`; its
                 // intents do not `persist_if_unsubmitted`): one the venue's
                 // hours refuse, or preflight, is dropped, and whatever target
@@ -830,6 +958,7 @@ impl Replay<'_> {
                 (
                     self.pending_target,
                     self.pending_reference,
+                    self.pending_order_style,
                     self.target_bars,
                     self.target_bar_ts,
                     self.short_attempts,
@@ -856,6 +985,7 @@ impl Replay<'_> {
             }
             self.retarget(Some(target));
             self.pending_reference = reference;
+            self.pending_order_style = style;
             self.submit_entry(i, reference, units, false)?;
             return Ok(());
         }
@@ -866,12 +996,14 @@ impl Replay<'_> {
         Ok(())
     }
 
-    /// `_submit_exit`: close the position, or `units` of it, at `reference`.
+    /// `_submit_exit`: close the position, or `units` of it, at `reference`,
+    /// in `style`: the venue's configured close for `Default`.
     fn submit_exit(
         &mut self,
         i: usize,
         reference: f64,
         units: Option<f64>,
+        style: OrderStyle,
     ) -> Result<bool, Declined> {
         let decided_ns = self.m.ts[i];
         let (_, net_position) = self.k.net_position();
@@ -895,13 +1027,16 @@ impl Replay<'_> {
             return Ok(false);
         }
         // A buy close takes `reference_order_type`'s buy side: a cover's.
-        let market = if buy {
-            match self.shorts {
-                Some(shorts) => shorts.cover_market,
-                None => return Err(Declined("a short position")),
-            }
-        } else {
-            self.venue.exit_market
+        let cover_market = match self.shorts {
+            Some(shorts) => shorts.cover_market,
+            None if buy => return Err(Declined("a short position")),
+            None => false,
+        };
+        let market = match style {
+            OrderStyle::Default if buy => cover_market,
+            OrderStyle::Default => self.venue.exit_market,
+            OrderStyle::Market => true,
+            OrderStyle::Limit => false,
         };
         let tif = if market {
             Tif::Gtc
@@ -1063,6 +1198,7 @@ impl Replay<'_> {
 
     fn drop_target(&mut self) {
         self.retarget(None);
+        self.pending_order_style = OrderStyle::Default;
         self.target_bars = 0;
         self.target_bar_ts = -1;
     }
@@ -1083,14 +1219,19 @@ impl Replay<'_> {
         if held != 0.0 && (target == 0.0 || (held > 0.0) != (target > 0.0)) {
             // Wrong side of the target, or anything held when it is flat:
             // reduce first, and to flat.
-            let submitted = self.submit_exit(i, reference, None)?;
+            let submitted = self.submit_exit(i, reference, None, self.pending_order_style)?;
             if submitted {
                 self.pending_reference = reference;
             }
             return Ok(submitted);
         }
         if held != 0.0 && target.abs() < held.abs() {
-            let submitted = self.submit_exit(i, reference, Some(held.abs() - target.abs()))?;
+            let submitted = self.submit_exit(
+                i,
+                reference,
+                Some(held.abs() - target.abs()),
+                self.pending_order_style,
+            )?;
             if submitted {
                 self.pending_reference = reference;
             }
@@ -1114,6 +1255,10 @@ impl Replay<'_> {
         if delta > 0.0 && target > 0.0 {
             // `_fund_long_target`, which no short node's target reaches.
             return Err(Declined("a long target"));
+        }
+        if self.pending_order_style != OrderStyle::Default {
+            // Only a risk close carries a style, and it targets flat.
+            return Err(Declined("an entry in a close's order style"));
         }
         self.submit_entry(i, reference, delta.abs(), delta > 0.0)
     }
@@ -1166,7 +1311,19 @@ impl Replay<'_> {
             self.book_short_fill(at, buy, size)?;
             self.track_short_loan(at);
         }
+        // `runtime.on_fill`: the account refreshed, the next primary bar a
+        // visit, and the fill booked by the risk policies -- at what it cost
+        // as the strategy reads it (`_record_fill`).
         self.refresh()?;
+        if self.s.policies.is_some() {
+            let cost = money(or_zero(commission), self.quiet.currency_precision)
+                .ok_or(Declined("a commission that is not a number"))?;
+            let flat = side_of(self.account_quantity) == 0;
+            // A cell that borrows charges the loan on the lot the fill left.
+            let side = if buy { 1.0 } else { -1.0 };
+            let position = self.account_quantity;
+            self.cursor.policy_fill(self.s, side, or_zero(size), cost, flat, at, position)?;
+        }
         self.cursor.visit_primary_after_fill = true;
         if leaves <= 0.0 {
             self.working_orders = (self.working_orders - 1).max(0);
@@ -1241,6 +1398,7 @@ impl Replay<'_> {
         let previous = (
             self.pending_target,
             self.pending_reference,
+            self.pending_order_style,
             self.target_bars,
             self.target_bar_ts,
             self.short_attempts,
@@ -1249,16 +1407,19 @@ impl Replay<'_> {
         if latches {
             self.retarget(Some(0.0));
             self.pending_reference = reference;
+            self.pending_order_style = OrderStyle::Default;
             self.target_bars = 0;
             self.target_bar_ts = -1;
         }
         self.exit_gated = false;
-        if self.submit_exit(i, reference, None)? || !latches || self.exit_gated {
+        if self.submit_exit(i, reference, None, OrderStyle::Default)? || !latches || self.exit_gated
+        {
             return Ok(());
         }
         (
             self.pending_target,
             self.pending_reference,
+            self.pending_order_style,
             self.target_bars,
             self.target_bar_ts,
             self.short_attempts,

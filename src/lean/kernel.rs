@@ -400,6 +400,12 @@ impl<'m> Kernel<'m> {
         }
     }
 
+    /// The open position's average entry price; None when flat.
+    #[inline]
+    pub fn entry_price(&self) -> Option<f64> {
+        self.position.as_ref().map(|p| p.entry_price)
+    }
+
     /// `equity(close)`: cash plus the open position marked at `close`
     /// (`unrealized_total`).
     #[inline]

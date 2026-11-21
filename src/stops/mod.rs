@@ -2,6 +2,7 @@
 
 pub mod atr;
 pub mod fixed;
+pub mod policies;
 pub mod trailing;
 
 pub use atr::AtrStop;
