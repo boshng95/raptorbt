@@ -131,10 +131,11 @@ pub(crate) struct Shorts<'a> {
     /// `opened_ns` being when the short held was opened, or None. None where
     /// the run has no gate.
     pub refusal: Option<&'a PyAny>,
-    /// `(filled_ns) -> int`: `loan_clock.cover_bar`, the bar a short opened
-    /// at `filled_ns` is first due its forced cover on, -1 for none. None
-    /// where the instrument's loans carry no term.
-    pub cover_bar: Option<&'a PyAny>,
+    /// `(filled_ns) -> (int, int)`: `loan_clock.cover`, the bar a short
+    /// opened at `filled_ns` is first due its forced cover on, and the bar a
+    /// composite contests it on, each -1 for none. None where the
+    /// instrument's loans carry no term.
+    pub cover: Option<&'a PyAny>,
     /// `loan_admission`: the bars `handle_bar` admits, None for every bar.
     pub admission: Option<&'a [bool]>,
 }
@@ -190,11 +191,13 @@ struct Replay<'a> {
     /// `_exit_gated`: whether the last close met a venue shut to orders
     /// after it had passed instrument preflight.
     exit_gated: bool,
-    /// `_short_opened_ns` and `_loan_cover_bar`: when the short held was
-    /// opened, and the bar its loan's forced cover is due on, -1 for none.
-    /// Kept only where a loan has a term.
+    /// `_short_opened_ns`, `_loan_cover_bar` and `_loan_contest_bar`: when
+    /// the short held was opened, and the bars its loan's forced cover is
+    /// due on and a composite contests it on, -1 for none. Kept only where a
+    /// loan has a term.
     short_opened_ns: Option<i64>,
     loan_cover_bar: i64,
+    loan_contest_bar: i64,
 
     // The driver's: `Strategy._order_seq`, the queued commands and the
     // per-timestamp action budget.
@@ -264,6 +267,7 @@ pub(crate) fn replay<'a>(
         exit_gated: false,
         short_opened_ns: None,
         loan_cover_bar: -1,
+        loan_contest_bar: -1,
         order_seq,
         commands: Vec::new(),
         budget_ts: None,
@@ -472,9 +476,14 @@ impl Replay<'_> {
         if self.cash_halted {
             return Some((true, self.pending_target, n));
         }
-        if self.pending_target.is_some() || self.working_orders != 0 || self.loan_cover_bar >= 0 {
-            // A capped short's cover bar has to reach the strategy, and the
-            // kernel's quiet stepping would take it as any other.
+        if self.pending_target.is_some()
+            || self.working_orders != 0
+            || self.loan_cover_bar >= 0
+            || self.loan_contest_bar >= 0
+        {
+            // A capped short's cover and contested bars have to reach the
+            // strategy, and the kernel's quiet stepping would take them as
+            // any other.
             return None;
         }
         let held = self.account_quantity;
@@ -546,6 +555,11 @@ impl Replay<'_> {
         // send beside it.
         if self.runner.kernel().resting_exit(self.bars.ts[i]) {
             return Err(declined("an exit outlived the bar it met"));
+        }
+        // `_refuse_contested_loan`: a composite's check of the loan held
+        // comes ahead of anything this bar does.
+        if usize::try_from(self.loan_contest_bar).is_ok_and(|at| at <= i) {
+            return Err(declined("a composite bar asks a held loan its age first"));
         }
         if self.cash_halted {
             self.advance(i, false)?;
@@ -1117,18 +1131,20 @@ impl Replay<'_> {
     /// is dated from the fill that left the book short, and ends with the
     /// fill that leaves it flat or long.
     fn track_short_loan(&mut self, filled_ns: i64) -> PyResult<()> {
-        let Some(cover_bar) = self.shorts.as_ref().and_then(|s| s.cover_bar) else {
+        let Some(cover) = self.shorts.as_ref().and_then(|s| s.cover) else {
             return Ok(());
         };
         let (has_position, net_position) = held_position(self.runner);
         if has_position && net_position < 0.0 {
             if self.short_opened_ns.is_none() {
                 self.short_opened_ns = Some(filled_ns);
-                self.loan_cover_bar = cover_bar.call1((filled_ns,))?.extract()?;
+                (self.loan_cover_bar, self.loan_contest_bar) =
+                    cover.call1((filled_ns,))?.extract()?;
             }
         } else {
             self.short_opened_ns = None;
             self.loan_cover_bar = -1;
+            self.loan_contest_bar = -1;
         }
         Ok(())
     }

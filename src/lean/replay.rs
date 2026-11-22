@@ -116,6 +116,10 @@ pub(crate) struct Loan<'a> {
     /// The bar a short opened on each bar is first due its forced cover
     /// on, -1 for none.
     pub cover_bars: &'a [i64],
+    /// The bar a composite asks a short opened on each bar its age on
+    /// ahead of every primary bar (`ShortLoanClock.cover`), -1 for none:
+    /// one the replay declines on while the short is held.
+    pub contest_bars: &'a [i64],
 }
 
 /// A replay's records: the ledger it booked, the kernel's round trips, the
@@ -181,11 +185,13 @@ struct Replay<'a> {
     short_attempts: u32,
     /// `_exit_gated`.
     exit_gated: bool,
-    /// The bar the short held was opened on, and the bar its loan's forced
-    /// cover is due on, -1 for none: `_short_opened_ns` and
-    /// `_loan_cover_bar`. Kept only where a loan has a term.
+    /// The bar the short held was opened on, and the bars its loan's forced
+    /// cover is due on and a composite contests it on, -1 for none:
+    /// `_short_opened_ns`, `_loan_cover_bar` and `_loan_contest_bar`. Kept
+    /// only where a loan has a term.
     short_opened: Option<usize>,
     loan_cover_bar: i64,
+    loan_contest_bar: i64,
     /// The position the fills have left, signed, as the financing replays
     /// them, and what each changed of the shares held short.
     filled_position: f64,
@@ -261,6 +267,7 @@ pub(crate) fn replay(
             || long(shorts.admission.map(<[bool]>::len))
             || long(shorts.loan.as_ref().map(|loan| loan.days.len()))
             || long(shorts.loan.as_ref().map(|loan| loan.cover_bars.len()))
+            || long(shorts.loan.as_ref().map(|loan| loan.contest_bars.len()))
         {
             return Err(Declined("short terms of another length"));
         }
@@ -302,6 +309,7 @@ pub(crate) fn replay(
         exit_gated: false,
         short_opened: None,
         loan_cover_bar: -1,
+        loan_contest_bar: -1,
         filled_position: 0.0,
         short_deltas: Vec::new(),
         order_seq: cell.venue.first_order_seq,
@@ -462,10 +470,21 @@ impl Replay<'_> {
         self.quiet_scan(next_due)
     }
 
-    /// Whether no forced cover falls due before bar `to`: the cover bar is
-    /// one the strategy has to see.
+    /// Whether no forced cover falls due, nor a composite contests the loan,
+    /// before bar `to`: either bar is one the strategy has to see.
     fn loan_holds_before(&self, to: usize) -> bool {
-        usize::try_from(self.loan_cover_bar).map_or(true, |at| at >= to)
+        self.loan_watch().is_none_or(|at| at >= to)
+    }
+
+    /// The first bar the loan held has to be seen on: its cover bar, or the
+    /// one a composite contests it on where that comes first.
+    fn loan_watch(&self) -> Option<usize> {
+        let cover = usize::try_from(self.loan_cover_bar).ok();
+        let contest = usize::try_from(self.loan_contest_bar).ok();
+        match (cover, contest) {
+            (Some(cover), Some(contest)) => Some(cover.min(contest)),
+            (cover, contest) => cover.or(contest),
+        }
     }
 
     /// Where the visits cannot be passed unread: the callbacks of the due
@@ -579,8 +598,8 @@ impl Replay<'_> {
     ) -> usize {
         let (m, s, mask) = (self.m, self.s, self.mask_at);
         let mut stop = self.cursor.next_dispatch_position(s, m.len());
-        if let Ok(cover) = usize::try_from(self.loan_cover_bar) {
-            stop = stop.min(cover);
+        if let Some(watch) = self.loan_watch() {
+            stop = stop.min(watch);
         }
         let due = &mask[next_due..];
         let due = &due[..count_below(due, stop)];
@@ -738,6 +757,11 @@ impl Replay<'_> {
         if self.k.resting_exit(self.m.ts[i]) {
             return Err(Declined("an exit outlived the bar it met"));
         }
+        // `_refuse_contested_loan`: a composite's check of the loan held
+        // comes ahead of anything this bar does.
+        if usize::try_from(self.loan_contest_bar).is_ok_and(|at| at <= i) {
+            return Err(Declined("a composite bar asks a held loan its age first"));
+        }
         // A scan stops with nothing pending: nothing reconciles before the
         // advance it ran.
         let advanced = match self.advanced.take() {
@@ -820,9 +844,11 @@ impl Replay<'_> {
         Ok(())
     }
 
-    /// `0 <= _loan_cover_bar <= idx`: a loan past its cover bar, still held.
+    /// `0 <= _loan_cover_bar <= idx`: a loan past its cover bar, still held
+    /// -- or past the bar a composite contests it on, which `on_bar`
+    /// declines.
     fn loan_due(&self, i: usize) -> bool {
-        usize::try_from(self.loan_cover_bar).is_ok_and(|at| at <= i)
+        self.loan_watch().is_some_and(|at| at <= i)
     }
 
     /// `RustRuleSession.advance`; `apply_policies` false for a halted run.
@@ -1367,10 +1393,12 @@ impl Replay<'_> {
             if self.short_opened.is_none() {
                 self.short_opened = Some(at);
                 self.loan_cover_bar = loan.cover_bars[at];
+                self.loan_contest_bar = loan.contest_bars[at];
             }
         } else {
             self.short_opened = None;
             self.loan_cover_bar = -1;
+            self.loan_contest_bar = -1;
         }
     }
 

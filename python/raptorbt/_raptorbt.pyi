@@ -1430,8 +1430,9 @@ class KernelSession:
     # (balance, currency precision, size increment, size precision, price
     # precision, currency) -- it returns that record booked, a ReplayLedger.
     # Given `shorts` -- (cover at market, short attempts, stale bars, the
-    # short gate's refusal, the loan clock's cover bar, its admission) -- it
-    # is a short node's replay (REPLAY_VERSION 2).
+    # short gate's refusal, the loan clock's cover -- the cover bar and the
+    # bar a composite contests the loan on -- and its admission) -- it is a
+    # short node's replay (REPLAY_VERSION 2; the contested bar from 3).
     def replay_rules(
         self,
         timestamps: _I64,
@@ -1623,9 +1624,10 @@ _Venue = tuple[int, bool, bool, bool, float, float, float, float, float, str, in
 _Book = tuple[float, int, float, int, int, str]
 # A short node's terms: (cover_market, max_attempts, max_stale_bars, admitted,
 # loan, admission), admitted per bar whether a short from flat clears the
-# borrow gate, loan a capped loan's (days, block_age, cover_bars).
+# borrow gate, loan a capped loan's (days, block_age, cover_bars,
+# contest_bars), the last from LEAN_REPLAY_VERSION 6.
 _Shorts = tuple[
-    bool, int, int, _Bool | None, tuple[_I32, int, _I64] | None, _Bool | None
+    bool, int, int, _Bool | None, tuple[_I32, int, _I64, _I64] | None, _Bool | None
 ]
 # Its borrow: (dates, settles, priced, first_day, end_day, units, terminal_ns),
 # days counted from the epoch.

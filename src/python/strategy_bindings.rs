@@ -335,9 +335,11 @@ impl PyKernelSession {
     /// version, and runs that one in Python otherwise.
     ///
     /// 1: a long-only replay. 2: a short node's (`shorts`), whose entries
-    /// sell to open through a durable short target.
+    /// sell to open through a durable short target. 3: its loan clock names
+    /// the bar a composite contests a loan on too (`cover`), which the
+    /// replay declines.
     #[classattr]
-    const REPLAY_VERSION: u32 = 2;
+    const REPLAY_VERSION: u32 = 3;
 
     #[new]
     #[pyo3(signature = (symbol="ASSET", direction=1, config=None, instrument_config=None, instrument=None,
@@ -571,10 +573,11 @@ impl PyKernelSession {
     /// calling back wherever it can. `book` is `(balance,
     /// currency_precision, size_increment, size_precision, price_precision,
     /// currency)`. `shorts`, given, makes it a short node's replay:
-    /// `(cover_market, max_attempts, max_stale_bars, refusal, cover_bar,
+    /// `(cover_market, max_attempts, max_stale_bars, refusal, cover,
     /// admission)`, with `refusal(decided_ns, units, position, opened_ns) ->
-    /// bool`, `cover_bar(filled_ns) -> int` and `admission` the bars the
-    /// loan clock is asked on, each None where the run has none.
+    /// bool`, `cover(filled_ns) -> (int, int)` (the cover bar and the bar a
+    /// composite contests the loan on) and `admission` the bars the loan
+    /// clock is asked on, each None where the run has none.
     #[pyo3(signature = (
         timestamps, open, high, low, close, volume, atr, mask, rules, quiet, venue,
         units, snap, affordable, exhausted, gate=None, money=None, book=None, shorts=None,
@@ -638,7 +641,7 @@ impl PyKernelSession {
         let money = Money { units, snap, affordable, exhausted, model: money.as_deref() };
         let shorts = match &shorts {
             None => None,
-            Some((cover_market, max_attempts, max_stale_bars, refusal, cover_bar, admission)) => {
+            Some((cover_market, max_attempts, max_stale_bars, refusal, cover, admission)) => {
                 let admission = admission
                     .as_ref()
                     .map(|array| array.as_slice())
@@ -649,7 +652,7 @@ impl PyKernelSession {
                     max_attempts: *max_attempts,
                     max_stale_bars: *max_stale_bars,
                     refusal: *refusal,
-                    cover_bar: *cover_bar,
+                    cover: *cover,
                     admission,
                 })
             }

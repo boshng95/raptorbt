@@ -109,13 +109,19 @@ type TreeTuple = (Vec<ConditionTuple>, Vec<usize>, Vec<usize>, usize, (bool, f64
 
 /// A short node's terms (`crate::lean::replay::Shorts`): `(cover_market,
 /// max_attempts, max_stale_bars, admitted, loan, admission)`, the loan
-/// `(days, block_age, cover_bars)` or None where it carries no term.
+/// `(days, block_age, cover_bars, contest_bars)` or None where it carries no
+/// term.
 type ShortsTuple<'py> = (
     bool,
     u32,
     i64,
     Option<PyReadonlyArray1<'py, bool>>,
-    Option<(PyReadonlyArray1<'py, i32>, i32, PyReadonlyArray1<'py, i64>)>,
+    Option<(
+        PyReadonlyArray1<'py, i32>,
+        i32,
+        PyReadonlyArray1<'py, i64>,
+        PyReadonlyArray1<'py, i64>,
+    )>,
     Option<PyReadonlyArray1<'py, bool>>,
 );
 
@@ -212,10 +218,11 @@ fn short_terms<'a>(
     };
     let (cover_market, max_attempts, max_stale_bars, admitted, loan, admission) = shorts;
     let loan = match loan {
-        Some((days, block_age, cover_bars)) => Some(Loan {
+        Some((days, block_age, cover_bars, contest_bars)) => Some(Loan {
             days: days.as_slice()?,
             block_age: *block_age,
             cover_bars: cover_bars.as_slice()?,
+            contest_bars: contest_bars.as_slice()?,
         }),
         None => None,
     };

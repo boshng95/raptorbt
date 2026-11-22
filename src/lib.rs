@@ -95,8 +95,10 @@ fn _raptorbt(py: Python<'_>, m: &PyModule) -> PyResult<()> {
     // 3: it works crossings out each bar (`each_bar`).
     // 4: level rules read more than one of the symbol's streams
     // (`LeanFrame.of_legs`, `legs`). 5: risk exits -- the trade, ATR and
-    // time exits and the borrow they charge (`policies`, `borrow`).
-    m.add("LEAN_REPLAY_VERSION", 5_u32)?;
+    // time exits and the borrow they charge (`policies`, `borrow`). 6: a
+    // loan's clock names the bar a composite contests it on, which the
+    // replay declines (`loan`'s `contest_bars`).
+    m.add("LEAN_REPLAY_VERSION", 6_u32)?;
     m.add_function(wrap_pyfunction!(python::strategy_bindings::resolve_atr_period, m)?)?;
 
     // Register the canonical report of a replay and its exact-arithmetic probes
