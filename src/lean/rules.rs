@@ -27,6 +27,11 @@
 //! around the primary bar, each key holds its leg's last visit, and one not
 //! ready yet holds no value.
 //!
+//! A leg may be one the rules read and never decide on -- another symbol's
+//! reference leg (`DataParams.reference_legs`, [`Leg::decides`]). Its bar
+//! moves its keys and evaluates nothing, and leaves the next primary bar a
+//! visit owed (`rule_session`'s `owes_primary`): the first visit to read it.
+//!
 //! A cell may carry StrategyBase's risk exits ([`Policies`]). Nothing is
 //! then deferred -- every primary bar is a callback, as on the full lane --
 //! an entry decided from flat earlier in a callback rests through its later
@@ -199,7 +204,7 @@ fn crossed(previous: (f64, f64), a: f64, b: f64, above: bool) -> bool {
 /// What a leg is built from: one of the traded symbol's `ScheduledStream`s
 /// -- its bars' dispatch timestamps, labels and closes, its `dispatch_rank`,
 /// whether the strategy builds it (`built_by_strategy`) and its
-/// `stream_index`.
+/// `stream_index` -- and whether the rules decide on it ([`Leg::decides`]).
 pub struct LegTerms {
     pub ts: Vec<i64>,
     pub labels: Vec<i64>,
@@ -207,6 +212,7 @@ pub struct LegTerms {
     pub rank: i64,
     pub built: bool,
     pub stream_index: i64,
+    pub decides: bool,
 }
 
 /// One resampled stream of a frame: its bars' closes, their dispatch phases
@@ -224,6 +230,10 @@ pub struct Leg {
     /// Whether the labels rise, so no visit repeats the label before it
     /// (`DecisionProgram.evaluate`'s repeat).
     pub labels_rise: bool,
+    /// Whether the rules decide on its bars (`slot_decision`). One they only
+    /// read -- a reference leg -- moves its keys, evaluates nothing and owes
+    /// the next primary bar its visit.
+    pub decides: bool,
 }
 
 impl Leg {
@@ -284,6 +294,7 @@ impl Dispatch {
             rank: 0,
             built: true,
             stream_index: 0,
+            decides: true,
         };
         Self::of_legs(ts, pos, vec![leg])
     }
@@ -295,14 +306,19 @@ impl Dispatch {
     /// An instant's bars sort as `ScheduledStream.order` sorts them: by
     /// phase, then by `stream_index` among pre-close windows and by
     /// `dispatch_rank` among the rest -- an order with no ties among one
-    /// symbol's legs, which the leg's place breaks if it had.
+    /// symbol's legs, which the leg's place breaks if it had -- and one
+    /// leg's bars in their order. Only a leg the rules never decide on
+    /// delivers more than one bar at an instant: another symbol's bars that
+    /// closed while the traded symbol's market was shut, all handed over
+    /// with its next bar. Each moves its leg's keys and evaluates nothing,
+    /// so the last of them is what the rules read.
     pub fn of_legs(ts: Vec<i64>, pos: Vec<usize>, legs: Vec<LegTerms>) -> Result<Self, Declined> {
         let n = ts.len();
         if pos.len() != n {
             return Err(Declined("stream lengths differ"));
         }
-        if legs.is_empty() {
-            return Err(Declined("a frame without legs"));
+        if !legs.iter().any(|leg| leg.decides) {
+            return Err(Declined("a frame without a leg the rules decide on"));
         }
         if !ts.windows(2).all(|pair| pair[0] < pair[1])
             || !pos.windows(2).all(|pair| pair[0] < pair[1])
@@ -318,7 +334,8 @@ impl Dispatch {
             if terms.labels.len() != m || terms.close.len() != m {
                 return Err(Declined("stream lengths differ"));
             }
-            if !terms.ts.windows(2).all(|pair| pair[0] < pair[1]) {
+            let rises = |pair: &[i64]| pair[0] < pair[1] || (!terms.decides && pair[0] == pair[1]);
+            if !terms.ts.windows(2).all(rises) {
                 return Err(Declined("dispatches that do not rise"));
             }
             let mut at = Vec::with_capacity(m);
@@ -348,12 +365,13 @@ impl Dispatch {
                 close: terms.close,
                 phase,
                 at,
+                decides: terms.decides,
             });
         }
         if counts.contains(&0) {
             return Err(Declined("an instant no leg dispatches at"));
         }
-        sorted.sort_unstable_by_key(|&(u, p, rank, j, _)| (u, p, rank, j));
+        sorted.sort_unstable();
         let mut starts = Vec::with_capacity(n + 1);
         let mut total = 0;
         starts.push(0);
@@ -1635,8 +1653,14 @@ impl Cursor {
                 s, tree, close, event, idx, now, held_side, quantity, pending, resting,
             )?;
             let intent = if resting != 0 { None } else { intent };
-            if primary && self.last_reached {
-                self.visit_primary_after_fill = false;
+            // Only a primary bar the rules ran on settles a visit owed; a bar
+            // of a leg they only read leaves one owed (`owes_primary`).
+            if primary {
+                if self.last_reached {
+                    self.visit_primary_after_fill = false;
+                }
+            } else if event.is_some_and(|(leg, _)| !s.d.legs[leg].decides) {
+                self.visit_primary_after_fill = true;
             }
             if deferred && self.clocks.flipped {
                 self.visit_primary_after_fill = true;
@@ -1754,7 +1778,8 @@ impl Cursor {
         }
         self.last_sort_key = Some(order);
         self.last_reached = reached;
-        if !reached {
+        // A leg the rules only read moves its keys and evaluates nothing.
+        if !reached || event.is_some_and(|(leg, _)| !s.d.legs[leg].decides) {
             return Ok(None);
         }
         let current = &self.current;
@@ -2002,6 +2027,7 @@ mod tests {
             rank,
             built,
             stream_index,
+            decides: true,
         }
     }
 
@@ -2066,6 +2092,17 @@ mod tests {
         assert!(frame(vec![at(&[10, 30])]).is_err());
         assert!(frame(vec![at(&[10, 30, 20])]).is_err());
         assert!(frame(vec![]).is_err());
+        // A leg the rules only read, beside one they decide on; never alone.
+        let read = |ts: &[i64]| LegTerms { decides: false, ..at(ts) };
+        let d = frame(vec![at(&[10, 30]), read(&[20])]).unwrap();
+        assert!(d.legs[0].decides && !d.legs[1].decides);
+        assert!(frame(vec![read(&[10, 20, 30])]).is_err());
+        // Its bars may share an instant -- another market's, closed while
+        // this one was shut -- delivered in their order; a decided leg's not.
+        let shut = LegTerms { decides: false, ..leg(&[20, 20], &[15, 18], 0, true, 1) };
+        let d = frame(vec![at(&[10, 20, 30]), shut]).unwrap();
+        assert_eq!(d.events(1), (&[(1, 0), (1, 1), (0, 1)][..], 2));
+        assert!(frame(vec![at(&[10, 20, 20, 30])]).is_err());
         let nan = LegTerms { close: vec![1.0, f64::NAN], ..at(&[10, 20]) };
         assert!(frame(vec![nan, at(&[30])]).unwrap().lowest_close.is_nan());
     }

@@ -358,24 +358,36 @@ impl PyLeanFrame {
     /// stream_index)`, dispatched at `dispatch_timestamps` -- every instant
     /// one of them dispatches at (`NativeExecutionSession`'s
     /// `_dispatch_timestamps`) -- on the primary bars `dispatch_positions`.
-    /// Only level rules read a frame of more than one leg.
+    /// Only level rules read a frame of more than one leg. *decides*, where
+    /// given, says per leg whether the rules decide on it (`slot_decision`):
+    /// a leg they only read -- a reference leg -- evaluates nothing. Without
+    /// it, every leg decides.
     #[staticmethod]
+    #[pyo3(signature = (
+        market, due, dispatch_timestamps, dispatch_positions, legs, *, decides = None
+    ))]
     fn of_legs(
         market: PyRef<'_, PyLeanMarket>,
         due: PyReadonlyArray1<'_, i64>,
         dispatch_timestamps: PyReadonlyArray1<'_, i64>,
         dispatch_positions: PyReadonlyArray1<'_, i64>,
         legs: Vec<LegTuple<'_>>,
+        decides: Option<Vec<bool>>,
     ) -> PyResult<Self> {
+        if decides.as_ref().is_some_and(|decides| decides.len() != legs.len()) {
+            return Err(PyValueError::new_err("decides and legs of different counts"));
+        }
         let legs = legs
             .into_iter()
-            .map(|(ts, labels, close, rank, built, stream_index)| LegTerms {
+            .enumerate()
+            .map(|(at, (ts, labels, close, rank, built, stream_index))| LegTerms {
                 ts: ts.as_array().to_vec(),
                 labels: labels.as_array().to_vec(),
                 close: close.as_array().to_vec(),
                 rank,
                 built,
                 stream_index,
+                decides: decides.as_ref().is_none_or(|decides| decides[at]),
             })
             .collect();
         let dispatch = Dispatch::of_legs(

@@ -1577,7 +1577,9 @@ def indicator_twin(
 class LeanDeclined(RuntimeError): ...
 
 # 2 from the build whose lean replay takes a short node's terms; 3 from the
-# one that works crossings out each bar (`each_bar`).
+# one that works crossings out each bar (`each_bar`); 4 reads more than one of
+# the symbol's streams; 5 replays risk exits; 6 declines a contested loan; 7
+# reads a leg the rules never decide on (`LeanFrame.of_legs`' `decides`).
 LEAN_REPLAY_VERSION: int
 
 class LeanMarket:
@@ -1605,6 +1607,20 @@ class LeanFrame:
         labels: _I64,
         close: _F64,
     ) -> None: ...
+    # A frame of several of the symbol's streams, each (timestamps, labels,
+    # close, dispatch_rank, built_by_strategy, stream_index); decides, per
+    # leg, whether the rules decide on it (from LEAN_REPLAY_VERSION 7: a
+    # reference leg they only read).
+    @staticmethod
+    def of_legs(
+        market: LeanMarket,
+        due: _I64,
+        dispatch_timestamps: _I64,
+        dispatch_positions: _I64,
+        legs: list[tuple[_I64, _I64, _F64, int, bool, int]],
+        *,
+        decides: list[bool] | None = None,
+    ) -> LeanFrame: ...
     def __len__(self) -> int: ...
 
 # (a_key, a_value, b_key, b_value, above, clock)
