@@ -120,6 +120,11 @@ from raptorbt._raptorbt import (
     LEAN_REPLAY_VERSION,
     lean_replay,
     lean_replay_many,
+    # ... and a traded series' decisions, for the lean portfolio lane
+    lean_decide_series,
+    lean_decide_rank,
+    # ... and the book they trade, many cells at once
+    PortfolioReplay,
 )
 from raptorbt.strategy import (
     Bar,
@@ -251,6 +256,9 @@ __all__ = [
     "LEAN_REPLAY_VERSION",
     "lean_replay",
     "lean_replay_many",
+    "lean_decide_series",
+    "lean_decide_rank",
+    "PortfolioReplay",
     # Class-based strategy contract
     "Bar",
     "ClosePosition",

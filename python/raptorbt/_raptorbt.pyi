@@ -1705,6 +1705,94 @@ def lean_replay_many(
     each_bar: list[bool] | None = ...,
 ) -> Any: ...
 
+# A traded series' decisions (`lean::decide`): one decider's keys are
+# (values, ready, gated) -- the first `gated` its indicators', any after them
+# its bar's prices.
+_DecideKeys = tuple[list[_F64], list[_Bool], int]
+
+def lean_decide_series(
+    tree: _Tree,
+    entry_sides: list[int],
+    keys: _DecideKeys,
+    *,
+    each_bar: bool,
+    legacy: bool,
+) -> tuple[npt.NDArray[np.int64], npt.NDArray[np.int8]]: ...
+def lean_decide_rank(
+    tree: _Tree,
+    entry_sides: list[int],
+    members: list[tuple[_DecideKeys, _F64, _Bool]],
+    delivered: list[npt.NDArray[np.int64]],
+    by_name: list[int],
+    top: int,
+    permits: tuple[bool, bool],
+    *,
+    each_bar: bool,
+    legacy: bool,
+) -> tuple[npt.NDArray[np.int64], npt.NDArray[np.int8]]: ...
+
+# A long-only cash book of members trading on complete instants
+# (`python::portfolio_replay`), replayed for many cells at once: one
+# `add_member` per member in the session's order, `seal`, `capture` the
+# instants the book decides on, then `run` cells of (ordinals, weights).
+# A cell's run is its `PortfolioResult`, its fill count, each order as
+# submitted (seq, member, buy, quantity, price, reduce_only, ts_init) and what
+# the venue did with them (seq, ts, kind, order_id, size, price, leaves,
+# realized, commission) -- kind 0 a fill, 1 canceled, 2 expired -- or a `str`
+# naming why the cell leaves the path the replay follows.
+_ReplaySubmit = tuple[int, int, bool, float, float, bool, int]
+_ReplayRecord = tuple[int, int, int, int, float, float, float, float, float]
+
+class PortfolioReplay:
+    def __init__(
+        self,
+        session: PortfolioSession,
+        union: npt.NDArray[np.int64],
+        *,
+        starting_capital: float,
+        currency_precision: int,
+        sizer_percent: float,
+        policy_order: list[int],
+    ) -> None: ...
+    def add_member(
+        self,
+        timestamps: npt.NDArray[np.int64],
+        admitted: npt.NDArray[np.bool_] | None,
+        exec_mark: npt.NDArray[np.float64],
+        gate: npt.NDArray[np.bool_] | None,
+        labels: npt.NDArray[np.int64],
+        index: npt.NDArray[np.int64],
+        delivered: npt.NDArray[np.int64],
+        timer_fired: npt.NDArray[np.bool_],
+        clocked: npt.NDArray[np.bool_],
+        ohlc: npt.NDArray[np.float64],
+        money: MoneyModel,
+        *,
+        price_precision: int,
+        size_increment_precision: int,
+        size_precision: int,
+        min_notional: float | None,
+        base_precision: int | None,
+        urgent_tif: str,
+        ttl_ns: int,
+        str_rank: int,
+        name_rank: int,
+    ) -> None: ...
+    def seal(self) -> None: ...
+    def capture(
+        self,
+    ) -> tuple[
+        npt.NDArray[np.int64], npt.NDArray[np.float64], npt.NDArray[np.bool_]
+    ]: ...
+    def run(
+        self,
+        cells: list[tuple[npt.NDArray[np.int64], npt.NDArray[np.float64]]],
+        *,
+        threads: int = ...,
+    ) -> list[
+        tuple[PortfolioResult, int, list[_ReplaySubmit], list[_ReplayRecord]] | str
+    ]: ...
+
 # Exact-arithmetic probes: Python's float arithmetic as the report uses it.
 def _exact_fsum(values: list[float]) -> float | None: ...
 def _exact_sum(values: list[float]) -> float: ...

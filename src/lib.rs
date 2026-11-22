@@ -90,7 +90,10 @@ fn _raptorbt(py: Python<'_>, m: &PyModule) -> PyResult<()> {
     m.add_class::<python::lean_bindings::PyLeanFrame>()?;
     m.add_function(wrap_pyfunction!(python::lean_bindings::lean_replay, m)?)?;
     m.add_function(wrap_pyfunction!(python::lean_bindings::lean_replay_many, m)?)?;
+    m.add_function(wrap_pyfunction!(python::decide_bindings::lean_decide_series, m)?)?;
+    m.add_function(wrap_pyfunction!(python::decide_bindings::lean_decide_rank, m)?)?;
     m.add("LeanDeclined", py.get_type::<python::lean_bindings::LeanDeclined>())?;
+    m.add_class::<python::portfolio_replay::PyPortfolioReplay>()?;
     // 2: the lean replay takes a short node's terms (`shorts`, `financing`).
     // 3: it works crossings out each bar (`each_bar`).
     // 4: level rules read more than one of the symbol's streams
@@ -99,7 +102,9 @@ fn _raptorbt(py: Python<'_>, m: &PyModule) -> PyResult<()> {
     // loan's clock names the bar a composite contests it on, which the
     // replay declines (`loan`'s `contest_bars`). 7: a leg the rules read and
     // never decide on -- a reference leg (`LeanFrame.of_legs`' `decides`).
-    m.add("LEAN_REPLAY_VERSION", 7_u32)?;
+    // 8: a long-only cash pair, basket or rank on complete instants, many
+    // cells at once (`PortfolioReplay`).
+    m.add("LEAN_REPLAY_VERSION", 8_u32)?;
     m.add_function(wrap_pyfunction!(python::strategy_bindings::resolve_atr_period, m)?)?;
 
     // Register the canonical report of a replay and its exact-arithmetic probes

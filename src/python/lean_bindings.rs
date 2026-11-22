@@ -44,7 +44,7 @@ create_exception!(
     "The cell takes a branch the lean lane does not transcribe; run it on the full lane."
 );
 
-fn declined(why: Declined) -> PyErr {
+pub(crate) fn declined(why: Declined) -> PyErr {
     LeanDeclined::new_err(why.0)
 }
 
@@ -100,12 +100,12 @@ type LegsTuple = (Vec<usize>, Vec<i64>);
 /// One node of a condition arena, as `CrossoverRuleSession` takes it:
 /// `(kind, children, a_key, a_value, b_key, b_value, code, lower, upper)`
 /// (`rule_session::ConditionTuple`).
-type ConditionTuple = (u8, Vec<usize>, i64, f64, i64, f64, usize, f64, f64);
+pub(crate) type ConditionTuple = (u8, Vec<usize>, i64, f64, i64, f64, usize, f64, f64);
 
 /// Level rules: `(conditions, exit_roots, entry_roots, n_clocks, (two_sided,
 /// size_increment, minimum_notional))`, the arena and `level` arguments
 /// `CrossoverRuleSession` takes.
-type TreeTuple = (Vec<ConditionTuple>, Vec<usize>, Vec<usize>, usize, (bool, f64, f64));
+pub(crate) type TreeTuple = (Vec<ConditionTuple>, Vec<usize>, Vec<usize>, usize, (bool, f64, f64));
 
 /// A short node's terms (`crate::lean::replay::Shorts`): `(cover_market,
 /// max_attempts, max_stale_bars, admitted, loan, admission)`, the loan
@@ -442,7 +442,7 @@ fn cross(spec: CrossTuple) -> Cross {
 }
 
 /// A [`TreeTuple`]'s level rules; ValueError where it is malformed.
-fn tree(spec: &TreeTuple) -> PyResult<Tree> {
+pub(crate) fn tree(spec: &TreeTuple) -> PyResult<Tree> {
     let (nodes, exits, entries, clocks, (two_sided, size_increment, minimum_notional)) = spec;
     let malformed = |what: &str| PyValueError::new_err(format!("malformed condition: {what}"));
     let conditions = nodes
@@ -1174,7 +1174,10 @@ pub fn lean_replay(
 }
 
 /// *work* on *pool*, or on rayon's own where None.
-fn in_pool<R: Send>(pool: &Option<Arc<rayon::ThreadPool>>, work: impl FnOnce() -> R + Send) -> R {
+pub(crate) fn in_pool<R: Send>(
+    pool: &Option<Arc<rayon::ThreadPool>>,
+    work: impl FnOnce() -> R + Send,
+) -> R {
     match pool {
         Some(pool) => pool.install(work),
         None => work(),
@@ -1187,7 +1190,7 @@ static POOL: Mutex<Option<(u32, usize, Arc<rayon::ThreadPool>)>> = Mutex::new(No
 /// A pool of *threads* threads, kept for the next call that asks for as many
 /// in this process. A forked child builds its own: the pool it inherited
 /// names threads that were never copied into it.
-fn threads_pool(threads: usize) -> PyResult<Arc<rayon::ThreadPool>> {
+pub(crate) fn threads_pool(threads: usize) -> PyResult<Arc<rayon::ThreadPool>> {
     let pid = std::process::id();
     let mut kept = POOL.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Some((owner, size, pool)) = kept.as_ref() {

@@ -6,12 +6,14 @@ use numpy::{PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
+use crate::accounts::AccountMode;
 use crate::core::types::{BacktestConfig, Direction, InstrumentConfig, TickData};
 use crate::data::{BookLevel, BookSide, DepthTick};
 use crate::execution::orders::{OrderSide, OrderStatus, QtySpec, WalkPhase};
+use crate::instruments::InstrumentSpec;
 use crate::portfolio::kernel::{KernelBar, StepInput};
 use crate::portfolio::ledger::PositionPolicy;
-use crate::portfolio::session::{EventSession, ScheduleData};
+use crate::portfolio::session::{EventSession, ScheduleData, SessionOutcome};
 
 use super::bindings::{
     convert_result, PyBacktestConfig, PyInstrumentConfig, PyInstrumentSummary, PyPortfolioResult,
@@ -104,6 +106,77 @@ fn kernel_bars(
 #[pyclass(name = "PortfolioSession")]
 pub struct PyPortfolioSession {
     session: Option<EventSession>,
+    /// How the session was set up, while that is all that happened to it.
+    recipe: Option<SessionRecipe>,
+}
+
+/// One instrument as `add_instrument` and its bars registered it.
+#[derive(Clone)]
+struct RecipeMember {
+    symbol: String,
+    direction: Direction,
+    spec: Option<InstrumentSpec>,
+    config: Option<InstrumentConfig>,
+    policy: PositionPolicy,
+    bars: Option<Arc<Vec<KernelBar>>>,
+}
+
+/// A session's setup -- its account, instruments and bars -- kept so a run
+/// can start any number of fresh copies of it, each sealed and untouched.
+///
+/// A replay of many cells over one book builds its session once in Python
+/// and then needs one new session per cell; rebuilding from the recipe
+/// shares the bar series instead of converting them again.
+#[derive(Clone)]
+pub(crate) struct SessionRecipe {
+    config: BacktestConfig,
+    account: AccountMode,
+    members: Vec<RecipeMember>,
+}
+
+impl SessionRecipe {
+    /// A new sealed session with this setup.
+    pub(crate) fn build(&self) -> EventSession {
+        let mut session = EventSession::with_account(self.config.clone(), self.account);
+        for member in &self.members {
+            let index = session.add_instrument(
+                member.symbol.clone(),
+                member.direction,
+                member.spec.clone(),
+                member.config.as_ref(),
+                member.policy,
+            );
+            if let Some(bars) = &member.bars {
+                session.set_shared_bars(index, Arc::clone(bars));
+            }
+        }
+        session.seal();
+        session
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.members.len()
+    }
+}
+
+/// A finished session's outcome as Python receives it.
+pub(crate) fn portfolio_result(outcome: SessionOutcome) -> PyPortfolioResult {
+    PyPortfolioResult {
+        result: convert_result(outcome.result),
+        per_instrument: outcome
+            .instruments
+            .into_iter()
+            .map(|o| PyInstrumentSummary {
+                symbol: o.symbol,
+                trades: o.trades,
+                pnl: o.pnl,
+                rejected_entries: o.rejected_entries,
+            })
+            .collect(),
+        rejected_entries: outcome.rejected_entries,
+        halted: outcome.halted,
+        halted_at: outcome.halted_at,
+    }
 }
 
 impl PyPortfolioSession {
@@ -113,10 +186,34 @@ impl PyPortfolioSession {
             .ok_or_else(|| PyValueError::new_err("session is finished; create a new one"))
     }
 
+    /// The session, for anything but its setup: the recipe no longer
+    /// describes it.
     fn session_mut(&mut self) -> PyResult<&mut EventSession> {
+        self.recipe = None;
+        self.setup_mut()
+    }
+
+    /// The session, for a setup step the recipe records.
+    fn setup_mut(&mut self) -> PyResult<&mut EventSession> {
         self.session
             .as_mut()
             .ok_or_else(|| PyValueError::new_err("session is finished; create a new one"))
+    }
+
+    fn attach_bars(&mut self, instrument: usize, bars: Arc<Vec<KernelBar>>) -> PyResult<()> {
+        self.setup_mut()?.set_shared_bars(instrument, Arc::clone(&bars));
+        if let Some(recipe) = self.recipe.as_mut() {
+            match recipe.members.get_mut(instrument) {
+                Some(member) => member.bars = Some(bars),
+                None => self.recipe = None,
+            }
+        }
+        Ok(())
+    }
+
+    /// The setup, if nothing but setup has happened to the session.
+    pub(crate) fn recipe(&self) -> Option<&SessionRecipe> {
+        self.recipe.as_ref()
     }
 }
 
@@ -127,7 +224,11 @@ impl PyPortfolioSession {
     fn new(config: Option<&PyBacktestConfig>, account_type: &str, leverage: f64) -> PyResult<Self> {
         let rust_config: BacktestConfig = config.map(BacktestConfig::from).unwrap_or_default();
         let account = parse_account_mode(account_type, leverage)?;
-        Ok(Self { session: Some(EventSession::with_account(rust_config, account)) })
+        let recipe = SessionRecipe { config: rust_config.clone(), account, members: Vec::new() };
+        Ok(Self {
+            session: Some(EventSession::with_account(rust_config, account)),
+            recipe: Some(recipe),
+        })
     }
 
     /// Register an instrument; returns its index for routing.
@@ -166,13 +267,29 @@ impl PyPortfolioSession {
             None => None,
         };
         let inst: Option<InstrumentConfig> = instrument_config.map(InstrumentConfig::from);
-        Ok(self.session_mut()?.add_instrument(
+        let recorded = self.recipe.is_some().then(|| (spec.clone(), inst.clone()));
+        let index = self.setup_mut()?.add_instrument(
             symbol.to_string(),
             direction,
             spec,
             inst.as_ref(),
             policy,
-        ))
+        );
+        if let (Some(recipe), Some((spec, config))) = (self.recipe.as_mut(), recorded) {
+            if index == recipe.members.len() {
+                recipe.members.push(RecipeMember {
+                    symbol: symbol.to_string(),
+                    direction,
+                    spec,
+                    config,
+                    policy,
+                    bars: None,
+                });
+            } else {
+                self.recipe = None;
+            }
+        }
+        Ok(index)
     }
 
     /// Attach an instrument's bar arrays (ascending timestamps).
@@ -187,15 +304,13 @@ impl PyPortfolioSession {
         close: PyReadonlyArray1<f64>,
         volume: PyReadonlyArray1<f64>,
     ) -> PyResult<()> {
-        let bars = kernel_bars(timestamps, open, high, low, close, volume)?;
-        self.session_mut()?.set_bars(instrument, bars);
-        Ok(())
+        let bars = Arc::new(kernel_bars(timestamps, open, high, low, close, volume)?);
+        self.attach_bars(instrument, bars)
     }
 
     /// Attach an instrument's bars from a `BarStore`, without copying them.
     fn set_bar_store(&mut self, instrument: usize, store: &PyBarStore) -> PyResult<()> {
-        self.session_mut()?.set_shared_bars(instrument, Arc::clone(&store.bars));
-        Ok(())
+        self.attach_bars(instrument, Arc::clone(&store.bars))
     }
 
     /// Attach an instrument's tick arrays (ascending timestamps).
@@ -319,7 +434,7 @@ impl PyPortfolioSession {
 
     /// Merge all streams into the deterministic schedule.
     fn seal(&mut self) -> PyResult<()> {
-        self.session_mut()?.seal();
+        self.setup_mut()?.seal();
         Ok(())
     }
 
@@ -777,22 +892,6 @@ impl PyPortfolioSession {
             .session
             .take()
             .ok_or_else(|| PyValueError::new_err("session is already finished"))?;
-        let outcome = session.finish();
-        Ok(PyPortfolioResult {
-            result: convert_result(outcome.result),
-            per_instrument: outcome
-                .instruments
-                .into_iter()
-                .map(|o| PyInstrumentSummary {
-                    symbol: o.symbol,
-                    trades: o.trades,
-                    pnl: o.pnl,
-                    rejected_entries: o.rejected_entries,
-                })
-                .collect(),
-            rejected_entries: outcome.rejected_entries,
-            halted: outcome.halted,
-            halted_at: outcome.halted_at,
-        })
+        Ok(portfolio_result(session.finish()))
     }
 }

@@ -168,13 +168,13 @@ pub(crate) fn fixed(x: f64, precision: usize) -> String {
 
 /// `c * 10**e`, exact.
 #[derive(Clone, Copy, Debug)]
-struct Dec {
-    c: i128,
-    e: i32,
+pub(crate) struct Dec {
+    pub(crate) c: i128,
+    pub(crate) e: i32,
 }
 
 #[derive(Clone, Copy)]
-enum Rounding {
+pub(crate) enum Rounding {
     Ceiling,
     HalfEven,
     /// `ROUND_HALF_UP`: a tie away from zero.
@@ -184,16 +184,16 @@ enum Rounding {
 }
 
 impl Dec {
-    const ZERO: Dec = Dec { c: 0, e: 0 };
+    pub(crate) const ZERO: Dec = Dec { c: 0, e: 0 };
 
     /// The value, or `None` once its coefficient leaves `Decimal`'s digits.
-    fn checked(c: i128, e: i32) -> Option<Dec> {
+    pub(crate) fn checked(c: i128, e: i32) -> Option<Dec> {
         (c.unsigned_abs() < DIGITS.unsigned_abs()).then_some(Dec { c, e })
     }
 
     /// `_dec`: a float through its shortest repr, which Rust's `{:e}` writes
     /// with the same digits Python's `repr` does.
-    fn of(x: f64) -> Option<Dec> {
+    pub(crate) fn of(x: f64) -> Option<Dec> {
         if !x.is_finite() {
             return None;
         }
@@ -286,7 +286,7 @@ impl Dec {
     }
 
     /// The nearest float, as `float(Decimal)` rounds it.
-    fn to_f64(self) -> f64 {
+    pub(crate) fn to_f64(self) -> f64 {
         // Both operands exact, so the one operation rounds once.
         if self.c.unsigned_abs() < (1_u128 << 53) && self.e.unsigned_abs() <= 22 {
             let c = self.c as i64 as f64;
@@ -307,7 +307,7 @@ impl Dec {
         i128_to_f64(self.c) * scale
     }
 
-    fn mul(self, other: Dec) -> Option<Dec> {
+    pub(crate) fn mul(self, other: Dec) -> Option<Dec> {
         Dec::checked(mul_i128(self.c, other.c)?, self.e.checked_add(other.e)?)
     }
 
@@ -322,7 +322,7 @@ impl Dec {
         Some((a, b, e))
     }
 
-    fn add(self, other: Dec) -> Option<Dec> {
+    pub(crate) fn add(self, other: Dec) -> Option<Dec> {
         if other.c == 0 {
             return Some(self);
         }
@@ -333,7 +333,7 @@ impl Dec {
         Dec::checked(a.checked_add(b)?, e)
     }
 
-    fn compare(self, other: Dec) -> Option<Ordering> {
+    pub(crate) fn compare(self, other: Dec) -> Option<Ordering> {
         let (a, b) = (self.signum(), other.signum());
         if a != b || a == 0 {
             return Some(a.cmp(&b));
@@ -388,7 +388,7 @@ impl Dec {
     }
 
     /// `floor(self / other)` for two positive values.
-    fn floor_div(self, other: Dec) -> Option<i128> {
+    pub(crate) fn floor_div(self, other: Dec) -> Option<i128> {
         if self.e >= other.e {
             let numerator = mul_i128(self.c, pow10((self.e - other.e) as u32)?)?;
             Some(div_rem(numerator, other.c).0)
@@ -402,8 +402,105 @@ impl Dec {
     }
 }
 
+impl Dec {
+    /// `self * other` as `Decimal` multiplies: exact where the product fits
+    /// its 28 digits, else rounded half to even there.
+    ///
+    /// Two shortest reprs of seventeen digits each multiply to thirty-four,
+    /// and Python's default context rounds that product before any later
+    /// step reads it, so every product `TradeCost` forms is taken this way.
+    /// `None` only once the exact product leaves `i128`'s 38 digits.
+    pub(crate) fn mul28(self, other: Dec) -> Option<Dec> {
+        let c = mul_i128(self.c, other.c)?;
+        let e = self.e.checked_add(other.e)?;
+        let magnitude = c.unsigned_abs();
+        if magnitude < DIGITS.unsigned_abs() {
+            return Some(Dec { c, e });
+        }
+        // The digits past the 28 kept: `10**(n - 1) <= magnitude < 10**n`.
+        let n = POWERS.iter().take_while(|power| power.unsigned_abs() <= magnitude).count();
+        let shift = n - 28;
+        let (q, r) = div_rem(c, POWERS[shift]);
+        let q = match (2 * r.abs()).cmp(&POWERS[shift]) {
+            Ordering::Greater => q + c.signum(),
+            Ordering::Equal if q % 2 != 0 => q + c.signum(),
+            _ => q,
+        };
+        let e = e.checked_add(shift as i32)?;
+        // A carry out of the 28th digit leaves `10**28`: one digit fewer.
+        if q.unsigned_abs() == DIGITS.unsigned_abs() {
+            return Dec::checked(q / 10, e.checked_add(1)?);
+        }
+        Dec::checked(q, e)
+    }
+
+    /// `self / other` as `Decimal` divides two positive values: exact where
+    /// the quotient fits its 28 digits, else rounded half to even there.
+    ///
+    /// Long division a digit at a time, so a divisor of any size the digits
+    /// allow never overflows: the remainder stays below it.
+    pub(crate) fn div28(self, other: Dec) -> Option<Dec> {
+        if self.c <= 0 || other.c <= 0 {
+            return None;
+        }
+        let (mut q, mut r) = div_rem(self.c, other.c);
+        let mut e = self.e.checked_sub(other.e)?;
+        // One digit past the 28 kept, the rest of the quotient as `r`.
+        while q < DIGITS && r != 0 {
+            let (digit, rest) = div_rem(r.checked_mul(10)?, other.c);
+            q = q * 10 + digit;
+            r = rest;
+            e = e.checked_sub(1)?;
+        }
+        if q < DIGITS {
+            return Dec::checked(q, e);
+        }
+        let (mut kept, last) = (q / 10, q % 10);
+        e = e.checked_add(1)?;
+        if last > 5 || (last == 5 && (r != 0 || kept % 2 != 0)) {
+            kept += 1;
+        }
+        if kept == DIGITS {
+            kept /= 10;
+            e = e.checked_add(1)?;
+        }
+        Dec::checked(kept, e)
+    }
+}
+
+/// `round(x, increment_precision)` on Nautilus's fixed point at `precision`,
+/// as `Instrument.make_price` and `make_qty` build a value: the units of
+/// `10**-precision` it holds, `f64::round` (half away) taking the scaled
+/// float as Nautilus's `f64_to_fixed` does. `None` past 64 bits.
+pub(crate) fn fixed_units(x: f64, increment_precision: u32, precision: u32) -> Option<i64> {
+    let rounded = round_to(x, increment_precision)?;
+    let units = round_half_away(rounded * pow10_f64(precision));
+    (units.abs() < 1e17).then_some(units as i64)
+}
+
+/// `as_double()` of a fixed-point value of `units` at `precision`.
+pub(crate) fn units_as_double(units: i64, precision: u32) -> Option<f64> {
+    let raw = mul_i128(i128::from(units), pow10(16_u32.checked_sub(precision)?)?)?;
+    Some(i128_to_f64(raw) / 1e16)
+}
+
+/// `parity.models.money_as_double`: `Money(value, currency).as_double()`,
+/// rounded to the minor unit half away from zero as `Money` rounds.
+pub(crate) fn money_as_double(value: f64, precision: u32) -> Option<f64> {
+    if precision > 16 || !value.is_finite() {
+        return None;
+    }
+    // A finite value: `minor` is finite or infinite, never NaN.
+    let minor = round_half_away(value * pow10_f64(precision));
+    if minor.abs() >= 1e17 {
+        return None;
+    }
+    units_as_double(minor as i64, precision)
+}
+
 /// `TradeCost` with its `CommissionSchedule`.
-struct Cost {
+#[derive(Clone)]
+pub(crate) struct Cost {
     lot: Dec,
     /// `-cash_precision`: the exponent of one cent.
     cent: i32,
@@ -415,7 +512,7 @@ struct Cost {
 
 impl Cost {
     /// `_cash`.
-    fn cash(&self, cash: f64) -> Option<Dec> {
+    pub(crate) fn cash(&self, cash: f64) -> Option<Dec> {
         // Clear of a tie, the shortest repr rounds where the float does.
         if let Some((units, true)) =
             u32::try_from(-self.cent).ok().and_then(|places| scaled_half_even_clear(cash, places))
@@ -431,20 +528,22 @@ impl Cost {
         amount.quantize(self.cent, Rounding::Ceiling)
     }
 
-    /// `CommissionSchedule.commission_for`.
+    /// `CommissionSchedule.commission_for`, each product rounded where its
+    /// `Decimal` one is ([`Dec::mul28`]); `max` and `min` round nothing.
     fn commission(&self, quantity: Dec, price: Dec) -> Option<Dec> {
-        let units = Dec { c: quantity.c.abs(), e: quantity.e };
-        let notional = units.mul(price)?;
+        // `abs` rounds too, but nothing past 28 digits reaches it.
+        let units = Dec::checked(quantity.c.abs(), quantity.e)?;
+        let notional = units.mul28(price)?;
         let mut fee = if self.per_share.c > 0 {
-            units.mul(self.per_share)?
+            units.mul28(self.per_share)?
         } else {
-            notional.mul(self.taker_fee)?
+            notional.mul28(self.taker_fee)?
         };
         if self.minimum.c > 0 && self.minimum.compare(fee)? == Ordering::Greater {
             fee = self.minimum;
         }
         if self.max_pct.c > 0 {
-            let cap = notional.mul(self.max_pct)?;
+            let cap = notional.mul28(self.max_pct)?;
             if cap.compare(fee)? == Ordering::Less {
                 fee = cap;
             }
@@ -452,17 +551,25 @@ impl Cost {
         Some(fee)
     }
 
-    /// `buy_cost`.
-    fn buy_cost(&self, quantity: Dec, price: Dec) -> Option<Dec> {
+    /// `fee`: the commission an order of `quantity` at `price` pays.
+    pub(crate) fn fee(&self, quantity: Dec, price: Dec) -> Option<Dec> {
         if quantity.c <= 0 {
             return Some(Dec::ZERO);
         }
-        let notional = self.up(quantity.mul(price)?)?;
+        self.up(self.commission(quantity, price)?)
+    }
+
+    /// `buy_cost`.
+    pub(crate) fn buy_cost(&self, quantity: Dec, price: Dec) -> Option<Dec> {
+        if quantity.c <= 0 {
+            return Some(Dec::ZERO);
+        }
+        let notional = self.up(quantity.mul28(price)?)?;
         notional.add(self.up(self.commission(quantity, price)?)?)
     }
 
     /// `can_afford`.
-    fn can_afford(&self, cash: f64, quantity: Dec, price: Dec) -> Option<bool> {
+    pub(crate) fn can_afford(&self, cash: f64, quantity: Dec, price: Dec) -> Option<bool> {
         let cost = self.buy_cost(quantity, price)?;
         Some(cost.compare(self.cash(cash)?)? != Ordering::Greater)
     }
@@ -479,8 +586,13 @@ impl Cost {
     /// probes are at most `floor(cash / (price * lot)) + 1` lots, and the
     /// cost there fitting `Decimal`'s digits means every probe's does.
     fn affordable_quantity(&self, cash: f64, price: f64) -> Option<Dec> {
+        self.affordable_quantity_at(cash, Dec::of(price)?)
+    }
+
+    /// [`Cost::affordable_quantity`] at a price already a decimal, as a
+    /// `Price.as_decimal()` hands `TradeCost` one.
+    pub(crate) fn affordable_quantity_at(&self, cash: f64, p: Dec) -> Option<Dec> {
         let c = self.cash(cash)?;
-        let p = Dec::of(price)?;
         if c.c <= 0 || p.c <= 0 {
             return Some(Dec::ZERO);
         }
@@ -542,7 +654,8 @@ impl Cost {
 }
 
 /// `snapped_order_price`: a marketable limit on Nautilus's price grid.
-struct Grid {
+#[derive(Clone)]
+pub(crate) struct Grid {
     /// `fallback_buffer_for_venue`.
     buffer: f64,
     /// `venue_tick_tiers`: ascending `(below, tick)`, `None` on top.
@@ -552,6 +665,21 @@ struct Grid {
     /// `_increment_precision(price_increment)`.
     increment_precision: usize,
     price_precision: i32,
+}
+
+impl Grid {
+    /// `Instrument.make_price(x)`'s units of `10**-price_precision`.
+    pub(crate) fn price_units(&self, x: f64) -> Option<i64> {
+        fixed_units(
+            x,
+            u32::try_from(self.increment_precision).ok()?,
+            u32::try_from(self.price_precision).ok()?,
+        )
+    }
+
+    pub(crate) fn price_precision(&self) -> Option<u32> {
+        u32::try_from(self.price_precision).ok()
+    }
 }
 
 impl Grid {
@@ -600,7 +728,7 @@ impl Grid {
 
     /// `snapped_order_price`: `marketable_limit_price` priced from a mark,
     /// then `Instrument.make_price`.
-    fn snap(&self, reference: f64, buy: bool) -> Option<f64> {
+    pub(crate) fn snap(&self, reference: f64, buy: bool) -> Option<f64> {
         // `marketable_limit_price` prices nothing at or below zero; such a
         // reference, and one too large for a `Price`, are Python's to answer.
         if !(reference > 0.0 && reference < 1e12) {
@@ -689,6 +817,14 @@ impl PyMoneyModel {
                 Some(if cash < share { cash } else { share })
             }
         }
+    }
+
+    pub(crate) fn cost(&self) -> &Cost {
+        &self.cost
+    }
+
+    pub(crate) fn grid(&self) -> &Grid {
+        &self.grid
     }
 
     pub(crate) fn sized(&self, cash: f64, close: f64, reference: f64) -> Option<f64> {
@@ -1014,6 +1150,33 @@ mod tests {
         // 999999999999999 has 29.
         assert!(dec("9999999999999").mul(dec("9999999999999")).is_some());
         assert!(dec("99999999999999").mul(dec("999999999999999")).is_none());
+    }
+
+    #[test]
+    fn multiplies_as_decimal_rounds() {
+        // Each answer is `Decimal(a) * Decimal(b)` in the default context.
+        for (a, b, product) in [
+            // A replay's fee estimate: a quantity times a 17-digit mark.
+            ("1.087108057343795", "34478.729999999996", "37482.10518998122063191777062"),
+            ("1.7850333321031475", "40367.369999999995", "72057.10097934062437190833948"),
+            ("99999999999999.99", "99999999999999.99", "9999999999999998000000000000"),
+            ("9999999999999999", "99999999999995", "9.999999999999499000000000000E+29"),
+            // Ties to even, either way and either sign.
+            ("1999999999999999999999999999", "25", "4.999999999999999999999999998E+28"),
+            ("1999999999999999999999999997", "25", "4.999999999999999999999999992E+28"),
+            ("-1999999999999999999999999999", "25", "-4.999999999999999999999999998E+28"),
+            // The carry out of the 28th digit.
+            ("8333333333333333333333333333", "12", "1.000000000000000000000000000E+29"),
+            ("-1.5", "3", "-4.5"),
+            ("0.35", "0.001", "0.00035"),
+        ] {
+            let got = dec(a).mul28(dec(b)).unwrap();
+            assert!(same(got, product), "{a} * {b}: {got:?}");
+            assert!(got.c.unsigned_abs() < DIGITS.unsigned_abs());
+        }
+        // Past `i128`, no answer.
+        let big = dec("9999999999999999999999999999");
+        assert!(big.mul28(big).is_none());
     }
 
     fn us_cost() -> Cost {

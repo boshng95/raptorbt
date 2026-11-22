@@ -76,7 +76,7 @@ pub enum Compare {
 
 impl Compare {
     #[inline]
-    fn holds(self, a: f64, b: f64) -> bool {
+    pub(crate) fn holds(self, a: f64, b: f64) -> bool {
         match self {
             Self::Gt => a > b,
             Self::Ge => a >= b,
@@ -192,7 +192,7 @@ impl Tree {
 }
 
 #[inline]
-fn crossed(previous: (f64, f64), a: f64, b: f64, above: bool) -> bool {
+pub(crate) fn crossed(previous: (f64, f64), a: f64, b: f64, above: bool) -> bool {
     let (p0, p1) = previous;
     if above {
         p0 <= p1 && a > b
