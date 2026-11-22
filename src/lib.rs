@@ -103,8 +103,10 @@ fn _raptorbt(py: Python<'_>, m: &PyModule) -> PyResult<()> {
     // replay declines (`loan`'s `contest_bars`). 7: a leg the rules read and
     // never decide on -- a reference leg (`LeanFrame.of_legs`' `decides`).
     // 8: a long-only cash pair, basket or rank on complete instants, many
-    // cells at once (`PortfolioReplay`).
-    m.add("LEAN_REPLAY_VERSION", 8_u32)?;
+    // cells at once (`PortfolioReplay`). 9: a spec over the primary bars
+    // alone, its one leg the primary stream (`LeanFrame.of_primary`), a time
+    // exit counting those bars.
+    m.add("LEAN_REPLAY_VERSION", 9_u32)?;
     m.add_function(wrap_pyfunction!(python::strategy_bindings::resolve_atr_period, m)?)?;
 
     // Register the canonical report of a replay and its exact-arithmetic probes

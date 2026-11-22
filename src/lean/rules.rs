@@ -276,6 +276,11 @@ pub struct Dispatch {
     /// How many of each instant's bars are decided ahead of its primary bar,
     /// which they lead.
     ahead: Vec<usize>,
+    /// Whether the one leg is the primary stream itself ([`Dispatch::of_primary`]):
+    /// a spec over the primary bars alone, every primary bar an instant
+    /// whose leg bar is that primary bar's visit -- there is no other
+    /// (`rule_session`'s `reads_primary`).
+    pub primary: bool,
 }
 
 impl Dispatch {
@@ -394,7 +399,28 @@ impl Dispatch {
             }
         });
         let events = sorted.into_iter().map(|(_, _, _, j, r)| (j, r)).collect();
-        Ok(Self { ts, pos, legs: built, lowest_close, events, starts, ahead })
+        Ok(Self { ts, pos, legs: built, lowest_close, events, starts, ahead, primary: false })
+    }
+
+    /// A frame whose one leg is the primary stream: a spec over the primary
+    /// bars `ts` alone, whose closes are `close`. Each bar is an instant of
+    /// its own, delivered on itself, and its visit -- the leg's bar --
+    /// moves the keys, as `rule_session` visits a spec reading the primary
+    /// stream: once a bar, in the primary bar's phase.
+    pub fn of_primary(ts: Vec<i64>, close: Vec<f64>) -> Result<Self, Declined> {
+        let pos = (0..ts.len()).collect();
+        let leg = LegTerms {
+            ts: ts.clone(),
+            labels: ts.clone(),
+            close,
+            rank: 0,
+            built: false,
+            stream_index: 0,
+            decides: true,
+        };
+        let mut dispatch = Self::of_legs(ts, pos, vec![leg])?;
+        dispatch.primary = true;
+        Ok(dispatch)
     }
 
     /// Instant `u`'s bars as `(leg, bar)` in delivery order, and how many of
@@ -709,13 +735,19 @@ impl<'a> Stream<'a> {
         if risk.trade.is_none() && risk.atr.is_none() && risk.hold.is_none() {
             return Err(Declined("risk policies that name no check"));
         }
-        if risk.hold.is_some_and(|hold| hold.slot == 0 || hold.slot > legs) {
+        // The policies' slots are the rule session's: 0 the primary -- a
+        // primary frame's one leg -- and each resample after it.
+        let slots = if self.d.primary { 0 } else { legs };
+        // A time exit counts a leg's bars: a resample's, or a primary frame's.
+        let counts =
+            |slot: usize| if self.d.primary { slot == 0 } else { (1..=legs).contains(&slot) };
+        if risk.hold.is_some_and(|hold| !counts(hold.slot)) {
             return Err(Declined("a time exit on no resample of the frame"));
         }
         match (risk.atr, policies.atr) {
             (None, None) => {}
             (Some(atr), Some((values, initialized))) => {
-                if atr.slot > legs {
+                if atr.slot > slots {
                     return Err(Declined("an ATR exit on no stream of the frame"));
                 }
                 let n = if atr.slot == 0 { bars } else { self.d.legs[atr.slot - 1].len() };
@@ -1314,7 +1346,12 @@ impl Cursor {
             return None;
         }
         if let (false, Some(policies)) = (primary, &s.policies) {
-            policies.risk.stream(&mut self.policy, 1, bar, s.leg().ahead(bar));
+            if s.d.primary {
+                // The leg's bar is the primary bar.
+                policies.risk.primary(&mut self.policy);
+            } else {
+                policies.risk.stream(&mut self.policy, 1, bar, s.leg().ahead(bar));
+            }
         }
         let (r, entry) = if primary {
             if self.last_primary_label == Some(now) {
@@ -1414,9 +1451,14 @@ impl Cursor {
             )?;
             return Ok((true, target));
         }
-        // One leg: the instant is its bar.
+        // One leg: the instant is its bar -- on a primary frame, the
+        // primary bar's only visit.
         let events: [(bool, usize); 2];
         let events: &[(bool, usize)] = match res {
+            Some(r) if s.d.primary => {
+                events = [(false, r), (false, r)];
+                &events[..1]
+            }
             Some(r) if s.leg().ahead(r) => {
                 events = [(false, r), (true, idx)];
                 &events
@@ -1447,7 +1489,7 @@ impl Cursor {
             {
                 continue;
             }
-            if primary {
+            if primary || s.d.primary {
                 self.visit_primary_after_fill = false;
             }
             // An entry an earlier event decided from flat is still resting:
@@ -1485,7 +1527,7 @@ impl Cursor {
             }
             reference = Some(price);
             if start_side != 0 && previous == start_side && target == 0 {
-                model_exit = Some((price, primary || early));
+                model_exit = Some((price, primary || early || s.d.primary));
             }
             if previous != 0 && target == 0 {
                 latch.close(idx as i64, early, idx as i64);
@@ -1627,17 +1669,19 @@ impl Cursor {
         let mut reference: Option<f64> = None;
         let mut entry_timestamp: Option<i64> = None;
         // The instant's bars decided ahead of the primary bar, the primary
-        // bar (None), and the rest.
+        // bar (None), and the rest; a primary frame's leg bar is the primary
+        // bar's visit, and there is no other.
         let (bars, ahead) = res.map_or((&[][..], 0), |u| s.d.events(u));
+        let own = (!s.d.primary).then_some(None);
         let events = bars[..ahead]
             .iter()
             .map(|&event| Some(event))
-            .chain(std::iter::once(None))
+            .chain(own)
             .chain(bars[ahead..].iter().map(|&event| Some(event)));
         let mut latch = Latch::new(self.close_bar);
         let mut model_exit: Option<(f64, bool)> = None;
         for event in events {
-            let primary = event.is_none();
+            let primary = event.is_none() || s.d.primary;
             let early = event.is_some_and(|(leg, bar)| s.d.legs[leg].ahead(bar));
             latch.step(idx as i64, early, start_side);
             self.clocks.flipped = false;
@@ -1747,7 +1791,12 @@ impl Cursor {
             return Ok(None);
         }
         if let (Some((leg, bar)), Some(policies)) = (event, &s.policies) {
-            policies.risk.stream(&mut self.policy, leg + 1, bar, s.d.legs[leg].ahead(bar));
+            if s.d.primary {
+                // The leg's bar is the primary bar.
+                policies.risk.primary(&mut self.policy);
+            } else {
+                policies.risk.stream(&mut self.policy, leg + 1, bar, s.d.legs[leg].ahead(bar));
+            }
         }
         let mut position = side;
         if position != 0 && s.position_required {

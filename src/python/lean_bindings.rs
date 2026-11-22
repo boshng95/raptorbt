@@ -399,6 +399,20 @@ impl PyLeanFrame {
         Self::framed(&market, &due, dispatch)
     }
 
+    /// A frame whose one leg is *market*'s primary stream itself: a spec
+    /// over the primary bars alone (`NativeModelRunner.primary_decides`),
+    /// each bar an instant delivered on itself, and its visit the leg's
+    /// bar -- the session's only visit of it.
+    #[staticmethod]
+    fn of_primary(
+        market: PyRef<'_, PyLeanMarket>,
+        due: PyReadonlyArray1<'_, i64>,
+    ) -> PyResult<Self> {
+        let dispatch = Dispatch::of_primary(market.market.ts.clone(), market.market.close.clone())
+            .map_err(declined)?;
+        Self::framed(&market, &due, dispatch)
+    }
+
     fn __len__(&self) -> usize {
         self.frame.dispatch.len()
     }

@@ -104,7 +104,8 @@ pub struct AtrExit {
     pub trailing: bool,
 }
 
-/// `NativeHoldExitPolicy`: a time exit counted in bars of resample `slot`.
+/// `NativeHoldExitPolicy`: a time exit counted in bars of resample `slot`,
+/// or of the primary ([`PRIMARY`]) on a session visiting each of them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HoldExit {
     pub slot: usize,
@@ -362,6 +363,16 @@ impl Risk {
         }
     }
 
+    /// `_advance_readiness` of admitted primary bar, for the policies: a
+    /// time exit counting the primary bars (`NativeHoldExitPolicy`'s
+    /// `_stream` None) counts it at once, ahead of the bar's own check. The
+    /// ATR on the primary reads the executing bar itself.
+    pub fn primary(&self, p: &mut PolicyState) {
+        if self.hold.is_some_and(|hold| hold.slot == PRIMARY) {
+            p.hold_counted += 1;
+        }
+    }
+
     /// `NativeModelRunner.apply_policies` for the executing primary bar
     /// `idx`, closing at `current`: checked on the bar -- unless the session
     /// refuses it (`primary`) -- and again once the resample closes it held
@@ -565,9 +576,36 @@ impl Risk {
 #[cfg(test)]
 mod tests {
     use super::{
-        borrow_amount, trade_roi_pct, Account, AtrExit, BorrowView, Charges, PolicyExit,
+        borrow_amount, trade_roi_pct, Account, AtrExit, BorrowView, Charges, HoldExit, PolicyExit,
         PolicyState, Risk, PRIMARY,
     };
+
+    #[test]
+    fn a_time_exit_on_the_primary_counts_each_bar_ahead_of_its_check() {
+        // `NativeHoldExitPolicy` with nothing resampled: each primary bar's
+        // visit counts it before the bar's check, which marks the position
+        // at the first check that sees it and closes once held two bars.
+        let hold = HoldExit { slot: PRIMARY, bars: 2 };
+        let risk = Risk { trade: None, atr: None, hold: Some(hold), fee_rate: 0.0 };
+        let held = Account { quantity: 1.0, entry: 100.0 };
+        let mut p = PolicyState::NEW;
+        let bar = |p: &mut PolicyState, account, idx| {
+            risk.primary(p);
+            risk.apply(None, p, account, idx, 100.0, true)
+        };
+        assert_eq!(bar(&mut p, Account::FLAT, 0), None);
+        assert_eq!(bar(&mut p, held, 1), None);
+        assert_eq!(p.hold_mark, 2);
+        assert_eq!(bar(&mut p, held, 2), None);
+        assert_eq!(bar(&mut p, held, 3), Some(PolicyExit::MaxHold));
+        assert_eq!(bar(&mut p, Account::FLAT, 4), None);
+        assert_eq!(p.hold_mark, -1);
+        // A resample's time exit counts nothing on a primary bar.
+        let resampled = Risk { hold: Some(HoldExit { slot: 1, ..hold }), ..risk };
+        let mut p = PolicyState::NEW;
+        resampled.primary(&mut p);
+        assert_eq!(p.hold_counted, 0);
+    }
 
     #[test]
     fn charges_book_what_the_open_position_paid() {

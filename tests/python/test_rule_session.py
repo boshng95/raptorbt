@@ -120,14 +120,6 @@ def test_a_callback_that_asks_for_the_next_bar_gets_it() -> None:
     [
         ({"reg_rank": []}, "inconsistent rule session layout"),
         ({"slot_close": []}, "inconsistent rule session layout"),
-        (
-            {
-                "key_slot": [0],
-                "key_values": [np.zeros(N)],
-                "key_init": [np.ones(N, np.bool_)],
-            },
-            "reads no primary-stream indicator",
-        ),
         ({"dispatch_positions": np.zeros(1, np.int64)}, "dispatch positions do not match"),
         (
             {"conditions": [(0, [], -1, 0.0, -1, 0.0, 0, 0.0, 0.0)], "exit_roots": []},
@@ -160,6 +152,31 @@ def test_a_callback_that_asks_for_the_next_bar_gets_it() -> None:
 def test_an_inconsistent_layout_is_refused(changes, message) -> None:
     with pytest.raises(ValueError, match=message):
         _rules(**changes)
+
+
+#: Rules over the primary bars alone: one key, on the primary stream.
+READS_PRIMARY = {
+    "key_slot": [0],
+    "key_values": [np.zeros(N)],
+    "key_init": [np.ones(N, np.bool_)],
+}
+#: Risk policies naming only a time exit of five bars on the primary stream.
+HOLD_ON_PRIMARY = (0.0, False, None, None, (0, 5))
+
+
+def test_rules_over_the_primary_bars_are_taken() -> None:
+    # A spec over the primary bars alone moves its operands on each one;
+    # the session visits every primary bar (`VERSION` 7).
+    assert CrossoverRuleSession.VERSION >= 7
+    _rules(**READS_PRIMARY)
+
+
+def test_a_time_exit_counts_the_primary_only_where_the_rules_read_it() -> None:
+    # Visited on every primary bar, such rules have their time exit counted
+    # on those bars; rules that read none count a resample stream's.
+    _rules(**READS_PRIMARY, policies=HOLD_ON_PRIMARY)
+    with pytest.raises(ValueError, match="the time exit counts a resample stream"):
+        _rules(policies=HOLD_ON_PRIMARY)
 
 
 def test_a_condition_tree_is_taken_as_level_rules() -> None:

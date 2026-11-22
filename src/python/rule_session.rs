@@ -818,6 +818,15 @@ impl Data {
         self.legacy && slot != PRIMARY && !self.slot_decision[slot]
     }
 
+    /// Whether the rules read the primary stream's own indicators: then a
+    /// primary bar moves their operands, so none repeats the evaluation
+    /// before it -- each is visited, and its caller dispatches on every one
+    /// (`NativeExecutionSession._dispatch_timestamps`).
+    #[inline]
+    pub(crate) fn reads_primary(&self) -> bool {
+        !self.slot_keys[PRIMARY].is_empty()
+    }
+
     fn reached(&self, state: &State, slot: usize) -> bool {
         if slot == PRIMARY {
             return !state.unready.iter().any(|&u| u);
@@ -973,12 +982,15 @@ impl Data {
             }
         }
         if let Some(policies) = &self.policies {
-            if slot != PRIMARY {
+            if slot == PRIMARY {
+                policies.risk.primary(&mut state.policy);
+            } else {
                 policies.risk.stream(&mut state.policy, slot, bar, phase < PHASE_PRIMARY);
             }
         }
-        // A composite dispatched early first lands its primary bar, which
-        // updates the primary stream's indicators: none, in this lane.
+        // A visit moves the keys of its own stream: a resample's, or the
+        // primary's for a spec over the primary bars alone, which reads no
+        // resample ([`Data::reads_primary`]).
         for &key in &self.slot_keys[slot] {
             state.updates[key] =
                 if view.key_init[key][bar] { Some(view.key_values[key][bar]) } else { None };
@@ -1130,6 +1142,7 @@ impl Data {
             let (early, event_bar) = Self::event_bar(&state.cursor, now, idx);
             latch.step(event_bar, early, start_side);
             if state.cursor.slot == PRIMARY
+                && !self.reads_primary()
                 && !state.visit_primary_after_fill
                 && entry_timestamp != Some(timestamp)
                 && (!self.dust
@@ -1623,6 +1636,7 @@ impl Data {
         let p = &state.policy;
         if from >= end
             || self.level.is_some()
+            || self.reads_primary()
             || state.visit_primary_after_fill
             || state.close_bar >= 0
             || bar.pending.is_some()
@@ -1903,7 +1917,9 @@ fn conditions(
 /// market (`_close_style`); `trade` is `(stop, take_profit)` in per cent;
 /// `atr` is `(slot, values, initialized, stop, take_profit, trailing)`, its
 /// series in that slot's bars; `hold` is `(slot, bars)`, counted in a
-/// resample's bars. Each is `None` where the plan has no such check.
+/// resample's bars, or the primary's on a session that reads them
+/// ([`Data::reads_primary`]), which visits each. Each is `None` where the
+/// plan has no such check.
 type PolicyTuple = (
     f64,
     bool,
@@ -1916,8 +1932,9 @@ type PolicyTuple = (
 /// charged)`.
 type BorrowTuple = (Py<PyArray1<i32>>, Py<PyArray1<i32>>, i32, Py<PyArray1<i64>>);
 
-/// [`Policies`] from their tuple, over `n_slots` slots.
-fn policies(tuple: PolicyTuple, n_slots: usize) -> PyResult<Policies> {
+/// [`Policies`] from their tuple, over `n_slots` slots, on a session that
+/// visits every primary bar where it `reads_primary`.
+fn policies(tuple: PolicyTuple, n_slots: usize, reads_primary: bool) -> PyResult<Policies> {
     let (fee_rate, close_limit, trade, atr, hold) = tuple;
     if trade.is_none() && atr.is_none() && hold.is_none() {
         return Err(PyValueError::new_err("risk policies name no check"));
@@ -1925,8 +1942,10 @@ fn policies(tuple: PolicyTuple, n_slots: usize) -> PyResult<Policies> {
     if atr.as_ref().is_some_and(|(slot, ..)| *slot >= n_slots) {
         return Err(PyValueError::new_err("the ATR exit names an unknown stream"));
     }
-    if hold.is_some_and(|(slot, _)| slot == PRIMARY || slot >= n_slots) {
-        return Err(PyValueError::new_err("the time exit counts a resample stream"));
+    if hold.is_some_and(|(slot, _)| (slot == PRIMARY && !reads_primary) || slot >= n_slots) {
+        return Err(PyValueError::new_err(
+            "the time exit counts a resample stream, or the primary of rules that read it",
+        ));
     }
     let (exit, atr) = match atr {
         Some((slot, values, initialized, stop, take_profit, trailing)) => {
@@ -1990,9 +2009,13 @@ impl PyCrossoverRuleSession {
     /// trade and ATR exits charge, observed on every primary bar and fill.
     /// 6: a bar of a run with risk policies on which none acts is quiet
     /// ([`Data::quiet_bar`]), asked with the account they read
-    /// (`probe_quiet_bar`'s `quantity` and `entry`).
+    /// (`probe_quiet_bar`'s `quantity` and `entry`). 7: indicators on the
+    /// primary stream -- a spec over the primary bars alone, which moves
+    /// its operands on each one, every primary bar a dispatch -- visited on
+    /// every primary bar ([`Data::reads_primary`]), its time exit counting
+    /// them.
     #[classattr]
-    const VERSION: u32 = 6;
+    const VERSION: u32 = 7;
 
     /// A session over crossover rules `exits` and `entries`, or, given
     /// `conditions`, over the rules rooted at `exit_roots` and `entry_roots`
@@ -2080,11 +2103,6 @@ impl PyCrossoverRuleSession {
         for (key, &slot) in key_slot.iter().enumerate() {
             slot_keys[slot].push(key);
         }
-        if !slot_keys[PRIMARY].is_empty() {
-            return Err(PyValueError::new_err(
-                "the rule session reads no primary-stream indicator",
-            ));
-        }
         let regs: Vec<Registration> = (0..n_regs)
             .map(|i| Registration {
                 slot: reg_slots[i],
@@ -2122,7 +2140,9 @@ impl PyCrossoverRuleSession {
             }
         };
         let each_bar = if each_bar { Some(clock_crossings(&arena, n_clocks)?) } else { None };
-        let policies = policies.map(|tuple| self::policies(tuple, n_slots)).transpose()?;
+        let reads_primary = !slot_keys[PRIMARY].is_empty();
+        let policies =
+            policies.map(|tuple| self::policies(tuple, n_slots, reads_primary)).transpose()?;
         if borrow.is_some() && policies.is_none() {
             return Err(PyValueError::new_err("only the risk exits read the borrow"));
         }
