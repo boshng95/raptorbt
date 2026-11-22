@@ -13,6 +13,6 @@ pub use aggregate::{builder_for, builder_for_with, BarBuilder, SourceRecord, IST
 pub use bar_spec::{AggregationUnit, BarSpec, BuilderParams, SourceLabel, SpecError};
 pub use book::{BookLevel, BookSide, DepthTick, OrderBook, BOOK_DEPTH};
 pub use events::{tick_data_to_events, DepthRef, EventPayload, MarketEvent, QuoteTick, TradeTick};
-pub use feed::EventFeed;
+pub use feed::{EventFeed, IndexedEvents};
 pub use flow_bars::{FlowBarBuilder, FlowMagnitude, FlowRule};
 pub use renko::RenkoBarBuilder;

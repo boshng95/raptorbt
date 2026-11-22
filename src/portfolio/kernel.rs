@@ -17,7 +17,7 @@ use crate::core::types::{
 };
 use crate::data::{DepthTick, OrderBook, QuoteTick, TradeTick};
 use crate::execution::algos::AlgoEngine;
-use crate::execution::fill::{FillDepth, FillRng, Tail};
+use crate::execution::fill::{FillDepth, FillRng, FiniteShare, Tail};
 use crate::execution::orders::{
     MatchOutcome, OrderEngine, OrderKind, OrderStatus, QtySpec, TimeInForce, WalkPhase,
 };
@@ -92,6 +92,57 @@ impl BarColumns<'_> {
     #[inline]
     pub fn input(&self, idx: usize) -> StepInput {
         StepInput { atr: self.atr.map_or(0.0, |values| values[idx]), ..StepInput::default() }
+    }
+}
+
+/// A bar series an idle kernel steps a run of in one piece: columns
+/// ([`EngineKernel::step_idle_bars`]) or rows ([`EngineKernel::step_idle_rows`]).
+pub(crate) trait IdleBars {
+    /// Bar `idx`.
+    fn ohlcv(&self, idx: usize) -> OhlcvBar;
+
+    /// The last of bars `start..end` whose volume shows `share` nothing
+    /// finite, as [`FiniteShare::last_failing`] finds it.
+    fn last_without_finite_share(
+        &self,
+        share: FiniteShare,
+        start: usize,
+        end: usize,
+    ) -> Option<usize>;
+}
+
+impl IdleBars for BarColumns<'_> {
+    #[inline]
+    fn ohlcv(&self, idx: usize) -> OhlcvBar {
+        self.bar(idx).to_ohlcv_bar()
+    }
+
+    fn last_without_finite_share(
+        &self,
+        share: FiniteShare,
+        start: usize,
+        end: usize,
+    ) -> Option<usize> {
+        match self.index {
+            Some(index) => index.last_without_finite_share(share, start, end),
+            None => share.last_failing(&self.volume[start..end]).map(|at| start + at),
+        }
+    }
+}
+
+impl IdleBars for [KernelBar] {
+    #[inline]
+    fn ohlcv(&self, idx: usize) -> OhlcvBar {
+        self[idx].to_ohlcv_bar()
+    }
+
+    fn last_without_finite_share(
+        &self,
+        share: FiniteShare,
+        start: usize,
+        end: usize,
+    ) -> Option<usize> {
+        (start..end).rev().find(|&idx| !share.passes(self[idx].volume))
     }
 }
 
@@ -1348,14 +1399,42 @@ impl EngineKernel {
         if let Some((high, low)) = run.range {
             self.ledger.update_price(high, low);
         }
-        self.orders.advance_idle_bars(
-            |idx| bars.bar(idx).to_ohlcv_bar(),
-            bars.volume,
-            bars.index,
-            start,
-            end,
-            &self.fill_model,
-        );
+        self.orders.advance_idle_bars(bars, start, end, &self.fill_model);
+    }
+
+    /// [`Self::step`] over `rows` in turn, each with no signal and no ATR
+    /// ([`StepInput::default`]), for a kernel idle on every bar
+    /// ([`Self::idle_state`], [`Self::idle_at_every_bar`]): the state those
+    /// steps leave, in one piece. A driver merging several instruments'
+    /// rows takes each one's run of them so.
+    ///
+    /// The steps change no money, so nothing they leave reads a close but
+    /// the standing book, set off the run's newest bars; the positions'
+    /// running extremes meet its highest high and lowest low, the first of
+    /// equal ones, as a step at a time keeps.
+    pub(crate) fn step_idle_rows(&mut self, rows: &[KernelBar]) {
+        debug_assert!(self.idle_state() && self.idle_at_every_bar());
+        if rows.is_empty() {
+            return;
+        }
+        self.stepping_trade = false;
+        self.last_atr = StepInput::default().atr;
+        if self.ledger.is_in_position() {
+            let mut extremes = Extremes::EMPTY;
+            for bar in rows {
+                extremes.push(bar.close, bar.high, bar.low);
+            }
+            self.ledger.update_price(extremes.high, extremes.low);
+        }
+        self.orders.advance_idle_bars(rows, 0, rows.len(), &self.fill_model);
+    }
+
+    /// Whether lending the kernel `cash` for a step, and taking it back
+    /// after, moves no money: the kernel holds it to its currency's
+    /// precision, which `cash` already is.
+    #[inline]
+    pub(crate) fn holds_cash_exactly(&self, cash: f64) -> bool {
+        self.quantize_money(cash).to_bits() == cash.to_bits()
     }
 
     /// The margin call this bar's close makes, as `(equity, required)`.

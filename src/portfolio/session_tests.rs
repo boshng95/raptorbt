@@ -1540,3 +1540,199 @@ fn shared_bars_run_as_owned_bars() {
         assert!(stores.iter().all(|store| store.len() == 10), "run {run}");
     }
 }
+
+/// A minute book a few days long for the quiet-run comparison: `len` bars
+/// from `start`, `step` apart with a gap now and then and a repeated stamp
+/// once, closes walking, and odd volumes and extremes a step at a time must
+/// pass over as a run does.
+fn quiet_bars(next: &mut impl FnMut() -> u64, start: i64, step: i64, len: usize) -> Vec<KernelBar> {
+    let mut out = Vec::with_capacity(len);
+    let (mut ts, mut close) = (start, 100.0);
+    for j in 0..len {
+        if j > 0 {
+            ts += match next() % 97 {
+                0 => 0,
+                1..=3 => step * (1 + (next() % 600) as i64),
+                _ => step,
+            };
+        }
+        close = f64::max(close + ((next() % 2001) as f64 - 1000.0) / 1000.0, 1.0);
+        let (high, low) = match next() % 211 {
+            0 => (f64::NAN, close - 0.5),
+            1 => (close + 0.5, f64::NAN),
+            _ => (close + (next() % 100) as f64 / 50.0, close - (next() % 100) as f64 / 50.0),
+        };
+        let volume = match next() % 151 {
+            0 => 0.0,
+            1 => f64::NAN,
+            2 => -1.0,
+            _ => (next() % 5_000) as f64,
+        };
+        out.push(KernelBar { timestamp: ts, open: close, high, low, close, volume });
+    }
+    out
+}
+
+const MINUTE: i64 = 60_000_000_000;
+const HOUR: i64 = 60 * MINUTE;
+const DAY: i64 = 24 * HOUR;
+
+/// Four members -- two on one clock, one starting late on its own, one with
+/// no bars -- under daily marks across an offset change, on a cash or a
+/// margin account, with liquidity bounded by volume or not.
+fn quiet_session(seed: u64, margin: bool, bounded: bool) -> EventSession {
+    let mut state = seed;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let config = BacktestConfig {
+        fees: 0.001,
+        retain_curves: false,
+        compute_metrics: false,
+        retain_daily_performance: true,
+        performance_tz_transitions: vec![(0, 10 * HOUR), (2 * DAY + 13 * HOUR, 11 * HOUR)],
+        bar_volume_slices: if bounded { 4.0 } else { 0.0 },
+        ..BacktestConfig::default()
+    };
+    // Fully funded margin: a geared account watches maintenance at every
+    // event, so it never runs quiet.
+    let account = if margin { AccountMode::Margin { leverage: 1.0 } } else { AccountMode::Cash };
+    let mut session = EventSession::with_account(config, account);
+    for name in ["AAA", "BBB", "CCC", "DDD"] {
+        session.add_instrument(name.into(), Direction::Long, None, None, PositionPolicy::Net);
+    }
+    let len = 6 * 24 * 60;
+    session.set_bars(0, quiet_bars(&mut next, 0, MINUTE, len));
+    session.set_bars(1, quiet_bars(&mut next, 0, MINUTE, len));
+    session.set_bars(2, quiet_bars(&mut next, DAY + 7 * MINUTE, 2 * MINUTE, len / 3));
+    session.seal();
+    session
+}
+
+/// `run_until` an entry at a time, as it ran before quiet runs.
+fn run_until_stepped(
+    session: &mut EventSession,
+    until: Timestamp,
+) -> (Vec<EngineEvent>, Option<Timestamp>) {
+    loop {
+        let Some(entry) = session.current() else { return (Vec::new(), None) };
+        let ts = entry.timestamp();
+        if ts >= until {
+            return (Vec::new(), None);
+        }
+        let events = session.apply_current(StepInput::default());
+        if !events.is_empty() {
+            return (events, Some(ts));
+        }
+    }
+}
+
+/// Drive a session to its end by wakes a minute to two days apart, routing
+/// an order now and then, and log everything it shows on the way.
+fn drive_quiet(session: &mut EventSession, seed: u64, quiet: bool) -> Vec<String> {
+    use crate::execution::orders::{OrderKind, OrderSide, QtySpec, TimeInForce};
+
+    let mut state = seed ^ 0x2545_f491_4f6c_dd1d;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let mut log = Vec::new();
+    let mut until = 0;
+    while let Some(entry) = session.current() {
+        until = until.max(entry.timestamp())
+            + [MINUTE, 7 * MINUTE, 2 * HOUR, DAY, 2 * DAY][(next() % 5) as usize]
+            + (next() % 90) as i64 * MINUTE;
+        loop {
+            let (events, ts) =
+                if quiet { session.run_until(until) } else { run_until_stepped(session, until) };
+            log.push(format!("{events:?} {ts:?}"));
+            if ts.is_none() {
+                break;
+            }
+        }
+        log.push(format!(
+            "{:?} {} {:?} {:?}",
+            session.current().map(|e| (e.instrument, e.local_idx, e.timestamp())),
+            session.remaining(),
+            session.cash(),
+            session.equity(),
+        ));
+        let instrument = (next() % 4) as usize;
+        let Some((idx, bar)) = session.last_seen[instrument] else { continue };
+        let submitted = session.submission_idx(instrument, idx);
+        let (side, qty, kind, stop) = match next() % 6 {
+            0 | 1 => {
+                (OrderSide::Buy, QtySpec::Units((1 + next() % 40) as f64), OrderKind::Market, None)
+            }
+            2 => (OrderSide::Sell, QtySpec::FullPosition, OrderKind::Market, None),
+            3 => (
+                OrderSide::Buy,
+                QtySpec::Units(5.0),
+                OrderKind::Limit { price: bar.close - 0.5 },
+                None,
+            ),
+            // A protective stop holds the kernel to full steps until it goes.
+            4 => (OrderSide::Buy, QtySpec::Units(3.0), OrderKind::Market, Some(bar.close - 3.0)),
+            _ => continue,
+        };
+        session.kernel_mut(instrument).submit_order(
+            side,
+            qty,
+            kind,
+            TimeInForce::Gtc,
+            submitted,
+            bar.timestamp,
+            format!("q{}", log.len()),
+            stop,
+            None,
+        );
+        for i in 0..4 {
+            let events = session.walk_book(i, bar.timestamp, WalkPhase::Walk);
+            log.push(format!("walk {i} {events:?}"));
+        }
+    }
+    log
+}
+
+#[test]
+fn a_quiet_run_leaves_what_its_entries_leave_one_at_a_time() {
+    for seed in [0x9e37_79b9_7f4a_7c15_u64, 0x1234_5678_9abc_def1, 0x0bad_cafe_f00d_d00d] {
+        for margin in [false, true] {
+            for bounded in [false, true] {
+                let mut quiet = quiet_session(seed, margin, bounded);
+                let mut stepped = quiet_session(seed, margin, bounded);
+                let quiet_log = drive_quiet(&mut quiet, seed, true);
+                let stepped_log = drive_quiet(&mut stepped, seed, false);
+                assert!(
+                    quiet.quiet_runs_taken > 20,
+                    "seed {seed:#x} margin {margin} bounded {bounded}: {} quiet runs",
+                    quiet.quiet_runs_taken
+                );
+                assert_eq!(stepped.quiet_runs_taken, 0);
+                assert_eq!(quiet_log.len(), stepped_log.len());
+                for (at, (q, s)) in quiet_log.iter().zip(&stepped_log).enumerate() {
+                    assert_eq!(q, s, "seed {seed:#x} margin {margin} bounded {bounded} step {at}");
+                }
+                for i in 0..4 {
+                    assert_eq!(
+                        format!("{:?}", quiet.kernel(i).position_snapshots()),
+                        format!("{:?}", stepped.kernel(i).position_snapshots()),
+                    );
+                }
+                let (q, s) = (quiet.finish(), stepped.finish());
+                assert!(q
+                    .result
+                    .daily_performance
+                    .as_ref()
+                    .is_some_and(|d| d.timestamps.len() > 4));
+                assert_eq!(format!("{q:?}"), format!("{s:?}"));
+            }
+        }
+    }
+}

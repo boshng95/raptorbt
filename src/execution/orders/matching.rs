@@ -13,7 +13,7 @@ use crate::core::types::{Direction, OhlcvBar, Price, Timestamp};
 use crate::execution::fill::{BarLiquidity, BarTape, FillDepth, FillModel, StepKind};
 use crate::execution::orders::order::{Order, OrderKind, OrderStatus, TimeInForce};
 use crate::execution::orders::OrderSide;
-use crate::portfolio::bar_index::BarIndex;
+use crate::portfolio::kernel::IdleBars;
 
 const NS_PER_DAY: i64 = 86_400_000_000_000;
 
@@ -591,11 +591,9 @@ impl OrderEngine {
     /// Each bar after the first starts from the close of the one before,
     /// where every bar leaves the price, so the book a run of bars leaves
     /// is read off its newest bars instead of stepping them all.
-    pub(crate) fn advance_idle_bars(
+    pub(crate) fn advance_idle_bars<B: IdleBars + ?Sized>(
         &mut self,
-        bar_at: impl Fn(usize) -> OhlcvBar,
-        volume: &[f64],
-        index: Option<&BarIndex>,
+        bars: &B,
         start: usize,
         end: usize,
         fill_model: &FillModel,
@@ -606,6 +604,7 @@ impl OrderEngine {
         if start >= end {
             return;
         }
+        let bar_at = |idx| bars.ohlcv(idx);
         if fill_model.bar_liquidity == BarLiquidity::Unlimited {
             self.deferred_book = None;
             self.tape.set_book(Some((bar_at(end - 1).close, f64::INFINITY)));
@@ -616,14 +615,7 @@ impl OrderEngine {
         // The newest bar with no finite share: walking back, the run ends
         // there if no newer bar prints, and otherwise it is the bar before
         // the printing one that printed the tape last.
-        let unbounded = match index {
-            Some(index) => {
-                index.last_without_finite_share(liquidity.finite_share(grid), start, end)
-            }
-            None => {
-                liquidity.last_without_finite_share(&volume[start..end], grid).map(|at| start + at)
-            }
-        };
+        let unbounded = bars.last_without_finite_share(liquidity.finite_share(grid), start, end);
         for idx in (start..end).rev() {
             let bar = bar_at(idx);
             if unbounded == Some(idx) {

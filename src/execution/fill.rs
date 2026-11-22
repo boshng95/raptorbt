@@ -323,28 +323,6 @@ impl BarLiquidity {
         }
     }
 
-    /// The last of `volumes` without a finite share, as `rposition` over
-    /// [`Self::has_finite_share`] finds it.
-    ///
-    /// Clean data has no such bar, so the search walks every volume it is
-    /// given: it does so a block at a time and without branching inside a
-    /// block, which a per-volume early exit prevents.
-    pub(crate) fn last_without_finite_share(
-        &self,
-        volumes: &[f64],
-        grid: LotGrid,
-    ) -> Option<usize> {
-        match self.finite_share(grid) {
-            FiniteShare::NonNegative => {
-                last_failing(volumes, |volume| (0.0..f64::INFINITY).contains(&volume))
-            }
-            FiniteShare::Positive => {
-                last_failing(volumes, |volume| (volume > 0.0) & (volume < f64::INFINITY))
-            }
-            FiniteShare::Never => volumes.len().checked_sub(1),
-        }
-    }
-
     /// Which volumes [`Self::has_finite_share`] passes on `grid`.
     pub(crate) fn finite_share(&self, grid: LotGrid) -> FiniteShare {
         match *self {
@@ -448,8 +426,38 @@ pub(crate) enum FiniteShare {
     Never,
 }
 
+impl FiniteShare {
+    /// Whether a bar of `volume` shows a finite share.
+    #[inline]
+    pub(crate) fn passes(self, volume: f64) -> bool {
+        match self {
+            Self::NonNegative => (0.0..f64::INFINITY).contains(&volume),
+            Self::Positive => (volume > 0.0) & (volume < f64::INFINITY),
+            Self::Never => false,
+        }
+    }
+
+    /// The last of `volumes` without a finite share, as `rposition` over
+    /// [`Self::passes`] -- [`BarLiquidity::has_finite_share`] -- finds it.
+    ///
+    /// Clean data has no such bar, so the search walks every volume it is
+    /// given: it does so a block at a time and without branching inside a
+    /// block, which a per-volume early exit prevents.
+    pub(crate) fn last_failing(self, volumes: &[f64]) -> Option<usize> {
+        match self {
+            Self::NonNegative => {
+                last_failing(volumes, |volume| (0.0..f64::INFINITY).contains(&volume))
+            }
+            Self::Positive => {
+                last_failing(volumes, |volume| (volume > 0.0) & (volume < f64::INFINITY))
+            }
+            Self::Never => volumes.len().checked_sub(1),
+        }
+    }
+}
+
 /// The last index of `values` that `passes` fails, searched from the end a
-/// block at a time; see [`BarLiquidity::last_without_finite_share`].
+/// block at a time; see [`FiniteShare::last_failing`].
 #[inline]
 fn last_failing(values: &[f64], passes: impl Fn(f64) -> bool) -> Option<usize> {
     const BLOCK: usize = 64;
@@ -977,8 +985,15 @@ mod tests {
                             let rescan = volumes
                                 .iter()
                                 .rposition(|&volume| !liquidity.has_finite_share(volume, grid));
+                            let share = liquidity.finite_share(grid);
                             assert_eq!(
-                                liquidity.last_without_finite_share(&volumes, grid),
+                                share.last_failing(&volumes),
+                                rescan,
+                                "{liquidity:?} {grid:?} len {len} at {at:?} = {bad}",
+                            );
+                            // The one-volume test a row-at-a-time search reads.
+                            assert_eq!(
+                                volumes.iter().rposition(|&volume| !share.passes(volume)),
                                 rescan,
                                 "{liquidity:?} {grid:?} len {len} at {at:?} = {bad}",
                             );

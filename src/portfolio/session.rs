@@ -36,8 +36,8 @@ use crate::core::types::{
     BacktestConfig, BacktestMetrics, BacktestResult, Direction, InstrumentConfig, Timestamp, Trade,
 };
 use crate::data::{
-    tick_data_to_events, DepthRef, DepthTick, EventFeed, EventPayload, MarketEvent, QuoteTick,
-    TradeTick,
+    tick_data_to_events, DepthRef, DepthTick, EventFeed, EventPayload, IndexedEvents, MarketEvent,
+    QuoteTick, TradeTick,
 };
 use crate::execution::orders::WalkPhase;
 use crate::instruments::InstrumentSpec;
@@ -169,6 +169,44 @@ pub struct EventSession {
     /// event; the kill-switch measures its drawdown from here.
     peak_equity: f64,
     sealed: bool,
+    /// Whether the schedule is bars alone, each instrument's read in place
+    /// from its feed slot -- its index -- so a quiet run can pass over them
+    /// (`quiet.rs`).
+    bars_only: bool,
+    /// Quiet runs taken, which a test reads to know it compared one.
+    #[cfg(test)]
+    quiet_runs_taken: usize,
+}
+
+/// One instrument's bars as a feed stream, read in place.
+struct SeriesEvents {
+    bars: Arc<Vec<KernelBar>>,
+    instrument: u32,
+    stream: u32,
+}
+
+impl IndexedEvents for SeriesEvents {
+    #[inline]
+    fn len(&self) -> usize {
+        self.bars.len()
+    }
+
+    #[inline]
+    fn event(&self, at: usize) -> MarketEvent {
+        let b = self.bars[at];
+        MarketEvent {
+            instrument: self.instrument,
+            stream: self.stream,
+            payload: EventPayload::Bar(OhlcvBar {
+                timestamp: b.timestamp,
+                open: b.open,
+                high: b.high,
+                low: b.low,
+                close: b.close,
+                volume: b.volume,
+            }),
+        }
+    }
 }
 
 impl EventSession {
@@ -210,6 +248,9 @@ impl EventSession {
             streaming: StreamingMetrics::new(),
             peak_equity: pool,
             sealed: false,
+            bars_only: false,
+            #[cfg(test)]
+            quiet_runs_taken: 0,
         }
     }
 
@@ -303,28 +344,21 @@ impl EventSession {
         // hand them out from one counter rather than reusing the instrument
         // index (a tick instrument needs three).
         let mut next_stream = 0u32;
-        for (i, bars) in self.bars.iter_mut().enumerate() {
+        // Each instrument's bars take the slot of its index; the session
+        // keeps its handle on them, which a quiet run reads.
+        for (i, bars) in self.bars.iter().enumerate() {
             let stream = next_stream;
             next_stream += 1;
-            let bars = std::mem::take(bars);
             self.local_idx_next[i] += bars.len();
-            let events = (0..bars.len()).map(move |j| {
-                let b = bars[j];
-                MarketEvent {
-                    instrument: i as u32,
-                    stream,
-                    payload: EventPayload::Bar(OhlcvBar {
-                        timestamp: b.timestamp,
-                        open: b.open,
-                        high: b.high,
-                        low: b.low,
-                        close: b.close,
-                        volume: b.volume,
-                    }),
-                }
+            let slot = feed.add_indexed(SeriesEvents {
+                bars: Arc::clone(bars),
+                instrument: i as u32,
+                stream,
             });
-            feed.add_iter(events);
+            debug_assert_eq!(slot, i);
         }
+        self.bars_only =
+            self.ticks.iter().all(Option::is_none) && self.depth_input.iter().all(Vec::is_empty);
         for (i, ticks) in self.ticks.iter_mut().enumerate() {
             let Some(ticks) = ticks.take() else { continue };
             let trade_stream = next_stream;
@@ -543,26 +577,7 @@ impl EventSession {
     /// notionally-locked margin — locks do not debit cash — so the margin arm
     /// does not double-count.
     pub fn equity(&self) -> f64 {
-        match self.account.mode() {
-            AccountMode::Cash => {
-                let positions: f64 = self
-                    .kernels
-                    .iter()
-                    .zip(&self.last_close)
-                    .map(|(k, close)| close.map(|c| k.position_value(c)).unwrap_or(0.0))
-                    .sum();
-                self.account.balance() + positions
-            }
-            AccountMode::Margin { .. } => {
-                let unrealized: f64 = self
-                    .kernels
-                    .iter()
-                    .zip(&self.last_close)
-                    .map(|(k, close)| close.map(|c| k.unrealized_value(c)).unwrap_or(0.0))
-                    .sum();
-                self.account.balance() + unrealized
-            }
-        }
+        equity_of(&self.account, &self.kernels, |i| self.last_close[i])
     }
 
     /// Shared cash balance. In margin mode this includes locked initial
@@ -863,7 +878,15 @@ impl EventSession {
     /// driver can observe and answer that event before any later market data is
     /// consumed.  The cursor has already advanced past the emitting entry and
     /// may therefore point at another entry carrying the same timestamp.
+    ///
+    /// Where nothing can happen on the entries -- every kernel idle on any
+    /// bar and nothing watching the equity between instants -- the entries
+    /// after the instant standing open are taken in one piece
+    /// ([`Self::take_quiet_run`]), to the same state. That holds for the
+    /// whole call once it holds at its start: an idle step leaves a kernel
+    /// idle, and an entry that does anything else emits an event.
     pub fn run_until(&mut self, ts_ns: Timestamp) -> (Vec<EngineEvent>, Option<Timestamp>) {
+        let quiet = self.runs_quiet();
         loop {
             let Some(entry) = self.current() else {
                 return (Vec::new(), None);
@@ -871,6 +894,9 @@ impl EventSession {
             let event_ts = entry.timestamp();
             if event_ts >= ts_ns {
                 return (Vec::new(), None);
+            }
+            if quiet && self.take_quiet_run(ts_ns) {
+                continue;
             }
             let events = self.apply_current(StepInput::default());
             if !events.is_empty() {
@@ -1052,6 +1078,35 @@ impl EventSession {
         SessionOutcome { result, instruments: outcomes, rejected_entries, halted, halted_at }
     }
 }
+
+/// [`EventSession::equity`] with each instrument marked at `close(index)`.
+fn equity_of(
+    account: &SharedAccount,
+    kernels: &[EngineKernel],
+    close: impl Fn(usize) -> Option<f64>,
+) -> f64 {
+    match account.mode() {
+        AccountMode::Cash => {
+            let positions: f64 = kernels
+                .iter()
+                .enumerate()
+                .map(|(i, k)| close(i).map(|c| k.position_value(c)).unwrap_or(0.0))
+                .sum();
+            account.balance() + positions
+        }
+        AccountMode::Margin { .. } => {
+            let unrealized: f64 = kernels
+                .iter()
+                .enumerate()
+                .map(|(i, k)| close(i).map(|c| k.unrealized_value(c)).unwrap_or(0.0))
+                .sum();
+            account.balance() + unrealized
+        }
+    }
+}
+
+#[path = "session_quiet.rs"]
+mod quiet;
 
 #[cfg(test)]
 #[path = "session_tests.rs"]

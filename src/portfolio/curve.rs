@@ -182,6 +182,53 @@ impl InstantCurve {
         self.open = Some(timestamps[last]);
     }
 
+    /// [`Self::close`] each instant of a run as the instant after it
+    /// arrives, at `equity(instant)`, and leave the run's `newest` open: the
+    /// merged-timeline [`Self::close_run`], for instants that are no one
+    /// series' bars.
+    ///
+    /// For a curve that does not record, standing open at the run's first
+    /// instant, which is older than `newest`. The run's instants are read
+    /// through two searches: `first_from(t)`, its first instant at or after
+    /// `t` -- `newest` where none is older -- and `last_before(t)`, its
+    /// newest instant before `t`, asked only of a `t` after the first. As
+    /// [`Self::close_run`], only the samples either side of each day
+    /// boundary are taken: the daily marks keep a day's last, and the
+    /// first of the next is what moves them on.
+    pub(crate) fn close_merged_run(
+        &mut self,
+        newest: i64,
+        first_from: impl Fn(i64) -> i64,
+        last_before: impl Fn(i64) -> i64,
+        mut equity: impl FnMut(i64) -> f64,
+    ) {
+        let oldest = self.open.expect("a merged run closes the instant standing open");
+        debug_assert!(!self.record && oldest < newest);
+        if let Some(daily) = &mut self.daily {
+            // The oldest instant not yet sampled.
+            let mut idx = oldest;
+            loop {
+                let until = daily.same_day_until();
+                let next = if until <= idx { idx } else { first_from(until) };
+                if next > idx {
+                    let last = last_before(next);
+                    daily.observe(last, equity(last));
+                }
+                if next >= newest {
+                    break;
+                }
+                daily.observe(next, equity(next));
+                idx = first_from(next + 1);
+                if idx >= newest {
+                    break;
+                }
+            }
+        }
+        let last = last_before(newest);
+        self.last = Some(equity(last));
+        self.open = Some(newest);
+    }
+
     /// Whether any priced event has been applied yet.
     #[inline]
     pub(crate) fn has_started(&self) -> bool {

@@ -42,10 +42,50 @@ impl Ord for Entry {
     }
 }
 
+/// A time-sorted stream read at any position: one whose events a consumer
+/// can take another way, a run at a time, and have the feed pass over
+/// unread ([`EventFeed::skip_to`]).
+pub trait IndexedEvents: Send {
+    /// Events in the stream.
+    fn len(&self) -> usize;
+
+    /// Whether the stream holds no event.
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The event at `at`, below [`Self::len`].
+    fn event(&self, at: usize) -> MarketEvent;
+}
+
+/// Where one stream's events come from.
+enum Source {
+    /// Pulled in order, once each.
+    Iter(Box<dyn Iterator<Item = MarketEvent> + Send>),
+    /// Read in place; `next` is the first not yet pulled.
+    Indexed { events: Box<dyn IndexedEvents>, next: usize },
+}
+
+impl Source {
+    #[inline]
+    fn pull(&mut self) -> Option<MarketEvent> {
+        match self {
+            Self::Iter(events) => events.next(),
+            Self::Indexed { events, next } => {
+                let at = *next;
+                (at < events.len()).then(|| {
+                    *next = at + 1;
+                    events.event(at)
+                })
+            }
+        }
+    }
+}
+
 /// K-way merge over owned, individually time-sorted event streams.
 #[derive(Default)]
 pub struct EventFeed {
-    streams: Vec<Box<dyn Iterator<Item = MarketEvent> + Send>>,
+    streams: Vec<Source>,
     remaining: usize,
     heap: BinaryHeap<Entry>,
     cursors: Vec<usize>,
@@ -76,9 +116,68 @@ impl EventFeed {
     ) -> usize {
         self.remaining += events.len();
         let slot = self.streams.len();
-        self.streams.push(Box::new(events));
+        self.streams.push(Source::Iter(Box::new(events)));
         self.cursors.push(0);
         slot
+    }
+
+    /// Register one time-sorted stream read in place; returns its slot
+    /// index. Its events merge as any stream's do, and [`Self::skip_to`] can
+    /// pass over a run of them.
+    pub fn add_indexed(&mut self, events: impl IndexedEvents + 'static) -> usize {
+        debug_assert!(
+            (1..events.len())
+                .all(|at| events.event(at - 1).timestamp() <= events.event(at).timestamp()),
+            "stream must be time-sorted"
+        );
+        self.remaining += events.len();
+        let slot = self.streams.len();
+        self.streams.push(Source::Indexed { events: Box::new(events), next: 0 });
+        self.cursors.push(0);
+        slot
+    }
+
+    /// Pass over events unread: each `(slot, at)` makes the `at`-th event of
+    /// that indexed stream its next to deliver, the ones before it never
+    /// delivered. `at` is no earlier than the slot's next undelivered event
+    /// and no later than its end; the merge order of everything still to
+    /// come is what it would have been had the skipped events been
+    /// delivered.
+    pub fn skip_to(&mut self, targets: &[(usize, usize)]) {
+        if targets.is_empty() {
+            return;
+        }
+        if !self.primed {
+            self.prime();
+        }
+        // A primed feed holds the next undelivered event of every stream
+        // that has one in its heap: a skipped stream's leaves it, the events
+        // from it up to `at` are never delivered, and the stream's `at`-th
+        // takes its place.
+        let mut entries = std::mem::take(&mut self.heap).into_vec();
+        let remaining = &mut self.remaining;
+        entries.retain(|entry| {
+            match targets.iter().find(|&&(slot, _)| slot == entry.stream_slot) {
+                Some(&(_, at)) => {
+                    debug_assert!(at >= entry.seq, "a skip cannot move a stream back");
+                    *remaining -= at - entry.seq;
+                    false
+                }
+                None => true,
+            }
+        });
+        self.heap = BinaryHeap::from(entries);
+        for &(slot, at) in targets {
+            let Source::Indexed { events, next } = &mut self.streams[slot] else {
+                panic!("only an indexed stream can be skipped");
+            };
+            // A stream with no heap entry has delivered everything, and is
+            // skipped to its end: it stays so.
+            debug_assert!(at <= events.len(), "a skip past a stream's end");
+            *next = at;
+            self.cursors[slot] = at;
+            self.advance(slot);
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -97,7 +196,7 @@ impl EventFeed {
     }
 
     fn advance(&mut self, slot: usize) {
-        if let Some(event) = self.streams[slot].next() {
+        if let Some(event) = self.streams[slot].pull() {
             let seq = self.cursors[slot];
             self.cursors[slot] += 1;
             self.heap.push(Entry { event, stream_slot: slot, seq });
