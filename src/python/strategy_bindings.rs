@@ -337,9 +337,11 @@ impl PyKernelSession {
     /// 1: a long-only replay. 2: a short node's (`shorts`), whose entries
     /// sell to open through a durable short target. 3: its loan clock names
     /// the bar a composite contests a loan on too (`cover`), which the
-    /// replay declines.
+    /// replay declines. 4: an exit, stop or loan cover drops a short target
+    /// it trades against, and a target's expansion is offered at the end of
+    /// the bar's step, after its decisions.
     #[classattr]
-    const REPLAY_VERSION: u32 = 3;
+    const REPLAY_VERSION: u32 = 4;
 
     #[new]
     #[pyo3(signature = (symbol="ASSET", direction=1, config=None, instrument_config=None, instrument=None,

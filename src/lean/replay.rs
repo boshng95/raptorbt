@@ -177,6 +177,13 @@ struct Replay<'a> {
     /// `_pending_order_style`: how the pending close is ordered.
     pending_order_style: OrderStyle,
     last_exit_ts: i64,
+    /// `_last_submit_ts`: the bar any order of the replay's last reached the
+    /// venue on. What a bar's step sent is still unresolved when Nautilus
+    /// ends the step, however it fared here.
+    last_submit_ts: i64,
+    /// `_target_step_due`: set by a bar's reconcile, spent at the end of its
+    /// step ([`Self::finish_target_step`]).
+    target_step_due: bool,
     cash_halted: bool,
     working_orders: i64,
     bar_callback_required: bool,
@@ -299,6 +306,8 @@ pub(crate) fn replay(
         pending_reference: 0.0,
         pending_order_style: OrderStyle::Default,
         last_exit_ts: -1,
+        last_submit_ts: -1,
+        target_step_due: false,
         cash_halted: false,
         working_orders: 0,
         // The first callback checks cash and establishes whether quiet bars
@@ -818,6 +827,17 @@ impl Replay<'_> {
             }
             flat_cash_safe = funds >= q.need_at_highest;
         }
+        // Behind the halt, as there: the book it leaves is the one the bars
+        // after this are asked about.
+        let (has_position, net_position, flat, cash_flat) =
+            if self.target_step_due && self.finish_target_step(i)? {
+                let (has_position, net_position) = self.k.net_position();
+                let flat = !has_position;
+                let cash_flat = flat || self.holds_flat_dust(i, has_position, net_position);
+                (has_position, net_position, flat, cash_flat)
+            } else {
+                (has_position, net_position, flat, cash_flat)
+            };
         // What the bars a sparse callback steps past before the next
         // composite can do is asked only of a run that defers them: one with
         // risk checks has every bar called back, each asked on its own.
@@ -934,13 +954,12 @@ impl Replay<'_> {
             if target_side != 0 {
                 return Err(Declined("a reversal"));
             }
-            if self.shorts.is_some() && self.pending_target.is_some_and(|t| t != 0.0) {
-                // A cover beside a short target still pending: an entry that
-                // filled in part. `create_order` latches no `_pending_flat`
-                // while a signed target is out -- the target owns the
-                // retries -- so nothing is retargeted here. Once the cover
-                // fills, the target's continuation sells its residual again,
-                // priced off this bar.
+            if self.pending_target.is_some_and(|t| t != 0.0 && (t > 0.0) != (held_side > 0)) {
+                // A close part way through a reversal, which moves the book
+                // toward the far side and stops short of it: the target
+                // stands (`_supersede_pending_signed_target`). No replay here
+                // reverses, so this is the original's shape kept whole. Every
+                // other close supersedes what is out, below.
                 if self.submit_exit(i, reference, None, style)? {
                     self.pending_reference = reference;
                 }
@@ -965,22 +984,28 @@ impl Replay<'_> {
                 None => false,
             };
             let submitted = self.submit_exit(i, reference, None, style)? || preceded;
-            if !submitted
-                && risk_exit
-                && self.exit_gated
-                && (previous.0.is_none() || self.shorts.is_none())
-            {
+            if submitted {
+                return Ok(());
+            }
+            if risk_exit && self.exit_gated {
                 // `run_decision` refuses the bar's own orders on a shut venue
                 // before `create_order` latches anything, but a risk check
-                // runs outside it: its close latches the pending flat, then
-                // `submit_order` meets the bell. The next primary bar's
-                // `_reconcile_exit` resends it in the configured close type.
+                // runs outside it: its close supersedes any target and
+                // latches the pending flat, then `submit_order` meets the
+                // bell. The next primary bar's `_reconcile_exit` resends it
+                // in the configured close type.
                 self.pending_order_style = OrderStyle::Default;
-            } else if !submitted {
+            } else if previous.0.is_some() && (risk_exit || self.gate.is_none_or(|g| g[i])) {
+                // A close that reached `create_order` and stopped at
+                // instrument preflight: it superseded the target there all
+                // the same, and latched nothing in its place.
+                self.drop_target();
+            } else {
                 // A rule session's close is one attempt (`create_order`; its
                 // intents do not `persist_if_unsubmitted`): one the venue's
-                // hours refuse, or preflight, is dropped, and whatever target
-                // was in flight before it stands -- `_submit_native_intent`.
+                // hours refuse before `create_order` is dropped, and whatever
+                // target was in flight before it stands --
+                // `_submit_native_intent`.
                 (
                     self.pending_target,
                     self.pending_reference,
@@ -1073,6 +1098,7 @@ impl Replay<'_> {
         };
         self.submit(buy, units, (!market).then_some(limit_price), tif, true, decided_ns)?;
         self.last_exit_ts = decided_ns;
+        self.last_submit_ts = decided_ns;
         self.working_orders += 1;
         Ok(true)
     }
@@ -1138,6 +1164,7 @@ impl Replay<'_> {
             self.short_attempts += 1;
         }
         self.working_entry = true;
+        self.last_submit_ts = decided_ns;
         self.working_orders += 1;
         Ok(true)
     }
@@ -1229,7 +1256,15 @@ impl Replay<'_> {
         self.target_bar_ts = -1;
     }
 
-    fn continue_target(&mut self, i: usize, reference: f64) -> Result<bool, Declined> {
+    /// `_continue_target`: one move toward the pending target -- reductions
+    /// unless `reduce` is false, expansions unless `expand` is.
+    fn continue_target(
+        &mut self,
+        i: usize,
+        reference: f64,
+        reduce: bool,
+        expand: bool,
+    ) -> Result<bool, Declined> {
         if self.cash_halted {
             return Ok(false);
         }
@@ -1245,6 +1280,9 @@ impl Replay<'_> {
         if held != 0.0 && (target == 0.0 || (held > 0.0) != (target > 0.0)) {
             // Wrong side of the target, or anything held when it is flat:
             // reduce first, and to flat.
+            if !reduce {
+                return Ok(false);
+            }
             let submitted = self.submit_exit(i, reference, None, self.pending_order_style)?;
             if submitted {
                 self.pending_reference = reference;
@@ -1252,6 +1290,9 @@ impl Replay<'_> {
             return Ok(submitted);
         }
         if held != 0.0 && target.abs() < held.abs() {
+            if !reduce {
+                return Ok(false);
+            }
             let submitted = self.submit_exit(
                 i,
                 reference,
@@ -1262,6 +1303,9 @@ impl Replay<'_> {
                 self.pending_reference = reference;
             }
             return Ok(submitted);
+        }
+        if !expand {
+            return Ok(false);
         }
         // A long-only replay's only target is flat, which the branches above
         // settle whatever the book holds; a short node's is short of it.
@@ -1306,7 +1350,10 @@ impl Replay<'_> {
             return Ok(false);
         }
         let closing = self.pending_target == Some(0.0);
-        let submitted = self.continue_target(i, self.m.close[i])?;
+        // Only what reduces the book, ahead of the decision; what adds to it
+        // waits for the end of the step.
+        self.target_step_due = true;
+        let submitted = self.continue_target(i, self.m.close[i], true, false)?;
         if submitted && closing {
             // `_reconcile_exit` resends it under the strategy's pending
             // close, which stands until the next bar's reconcile finds the
@@ -1314,6 +1361,18 @@ impl Replay<'_> {
             self.cursor.note_close(i);
         }
         Ok(submitted)
+    }
+
+    /// `_finish_target_step`: what the target still adds, offered once the
+    /// bar has decided and its risk checks have run -- unless an order went
+    /// out this bar, which Nautilus still holds unresolved at the end of the
+    /// step. Returns whether an order reached the venue.
+    fn finish_target_step(&mut self, i: usize) -> Result<bool, Declined> {
+        self.target_step_due = false;
+        if self.last_submit_ts == self.m.ts[i] {
+            return Ok(false);
+        }
+        self.continue_target(i, self.m.close[i], false, true)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1353,7 +1412,7 @@ impl Replay<'_> {
         self.cursor.visit_primary_after_fill = true;
         if leaves <= 0.0 {
             self.working_orders = (self.working_orders - 1).max(0);
-            self.continue_target(at, self.pending_reference)?;
+            self.continue_target(at, self.pending_reference, true, true)?;
         }
         self.bar_callback_required = true;
         Ok(())
@@ -1431,7 +1490,10 @@ impl Replay<'_> {
             self.target_bar_ts,
             self.short_attempts,
         );
-        let latches = self.pending_target.is_none();
+        // Short here, so a short target is one the cover trades against, or
+        // past: it supersedes that, and latches the close in its place.
+        let supersedes = self.pending_target.is_some_and(|t| t < 0.0);
+        let latches = self.pending_target.is_none() || supersedes;
         if latches {
             self.retarget(Some(0.0));
             self.pending_reference = reference;
@@ -1442,6 +1504,12 @@ impl Replay<'_> {
         self.exit_gated = false;
         if self.submit_exit(i, reference, None, OrderStyle::Default)? || !latches || self.exit_gated
         {
+            return Ok(());
+        }
+        if supersedes {
+            // Refused at instrument preflight, past the point where
+            // `create_order` dropped the target.
+            self.drop_target();
             return Ok(());
         }
         (

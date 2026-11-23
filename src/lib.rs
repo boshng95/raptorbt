@@ -105,8 +105,10 @@ fn _raptorbt(py: Python<'_>, m: &PyModule) -> PyResult<()> {
     // 8: a long-only cash pair, basket or rank on complete instants, many
     // cells at once (`PortfolioReplay`). 9: a spec over the primary bars
     // alone, its one leg the primary stream (`LeanFrame.of_primary`), a time
-    // exit counting those bars.
-    m.add("LEAN_REPLAY_VERSION", 9_u32)?;
+    // exit counting those bars. 10: an exit, stop or loan cover drops a
+    // short target it trades against, and a target's expansion is offered
+    // at the end of the bar's step, after its decisions.
+    m.add("LEAN_REPLAY_VERSION", 10_u32)?;
     m.add_function(wrap_pyfunction!(python::strategy_bindings::resolve_atr_period, m)?)?;
 
     // Register the canonical report of a replay and its exact-arithmetic probes
