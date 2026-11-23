@@ -25,7 +25,7 @@ use super::bindings::{
 use super::fill_ledger::{or_zero, BookTerms, Ledger, PyReplayLedger};
 use super::instrument_bindings::PyInstrumentSpec;
 use super::money::PyMoneyModel;
-use super::replay_session::{replay, Money, Shorts, Venue};
+use super::replay_session::{replay, Money, Resting, Shorts, Venue};
 use super::rule_session::{PyCrossoverRuleSession, QuietBar, QuietParams, QuietTuple, RuleStepper};
 use crate::stops::policies::Account;
 
@@ -340,9 +340,12 @@ impl PyKernelSession {
     /// replay declines. 4: an exit, stop or loan cover drops a short target
     /// it trades against, and a target's expansion is offered at the end of
     /// the bar's step, after its decisions. 5: the bar's own sale on a shut
-    /// venue latches no target.
+    /// venue latches no target. 6: a long close left resting by a gap is
+    /// canceled for drift on the next bar and re-sent once (`resting`), as
+    /// `StrategyBase._check_stale_day_orders` does. 7: one within the drift
+    /// is waited on until a bar's range fills it, as there.
     #[classattr]
-    const REPLAY_VERSION: u32 = 5;
+    const REPLAY_VERSION: u32 = 7;
 
     #[new]
     #[pyo3(signature = (symbol="ASSET", direction=1, config=None, instrument_config=None, instrument=None,
@@ -580,10 +583,14 @@ impl PyKernelSession {
     /// admission)`, with `refusal(decided_ns, units, position, opened_ns) ->
     /// bool`, `cover(filled_ns) -> (int, int)` (the cover bar and the bar a
     /// composite contests the loan on) and `admission` the bars the loan
-    /// clock is asked on, each None where the run has none.
+    /// clock is asked on, each None where the run has none. `resting`,
+    /// given, is `(stale_close_pct, max_close_retries)`: the replay then
+    /// works a long close a gap left resting as `StrategyBase` does, where
+    /// it would decline otherwise.
     #[pyo3(signature = (
         timestamps, open, high, low, close, volume, atr, mask, rules, quiet, venue,
         units, snap, affordable, exhausted, gate=None, money=None, book=None, shorts=None,
+        resting=None,
     ))]
     #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     fn replay_rules(
@@ -608,6 +615,7 @@ impl PyKernelSession {
         money: Option<PyRef<'_, PyMoneyModel>>,
         book: Option<(f64, u32, f64, usize, usize, String)>,
         shorts: Option<ShortsTuple<'_>>,
+        resting: Option<(f64, u32)>,
     ) -> PyResult<PyObject> {
         let bars =
             BarArrays::new(py, &timestamps, &open, &high, &low, &close, &volume, atr.as_ref())?;
@@ -691,6 +699,10 @@ impl PyKernelSession {
             venue,
             money,
             shorts,
+            resting.map(|(stale_close_pct, max_close_retries)| Resting {
+                stale_close_pct,
+                max_close_retries,
+            }),
             ledger,
         )?;
         if booked {

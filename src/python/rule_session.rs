@@ -1163,14 +1163,11 @@ impl Data {
             // An entry an earlier visit at this instant decided from flat is
             // still resting: the rules run their exit clocks over it, and
             // whatever they decide finds nothing to act on -- an exit has no
-            // position to sell, an entry the side already decided. Only the
-            // lane that visits every bar has the visit: on the deferred one
-            // it moves a clock early to where the next visit takes it anyway.
-            let resting = if policies.is_some()
-                && start_side == 0
-                && target != 0
-                && entry_timestamp == Some(timestamp)
-            {
+            // position to sell, an entry the side already decided. Every
+            // lane has the visit: a crossover a rule works out only where it
+            // checks it is spent there, so the visit after the fill finds it
+            // already taken.
+            let resting = if start_side == 0 && target != 0 && entry_timestamp == Some(timestamp) {
                 target
             } else {
                 0
@@ -1371,11 +1368,7 @@ impl Data {
             state.flipped = false;
             // An entry decided from flat earlier at this instant, still
             // resting: see `advance`.
-            let resting = if !deferred
-                && start_side == 0
-                && target != 0
-                && entry_timestamp == Some(timestamp)
-            {
+            let resting = if start_side == 0 && target != 0 && entry_timestamp == Some(timestamp) {
                 target
             } else {
                 0
@@ -2013,9 +2006,12 @@ impl PyCrossoverRuleSession {
     /// primary stream -- a spec over the primary bars alone, which moves
     /// its operands on each one, every primary bar a dispatch -- visited on
     /// every primary bar ([`Data::reads_primary`]), its time exit counting
-    /// them.
+    /// them. 8: an entry a visit decided from flat is read as held by the
+    /// later visits of its instant on both lanes, the deferred one too, as
+    /// `StrategyBase` reads it: a crossover an exit spends there no longer
+    /// sells on the next bar.
     #[classattr]
-    const VERSION: u32 = 7;
+    const VERSION: u32 = 8;
 
     /// A session over crossover rules `exits` and `entries`, or, given
     /// `conditions`, over the rules rooted at `exit_roots` and `entry_roots`

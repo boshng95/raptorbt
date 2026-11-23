@@ -1543,13 +1543,9 @@ impl Cursor {
             }
             // An entry an earlier event decided from flat is still resting:
             // the rules run their exit clock over it, and whatever they
-            // decide finds nothing to act on. Only the lane that visits every
-            // bar has the visit.
-            let resting = if policies.is_some()
-                && start_side == 0
-                && target != 0
-                && entry_timestamp == Some(now)
-            {
+            // decide finds nothing to act on. Every lane has the visit, as
+            // the rule session's (`advance`).
+            let resting = if start_side == 0 && target != 0 && entry_timestamp == Some(now) {
                 target
             } else {
                 0
@@ -1736,12 +1732,11 @@ impl Cursor {
             self.clocks.flipped = false;
             // An entry decided from flat earlier at this instant, still
             // resting: see `advance`.
-            let resting =
-                if !deferred && start_side == 0 && target != 0 && entry_timestamp == Some(now) {
-                    target
-                } else {
-                    0
-                };
+            let resting = if start_side == 0 && target != 0 && entry_timestamp == Some(now) {
+                target
+            } else {
+                0
+            };
             let intent = self.level_visit(
                 s, tree, close, event, idx, now, held_side, quantity, pending, resting,
             )?;

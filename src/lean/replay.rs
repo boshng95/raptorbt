@@ -26,7 +26,7 @@ use super::rules::{segment_highs, side_of, Cursor, Dispatch, Highs, Stream, Targ
 use super::Declined;
 use crate::python::fill_ledger::{money, or_zero, BookTerms, EndStatus, Ledger, OrderRecord};
 use crate::python::money::PyMoneyModel;
-use crate::python::replay_session::Venue;
+use crate::python::replay_session::{Resting, Venue};
 use crate::python::rule_session::{money_as_double, QuietParams};
 use crate::stops::policies::{Account, OrderStyle};
 
@@ -80,6 +80,8 @@ pub(crate) struct Cell<'a> {
     pub jumps: bool,
     /// A short node's terms; None for a long one, whose stream enters long.
     pub shorts: Option<&'a Shorts<'a>>,
+    /// How an exit left resting is worked; None declines every one.
+    pub resting: Option<Resting>,
 }
 
 /// A short node's terms, beyond [`Venue`]'s: `python::replay_session`'s
@@ -164,6 +166,7 @@ struct Replay<'a> {
     venue: &'a Venue,
     money: &'a PyMoneyModel,
     shorts: Option<&'a Shorts<'a>>,
+    resting: Option<Resting>,
 
     // `SignalReplay`'s own state, under its own names.
     working_entry: bool,
@@ -203,10 +206,25 @@ struct Replay<'a> {
     /// them, and what each changed of the shares held short.
     filled_position: f64,
     short_deltas: Vec<(usize, i64)>,
+    /// `_close_retries`: the stale closes re-sent since the book was last
+    /// left flat by a fill.
+    close_retries: u32,
+    /// `_stale_cancels`: the kernel id of the exit canceled for drift, whose
+    /// cancel re-sends it.
+    stale_cancel: Option<usize>,
+    /// `_stale_ts`: the bar that exit was canceled on, -1 for none.
+    stale_ts: i64,
+    /// An exit it waits on: the last bar it was worked on, the last it
+    /// waited on, and the last whose range could fill it, -1 for none.
+    rest_seen_ts: i64,
+    rest_wait_ts: i64,
+    rest_fill_ts: i64,
 
     // The driver's.
     order_seq: u64,
     commands: Vec<Submit>,
+    /// The cancels queued beside them, by kernel id.
+    cancels: Vec<usize>,
     budget_ts: Option<i64>,
     budget_actions: usize,
 
@@ -298,6 +316,7 @@ pub(crate) fn replay(
         venue: cell.venue,
         money: cell.money,
         shorts: cell.shorts,
+        resting: cell.resting,
         working_entry: false,
         orders: Vec::new(),
         pending_target: None,
@@ -321,8 +340,15 @@ pub(crate) fn replay(
         loan_contest_bar: -1,
         filled_position: 0.0,
         short_deltas: Vec::new(),
+        close_retries: 0,
+        stale_cancel: None,
+        stale_ts: -1,
+        rest_seen_ts: -1,
+        rest_wait_ts: -1,
+        rest_fill_ts: -1,
         order_seq: cell.venue.first_order_seq,
         commands: Vec::new(),
+        cancels: Vec::new(),
         budget_ts: None,
         budget_actions: 0,
         jumps: cell.jumps,
@@ -413,6 +439,7 @@ impl Replay<'_> {
                 && !self.bar_callback_required
                 && self.advanced.is_none()
                 && self.commands.is_empty()
+                && self.cancels.is_empty()
                 && self.k.idle()
             {
                 let to = self.quiet_until(i, next_due)?;
@@ -437,7 +464,7 @@ impl Replay<'_> {
             }
             if due || self.bar_callback_required {
                 self.callbacks += 1;
-                self.on_bar(i)?;
+                self.on_bar(i, due)?;
             }
             self.stepped += 1;
             self.apply_commands(i)?;
@@ -676,6 +703,10 @@ impl Replay<'_> {
 
     /// `apply_commands`: send what the strategy queued, and say whether it
     /// queued anything.
+    ///
+    /// A cancel is queued only by a bar's stale check, ahead of anything else
+    /// the bar could queue, so the cancels go first -- and, its report still
+    /// pending, leave nothing to reclaim.
     fn apply_commands(&mut self, i: usize) -> Result<bool, Declined> {
         let mut commands = std::mem::take(&mut self.commands);
         let now = self.m.ts[i];
@@ -683,9 +714,13 @@ impl Replay<'_> {
             self.budget_ts = Some(now);
             self.budget_actions = 0;
         }
-        self.budget_actions += commands.len();
+        self.budget_actions += commands.len() + self.cancels.len();
         if self.budget_actions > self.venue.max_actions_per_timestamp {
             return Err(Declined("execution did not quiesce within its action budget"));
+        }
+        let cancelled = !self.cancels.is_empty();
+        for id in self.cancels.drain(..) {
+            self.k.cancel(id);
         }
         // A tally names no order by its kernel id: once none is live, the
         // kernel's orders and the map to them start over, so a replay that
@@ -706,7 +741,7 @@ impl Replay<'_> {
             debug_assert_eq!(id, self.orders.len());
             self.orders.push((command.ledger_index, command.buy));
         }
-        let queued = !commands.is_empty();
+        let queued = !commands.is_empty() || cancelled;
         // Nothing queues while the kernel takes them; the buffer goes back
         // empty, its capacity kept.
         commands.clear();
@@ -744,8 +779,21 @@ impl Replay<'_> {
                 Event::Canceled(id) => {
                     self.end_order(at, id, EndStatus::Canceled);
                     order_fill_preceded = false;
+                    if self.stale_cancel == Some(id) {
+                        self.stale_cancel = None;
+                        self.retry_stale_exit(at)?;
+                    }
                 }
                 Event::Expired(id) => {
+                    if self.k.reduce_only(id) {
+                        // `on_order_expired` retries a close at once
+                        // (`_handle_ioc_close_expiry`); this would re-offer
+                        // it from the next bar instead.
+                        return Err(Declined(
+                            "a working exit expired, which StrategyBase retries at once and \
+                             the native lane does not model",
+                        ));
+                    }
                     self.end_order(at, id, EndStatus::Expired);
                     order_fill_preceded = false;
                 }
@@ -760,12 +808,11 @@ impl Replay<'_> {
 
     // -- the strategy: `SignalReplay` ---------------------------------------
 
-    fn on_bar(&mut self, i: usize) -> Result<(), Declined> {
-        // `_refuse_resting_exit`: asked first, ahead of anything that could
+    /// `due`: the rules are called on bar `i`.
+    fn on_bar(&mut self, i: usize, due: bool) -> Result<(), Declined> {
+        // `_work_resting_exit`: asked first, ahead of anything that could
         // send beside it.
-        if self.k.resting_exit(self.m.ts[i]) {
-            return Err(Declined("an exit outlived the bar it met"));
-        }
+        self.work_resting_exit(i, due)?;
         // `_refuse_contested_loan`: a composite's check of the loan held
         // comes ahead of anything this bar does.
         if usize::try_from(self.loan_contest_bar).is_ok_and(|at| at <= i) {
@@ -787,10 +834,13 @@ impl Replay<'_> {
         }
         let reconciled =
             if self.pending_target.is_some() { self.reconcile_target(i)? } else { false };
-        let target = match advanced {
+        let mut target = match advanced {
             Some(target) => target,
             None => self.advance(i, true)?,
         };
+        if self.stale_ts == self.m.ts[i] || self.rest_wait_ts == self.m.ts[i] {
+            target = self.absorb_close_on_cancel(i, target)?;
+        }
         // Reconciling stands in for the bar's own decision, not for its risk
         // checks: `handle_bar` runs those whatever the reconcile chased.
         let policy_acted = target.is_some_and(|t| t.policy.is_some());
@@ -861,6 +911,165 @@ impl Replay<'_> {
                     self.pending_target,
                 ))
             || self.loan_due(i);
+        Ok(())
+    }
+
+    /// `_work_resting_exit`: `StrategyBase._check_stale_day_orders` on a
+    /// primary bar, where the replay follows it ([`Resting`]); [`Declined`]
+    /// where not. `python::replay_session`'s, line for line.
+    ///
+    /// Asked first in every callback. There `_reconcile_exit` runs first
+    /// and, finding the close still pending, sends nothing but leaves the
+    /// pending close latched through the bar (`note_close`); the stale check
+    /// then cancels the exit, and the venue's report of the cancel re-sends
+    /// it ([`Self::retry_stale_exit`]). Within the drift the check waits on,
+    /// it leaves the exit working instead, and the bar's decision finds the
+    /// close pending ([`Self::absorb_close_on_cancel`]).
+    ///
+    /// Nautilus offers a resting order the bar's range before the strategy
+    /// hears of the bar, and this kernel after its callback: so a bar whose
+    /// range reaches the exit and whose close has drifted is declined, being
+    /// one on which Nautilus fills it rather than cancels it. Within the
+    /// drift neither cancels, and the fill lands either side of a callback
+    /// that must then act on nothing: no decision lands on the bar (`due`),
+    /// the bar decides nothing, and the flat book's cash check -- Nautilus's,
+    /// on that bar, after the fill -- cannot halt ([`Self::on_order_filled`]).
+    fn work_resting_exit(&mut self, i: usize, due: bool) -> Result<(), Declined> {
+        let now = self.m.ts[i];
+        if !self.k.resting_exit(now) {
+            return Ok(());
+        }
+        let Some(terms) = self.resting else {
+            return Err(Declined("an exit outlived the bar it met"));
+        };
+        if self.shorts.is_some() {
+            return Err(Declined(
+                "an exit outlived the bar it met: not on a long-only native runtime",
+            ));
+        }
+        let mut exits = self.k.working_exits();
+        let (Some(order), None) = (exits.next(), exits.next()) else {
+            return Err(Declined(
+                "an exit outlived the bar it met: another order is working beside it",
+            ));
+        };
+        if self.working_orders != 1 {
+            return Err(Declined(
+                "an exit outlived the bar it met: another order is working beside it",
+            ));
+        }
+        let (Some(price), Tif::Day) = (order.limit, order.tif) else {
+            return Err(Declined("an exit outlived the bar it met: it is not a DAY limit"));
+        };
+        if self.pending_target != Some(0.0) || self.pending_order_style != OrderStyle::Default {
+            // The retry is `create_order`'s, in the config's order type: a
+            // target carrying a shape of its own is not.
+            return Err(Declined(
+                "an exit outlived the bar it met: it closes to no flat target in the default \
+                 order type",
+            ));
+        }
+        if now - order.at_ts.max(self.rest_seen_ts) > self.venue.bar_ns {
+            return Err(Declined(
+                "an exit outlived the bar it met: it is met again only after a gap",
+            ));
+        }
+        let (has_position, net_position) = self.k.net_position();
+        let held = if has_position { net_position } else { 0.0 };
+        if held <= 0.0 || held != order.units {
+            return Err(Declined(
+                "an exit outlived the bar it met: it is partly filled, or not a long close",
+            ));
+        }
+        let reached = self.m.high[i] >= price;
+        let current = self.m.close[i];
+        if !((price - current).abs() / current > terms.stale_close_pct) {
+            // Within the drift: the check leaves it working, and the bar's
+            // reconcile found the close pending -- it sends nothing more on
+            // this bar, and the latch holds through it.
+            if reached {
+                if due {
+                    return Err(Declined(
+                        "an exit outlived the bar it met: the venue may fill it on a bar the \
+                         rules are called on, ahead of their decision",
+                    ));
+                }
+                self.rest_fill_ts = now;
+            }
+            self.rest_seen_ts = now;
+            self.rest_wait_ts = now;
+            self.last_exit_ts = now;
+            self.cursor.note_close(i);
+            return Ok(());
+        }
+        if reached {
+            return Err(Declined("an exit outlived the bar it met: the bar's range reaches it"));
+        }
+        if self.close_retries >= terms.max_close_retries {
+            return Err(Declined("an exit outlived the bar it met: its close retries are spent"));
+        }
+        if self.gate.is_some_and(|gate| !gate[i]) {
+            return Err(Declined(
+                "an exit outlived the bar it met: the venue is shut to its retry",
+            ));
+        }
+        self.stale_cancel = Some(order.id);
+        self.cancels.push(order.id);
+        self.stale_ts = now;
+        // The bar's reconcile found the close pending: it sends nothing more
+        // on this bar, and the latch holds through it.
+        self.last_exit_ts = now;
+        self.cursor.note_close(i);
+        Ok(())
+    }
+
+    /// `_absorb_close_on_cancel`: the bar's own decision, on a bar a resting
+    /// exit is canceled or waited on -- `None` where `StrategyBase` sends
+    /// nothing for it.
+    ///
+    /// The rules' close finds the close pending (Composable sells only if
+    /// not `has_pending_exit()`, which the `_pending_flat` latch answers),
+    /// and an entry is refused as `PENDING_CLOSE` (`note_close`). A risk
+    /// exit sends a close of its own, and anything sent ahead of the decision
+    /// would stand beside the retry: both decline. So does any decision on a
+    /// bar whose range may fill the exit, which Nautilus decides on the book
+    /// that fill leaves.
+    fn absorb_close_on_cancel(
+        &self,
+        i: usize,
+        target: Option<Target>,
+    ) -> Result<Option<Target>, Declined> {
+        if self.last_submit_ts == self.m.ts[i] {
+            return Err(Declined(
+                "an order is sent on the bar a resting exit is cancelled on, which the native \
+                 lane does not model",
+            ));
+        }
+        if target.is_some() && self.rest_fill_ts == self.m.ts[i] {
+            return Err(Declined(
+                "the bar whose range may fill a resting exit decides, which Nautilus does after \
+                 that fill",
+            ));
+        }
+        match target {
+            Some(target) if target.policy.is_some() || target.side != 0 => Err(Declined(
+                "the bar a resting exit is cancelled on decides more than a close, which the \
+                 native lane does not model",
+            )),
+            _ => Ok(None),
+        }
+    }
+
+    /// `_retry_stale_exit`: `_retry_close_order(kind="DAY")`, from the
+    /// cancel's report -- the whole position, at the bar's close, priced as
+    /// every close is.
+    fn retry_stale_exit(&mut self, at: usize) -> Result<(), Declined> {
+        self.close_retries += 1;
+        let reference = self.m.close[at];
+        if !self.submit_exit(at, reference, None, OrderStyle::Default)? {
+            return Err(Declined("a resting exit's retry could not be sent"));
+        }
+        self.pending_reference = reference;
         Ok(())
     }
 
@@ -1417,6 +1626,29 @@ impl Replay<'_> {
             self.cursor.policy_fill(self.s, side, or_zero(size), cost, flat, at, position)?;
         }
         self.cursor.visit_primary_after_fill = true;
+        if self.account_quantity == 0.0 {
+            // A fill that leaves the book flat restores the close retries.
+            self.close_retries = 0;
+            if self.rest_fill_ts == now {
+                // A resting exit this bar's range filled, after its callback
+                // here and before it in Nautilus -- whose cash check then
+                // reads this flat book, at this close.
+                let price = self.m.close[at];
+                let cash = self.strategy_cash()?;
+                let q = self.quiet;
+                let mut funds = cash * q.fraction;
+                if funds > q.cap {
+                    funds = q.cap;
+                }
+                let need = q.units * (price * q.markup + q.slack) + q.fee;
+                if funds < need && self.exhausted(cash, price)? {
+                    return Err(Declined(
+                        "a resting exit filled from a bar's range leaves a cash check on that \
+                         bar that could halt",
+                    ));
+                }
+            }
+        }
         if leaves <= 0.0 {
             self.working_orders = (self.working_orders - 1).max(0);
             self.continue_target(at, self.pending_reference, true, true)?;

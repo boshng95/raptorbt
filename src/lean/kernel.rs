@@ -142,6 +142,18 @@ impl Position {
     }
 }
 
+/// A working reduce-only order's terms ([`Kernel::working_exits`]).
+#[derive(Clone, Copy, Debug)]
+pub struct WorkingExit {
+    pub id: usize,
+    pub units: f64,
+    /// None for a market order.
+    pub limit: Option<f64>,
+    pub tif: Tif,
+    /// When it reached the venue.
+    pub at_ts: i64,
+}
+
 /// A closed round trip, as the report reads it.
 #[derive(Clone, Debug)]
 pub struct Trade {
@@ -525,6 +537,41 @@ impl<'m> Kernel<'m> {
             let order = &self.orders[id];
             order.reduce_only && order.at_ts < now && !order.status.terminal()
         })
+    }
+
+    /// The reduce-only orders still working, as `work_resting_exit` reads
+    /// them.
+    pub fn working_exits(&self) -> impl Iterator<Item = WorkingExit> + '_ {
+        self.working.iter().filter_map(|&id| {
+            let order = &self.orders[id];
+            (order.reduce_only && !order.status.terminal()).then_some(WorkingExit {
+                id,
+                units: order.units,
+                limit: order.limit,
+                tif: order.tif,
+                at_ts: order.at_ts,
+            })
+        })
+    }
+
+    /// Whether order `id` only reduces the position.
+    #[inline]
+    pub fn reduce_only(&self, id: usize) -> bool {
+        self.orders.get(id).is_some_and(|order| order.reduce_only)
+    }
+
+    /// `cancel_order`: end working order `id`, its report queued for the
+    /// next step ahead of anything it matches. False where `id` is unknown
+    /// or already done.
+    pub fn cancel(&mut self, id: usize) -> bool {
+        match self.orders.get_mut(id) {
+            Some(order) if !order.status.terminal() => {
+                order.status = Status::Canceled;
+                self.pending.push(Event::Canceled(id));
+                true
+            }
+            _ => false,
+        }
     }
 
     fn expired(&self, id: usize, ts: i64) -> bool {
@@ -1005,6 +1052,56 @@ mod tests {
         // Filled, it is over.
         k.step(3, &mut events);
         assert_eq!(k.orders[day].status, Status::Filled);
+        assert!(!k.resting_exit(ts[3] + minute));
+    }
+
+    #[test]
+    fn a_cancelled_exit_is_reported_ahead_of_the_next_match() {
+        let minute = 60_000_000_000_i64;
+        let ts: Vec<i64> = (0..4).map(|k| 1_750_000_000_000_000_000 + k * minute).collect();
+        let close = vec![100.0, 100.0, 100.0, 250.0];
+        let m = Market::new(
+            ts.clone(),
+            close.clone(),
+            close.iter().map(|c| c + 0.5).collect(),
+            close.iter().map(|c| c - 0.5).collect(),
+            close,
+            vec![10_000.0; 4],
+            1.0,
+            4.0,
+        );
+        let terms = Terms {
+            initial_capital: 1e6,
+            price_increment: 0.01,
+            max_quantity: None,
+            currency_precision: Some(2),
+            fees: 0.0,
+            fee_per_share: 0.0,
+            fee_minimum: 0.0,
+            fee_max_pct: 0.0,
+        };
+        let mut k = Kernel::new(&m, &terms);
+        let mut events = Vec::new();
+        k.submit(0, ts[0], true, 10.0, None, Tif::Gtc, false);
+        k.step(0, &mut events);
+        let day = k.submit(1, ts[1], false, 10.0, Some(200.0), Tif::Day, true);
+        k.step(1, &mut events);
+        let exits: Vec<WorkingExit> = k.working_exits().collect();
+        assert_eq!(exits.len(), 1);
+        assert_eq!((exits[0].id, exits[0].units, exits[0].limit), (day, 10.0, Some(200.0)));
+        assert_eq!((exits[0].tif, exits[0].at_ts), (Tif::Day, ts[1]));
+
+        // Cancelled ahead of bar 3, whose range would have filled it: the
+        // report comes first, and nothing matches behind it.
+        assert!(k.cancel(day));
+        assert!(!k.cancel(day));
+        assert!(!k.idle());
+        events.clear();
+        k.step(3, &mut events);
+        assert!(matches!(events.as_slice(), [Event::Canceled(id)] if *id == day));
+        assert_eq!(k.orders[day].status, Status::Canceled);
+        assert_eq!(k.net_position(), (true, 10.0));
+        assert_eq!(k.working_exits().count(), 0);
         assert!(!k.resting_exit(ts[3] + minute));
     }
 }

@@ -110,8 +110,14 @@ fn _raptorbt(py: Python<'_>, m: &PyModule) -> PyResult<()> {
     // at the end of the bar's step, after its decisions. 11: the bar's own
     // sale on a shut venue latches no target; and a frame whose leg 0 is the
     // primary stream may hold resample or reference legs beside it
-    // (`LeanFrame.of_primary_legs`): 1m rules under a filter.
-    m.add("LEAN_REPLAY_VERSION", 11_u32)?;
+    // (`LeanFrame.of_primary_legs`): 1m rules under a filter. 12: a long
+    // close a gap left resting is canceled for drift on the next bar and
+    // re-sent once (`resting`), as `StrategyBase._check_stale_day_orders`
+    // does. 13: one within the drift is waited on until a bar's range fills
+    // it, as there. 14: an entry an event decided from flat is read as held
+    // by the later events of its instant without risk exits too, as the rule
+    // session reads it from its `VERSION` 8.
+    m.add("LEAN_REPLAY_VERSION", 14_u32)?;
     m.add_function(wrap_pyfunction!(python::strategy_bindings::resolve_atr_period, m)?)?;
 
     // Register the canonical report of a replay and its exact-arithmetic probes

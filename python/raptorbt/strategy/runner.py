@@ -340,6 +340,7 @@ def run_strategy_backtest(
         money = replay[8] if len(replay) > 8 else None
         book = replay[9] if len(replay) > 9 else None
         shorts = replay[10] if len(replay) > 10 else None
+        resting = replay[11] if len(replay) > 11 else None
         tag = getattr(strategy.config, "order_id_tag", None) or "O"
         arguments = (
             timestamps,
@@ -366,6 +367,7 @@ def run_strategy_backtest(
             money,
             book,
             shorts,
+            resting,
         )
         # A strategy may be shown the replay before the kernel runs it, with
         # the terms its session was opened on: one that raises there ends the

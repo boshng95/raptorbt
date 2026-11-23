@@ -22,7 +22,7 @@ use rayon::prelude::*;
 
 use super::fill_ledger::{BookTerms, Ledger};
 use super::money::PyMoneyModel;
-use super::replay_session::Venue;
+use super::replay_session::{Resting, Venue};
 use super::report_bindings::{to_python, trip_rows, Trip};
 use super::rule_session::{QuietParams, QuietTuple};
 use crate::lean::financing::{charge, daily_fees, Schedule};
@@ -53,6 +53,10 @@ pub(crate) fn declined(why: Declined) -> PyErr {
 /// order_tag, first_order_seq, max_actions_per_timestamp)`, as
 /// `replay_rules` takes it.
 type VenueTuple = (i64, bool, bool, bool, f64, f64, f64, f64, f64, String, u64, usize);
+
+/// `(stale_close_pct, max_close_retries)`, as `replay_rules` takes them:
+/// how an exit left resting is worked (`python::replay_session::Resting`).
+type RestingTuple = (f64, u32);
 
 /// `(balance, currency_precision, size_increment, size_precision,
 /// price_precision, currency)`.
@@ -551,6 +555,8 @@ struct Shared<'a> {
     /// The risk exits every cell runs under, and an open short's borrow
     /// they charge; None where the cells have none.
     policies: Option<Policies<'a>>,
+    /// How an exit left resting is worked; None declines every one.
+    resting: Option<Resting>,
 }
 
 impl<'a> Shared<'a> {
@@ -570,11 +576,16 @@ impl<'a> Shared<'a> {
         jumps: bool,
         (shorts, financing): (Option<Shorts<'a>>, Option<Schedule<'a>>),
         policies: Option<Policies<'a>>,
+        resting: Option<RestingTuple>,
     ) -> Self {
         Self {
             shorts,
             financing,
             policies,
+            resting: resting.map(|(stale_close_pct, max_close_retries)| Resting {
+                stale_close_pct,
+                max_close_retries,
+            }),
             frame,
             gate,
             terms: Terms {
@@ -808,6 +819,7 @@ fn run(
         day_ends: &frame.day_ends,
         jumps: shared.jumps,
         shorts: shared.shorts.as_ref(),
+        resting: shared.resting,
     };
     let started = Instant::now();
     let outcome = replay(&frame.market, &shared.terms, &stream, &cell, Some(shared.book()), log)?;
@@ -1138,6 +1150,9 @@ fn screen_dict(py: Python<'_>, axes: &Axes, rows: &[Result<Row, Declined>]) -> P
 /// (`StrategySpec.crossings` ``each_bar``). *policies* are the risk exits
 /// the cell runs under ([`PolicyTuple`]), on a frame due on every primary
 /// bar, and *borrow* an open short's borrow they charge ([`BorrowTuple`]).
+/// *resting* (`(stale_close_pct, max_close_retries)`) works a long close
+/// left resting as `StrategyBase` does -- canceled for drift on the next
+/// bar and re-sent once; without it every exit left resting declines.
 ///
 /// Returns a dict: `log` (the replay log as `replay_rules` returns it, None
 /// without *log*), `report` (the canonical report as `canonical_report`
@@ -1151,7 +1166,8 @@ fn screen_dict(py: Python<'_>, axes: &Axes, rows: &[Result<Row, Declined>]) -> P
 #[pyo3(signature = (
     frame, gate, terms, quiet, venue, money, book, keys, entry, exit, flags,
     *, starting, timezone, offsets, offsets_until_ns, jumps = true, log = true, tree = None,
-    shorts = None, financing = None, each_bar = false, policies = None, borrow = None
+    shorts = None, financing = None, each_bar = false, policies = None, borrow = None,
+    resting = None
 ))]
 #[allow(clippy::too_many_arguments)]
 pub fn lean_replay(
@@ -1179,6 +1195,7 @@ pub fn lean_replay(
     each_bar: bool,
     policies: Option<PolicyTuple<'_>>,
     borrow: Option<BorrowTuple<'_>>,
+    resting: Option<RestingTuple>,
 ) -> PyResult<PyObject> {
     let gate = gate.as_ref().map(|gate| gate.as_slice()).transpose()?;
     let shared = Shared::new(
@@ -1196,6 +1213,7 @@ pub fn lean_replay(
         jumps,
         short_terms(&shorts, &financing, frame.market.len())?,
         self::policies(&policies, &borrow)?,
+        resting,
     );
     let spec =
         Spec::of(&keys, entry, exit, tree.as_ref().map(self::tree).transpose()?, flags, each_bar)?;
@@ -1276,7 +1294,8 @@ fn replay_all<T: Send>(
 /// than one leg ([`PyLeanFrame::of_legs`]), is `(key_legs, admits)`: each
 /// pool key's leg, and the admits of every leg after the first by place --
 /// a cell's own `admits` are its first leg's. *policies* and *borrow*, the
-/// risk exits and the borrow they charge, are every cell's.
+/// risk exits and the borrow they charge, are every cell's, as is
+/// *resting* ([`lean_replay`]'s).
 ///
 /// Returns, in the cells' order, per cell the dict [`lean_replay`] returns
 /// without `log` (and without the daily curve unless *curve*), or, where
@@ -1292,7 +1311,7 @@ fn replay_all<T: Send>(
     frame, gate, terms, quiet, venue, money, book, keys, cells,
     *, starting, timezone, offsets, offsets_until_ns, threads = 0, screen = false,
     curve = false, timings = false, trees = None, shorts = None, financing = None,
-    each_bar = None, legs = None, policies = None, borrow = None
+    each_bar = None, legs = None, policies = None, borrow = None, resting = None
 ))]
 #[allow(clippy::too_many_arguments)]
 pub fn lean_replay_many(
@@ -1321,6 +1340,7 @@ pub fn lean_replay_many(
     legs: Option<LegsTuple>,
     policies: Option<PolicyTuple<'_>>,
     borrow: Option<BorrowTuple<'_>>,
+    resting: Option<RestingTuple>,
 ) -> PyResult<PyObject> {
     let entered = Instant::now();
     let gate = gate.as_ref().map(|gate| gate.as_slice()).transpose()?;
@@ -1339,6 +1359,7 @@ pub fn lean_replay_many(
         true,
         short_terms(&shorts, &financing, frame.market.len())?,
         self::policies(&policies, &borrow)?,
+        resting,
     );
     let keys = Pool::of(&keys)?;
     if trees.as_ref().is_some_and(|trees| trees.len() != cells.len()) {

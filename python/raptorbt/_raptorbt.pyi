@@ -1674,6 +1674,11 @@ def lean_replay(
     # `StrategySpec.crossings` "each_bar": every crossing once per evaluated
     # bar, before any rule reads one.
     each_bar: bool = ...,
+    # (stale_close_pct, max_close_retries): a long close left resting is
+    # canceled for drift on the next bar and re-sent once, from
+    # LEAN_REPLAY_VERSION 12; one within the drift is waited on until a bar's
+    # range fills it, from 13.
+    resting: tuple[float, int] | None = ...,
 ) -> dict[str, Any]: ...
 
 # Per cell, the dict lean_replay returns without its log (a str naming why
@@ -1703,6 +1708,8 @@ def lean_replay_many(
     financing: _Financing | None = ...,
     # Per cell, whether it works its crossings out each bar.
     each_bar: list[bool] | None = ...,
+    # lean_replay's, every cell's.
+    resting: tuple[float, int] | None = ...,
 ) -> Any: ...
 
 # A traded series' decisions (`lean::decide`): one decider's keys are
