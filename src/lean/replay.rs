@@ -1020,6 +1020,13 @@ impl Replay<'_> {
         if target_side == 0 || self.working_entry || self.cash_halted {
             return Ok(());
         }
+        if !risk_exit && self.gate.is_some_and(|gate| !gate[i]) {
+            // The bar's own entry on a shut venue: `run_decision` refuses it
+            // before `create_order` -- or the sell-to-open's
+            // `set_target_position` -- latches anything, so no target is left
+            // to sell at the next open, and one already out stands as it was.
+            return Ok(());
+        }
         if units <= 0.0 {
             return Ok(());
         }

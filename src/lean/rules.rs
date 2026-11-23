@@ -276,10 +276,11 @@ pub struct Dispatch {
     /// How many of each instant's bars are decided ahead of its primary bar,
     /// which they lead.
     ahead: Vec<usize>,
-    /// Whether the one leg is the primary stream itself ([`Dispatch::of_primary`]):
-    /// a spec over the primary bars alone, every primary bar an instant
-    /// whose leg bar is that primary bar's visit -- there is no other
-    /// (`rule_session`'s `reads_primary`).
+    /// Whether leg 0 is the primary stream itself
+    /// ([`Dispatch::of_primary_legs`]): a spec reading the primary bars,
+    /// alone or beside resample or reference legs, every primary bar an
+    /// instant whose leg-0 bar is that primary bar's visit -- there is no
+    /// other (`rule_session`'s `reads_primary`).
     pub primary: bool,
 }
 
@@ -318,6 +319,17 @@ impl Dispatch {
     /// with its next bar. Each moves its leg's keys and evaluates nothing,
     /// so the last of them is what the rules read.
     pub fn of_legs(ts: Vec<i64>, pos: Vec<usize>, legs: Vec<LegTerms>) -> Result<Self, Declined> {
+        Self::framed(ts, pos, legs, false)
+    }
+
+    /// `of_legs`, leg 0 the primary stream where `primary`: its bars are
+    /// the primary visits, in the primary bar's phase.
+    fn framed(
+        ts: Vec<i64>,
+        pos: Vec<usize>,
+        legs: Vec<LegTerms>,
+        primary: bool,
+    ) -> Result<Self, Declined> {
         let n = ts.len();
         if pos.len() != n {
             return Err(Declined("stream lengths differ"));
@@ -353,7 +365,9 @@ impl Dispatch {
                 if u == n || ts[u] != dispatched {
                     return Err(Declined("a leg's bar at no instant of its frame"));
                 }
-                let (p, rank) = if label > dispatched {
+                let (p, rank) = if primary && j == 0 {
+                    (PHASE_PRIMARY, 0)
+                } else if label > dispatched {
                     (PHASE_PRECLOSE, terms.stream_index)
                 } else if label < dispatched && terms.built {
                     (PHASE_CLOSED_BY_GAP, terms.rank)
@@ -399,15 +413,30 @@ impl Dispatch {
             }
         });
         let events = sorted.into_iter().map(|(_, _, _, j, r)| (j, r)).collect();
-        Ok(Self { ts, pos, legs: built, lowest_close, events, starts, ahead, primary: false })
+        Ok(Self { ts, pos, legs: built, lowest_close, events, starts, ahead, primary })
     }
 
     /// A frame whose one leg is the primary stream: a spec over the primary
-    /// bars `ts` alone, whose closes are `close`. Each bar is an instant of
-    /// its own, delivered on itself, and its visit -- the leg's bar --
-    /// moves the keys, as `rule_session` visits a spec reading the primary
-    /// stream: once a bar, in the primary bar's phase.
+    /// bars `ts` alone, whose closes are `close` ([`Self::of_primary_legs`]
+    /// with no other leg).
     pub fn of_primary(ts: Vec<i64>, close: Vec<f64>) -> Result<Self, Declined> {
+        Self::of_primary_legs(ts, close, Vec::new())
+    }
+
+    /// A frame whose leg 0 is the primary stream, beside `legs`: a spec
+    /// reading the primary bars `ts`, whose closes are `close`, and the
+    /// streams of `legs` -- a 1m cell's rules under a filter's resampled or
+    /// reference legs. Each primary bar is an instant of its own, delivered
+    /// on itself, and its visit -- leg 0's bar -- moves the primary keys, as
+    /// `rule_session` visits a spec reading the primary stream: once a bar,
+    /// in the primary bar's phase, between the windows decided ahead of it
+    /// and the bars completed with it. Every other leg's bar is at one of
+    /// those instants.
+    pub fn of_primary_legs(
+        ts: Vec<i64>,
+        close: Vec<f64>,
+        legs: Vec<LegTerms>,
+    ) -> Result<Self, Declined> {
         let pos = (0..ts.len()).collect();
         let leg = LegTerms {
             ts: ts.clone(),
@@ -418,9 +447,32 @@ impl Dispatch {
             stream_index: 0,
             decides: true,
         };
-        let mut dispatch = Self::of_legs(ts, pos, vec![leg])?;
-        dispatch.primary = true;
-        Ok(dispatch)
+        Self::framed(ts, pos, std::iter::once(leg).chain(legs).collect(), true)
+    }
+
+    /// Whether `leg` is the primary stream (leg 0 of a primary frame).
+    #[inline]
+    pub fn is_primary(&self, leg: usize) -> bool {
+        self.primary && leg == 0
+    }
+
+    /// The rule session's slot of `leg`: 0 the primary stream -- a primary
+    /// frame's leg 0 -- and each other stream after it in leg order.
+    #[inline]
+    pub fn slot(&self, leg: usize) -> usize {
+        if self.primary {
+            leg
+        } else {
+            leg + 1
+        }
+    }
+
+    /// The leg of the rule session's `slot`, None for the primary stream
+    /// where no leg is it, or a slot past the frame's streams.
+    #[inline]
+    pub fn leg_of(&self, slot: usize) -> Option<usize> {
+        let leg = if self.primary { Some(slot) } else { slot.checked_sub(1) };
+        leg.filter(|&leg| leg < self.legs.len())
     }
 
     /// Instant `u`'s bars as `(leg, bar)` in delivery order, and how many of
@@ -730,27 +782,24 @@ impl<'a> Stream<'a> {
     /// policy on a stream of the frame, the ATR's values one per bar of its
     /// stream, and the borrow's terms one per primary bar.
     pub fn with_policies(&mut self, policies: Policies<'a>, bars: usize) -> Result<(), Declined> {
-        let legs = self.d.legs.len();
         let risk = &policies.risk;
         if risk.trade.is_none() && risk.atr.is_none() && risk.hold.is_none() {
             return Err(Declined("risk policies that name no check"));
         }
-        // The policies' slots are the rule session's: 0 the primary -- a
-        // primary frame's one leg -- and each resample after it.
-        let slots = if self.d.primary { 0 } else { legs };
-        // A time exit counts a leg's bars: a resample's, or a primary frame's.
-        let counts =
-            |slot: usize| if self.d.primary { slot == 0 } else { (1..=legs).contains(&slot) };
-        if risk.hold.is_some_and(|hold| !counts(hold.slot)) {
+        // The policies' slots are the rule session's (`Dispatch::slot`): 0
+        // the primary -- a primary frame's leg 0 -- and each stream after it.
+        // A time exit counts a leg's bars.
+        if risk.hold.is_some_and(|hold| self.d.leg_of(hold.slot).is_none()) {
             return Err(Declined("a time exit on no resample of the frame"));
         }
         match (risk.atr, policies.atr) {
             (None, None) => {}
             (Some(atr), Some((values, initialized))) => {
-                if atr.slot > slots {
-                    return Err(Declined("an ATR exit on no stream of the frame"));
-                }
-                let n = if atr.slot == 0 { bars } else { self.d.legs[atr.slot - 1].len() };
+                let n = match self.d.leg_of(atr.slot) {
+                    Some(leg) => self.d.legs[leg].len(),
+                    None if atr.slot == 0 => bars,
+                    None => return Err(Declined("an ATR exit on no stream of the frame")),
+                };
                 if values.len() != n || initialized.len() != n {
                     return Err(Declined("an ATR's values not one per bar of its stream"));
                 }
@@ -1346,11 +1395,11 @@ impl Cursor {
             return None;
         }
         if let (false, Some(policies)) = (primary, &s.policies) {
-            if s.d.primary {
+            if s.d.is_primary(0) {
                 // The leg's bar is the primary bar.
                 policies.risk.primary(&mut self.policy);
             } else {
-                policies.risk.stream(&mut self.policy, 1, bar, s.leg().ahead(bar));
+                policies.risk.stream(&mut self.policy, s.d.slot(0), bar, s.leg().ahead(bar));
             }
         }
         let (r, entry) = if primary {
@@ -1669,8 +1718,8 @@ impl Cursor {
         let mut reference: Option<f64> = None;
         let mut entry_timestamp: Option<i64> = None;
         // The instant's bars decided ahead of the primary bar, the primary
-        // bar (None), and the rest; a primary frame's leg bar is the primary
-        // bar's visit, and there is no other.
+        // bar (None), and the rest; a primary frame's leg-0 bar is the
+        // primary bar's visit, and there is no other.
         let (bars, ahead) = res.map_or((&[][..], 0), |u| s.d.events(u));
         let own = (!s.d.primary).then_some(None);
         let events = bars[..ahead]
@@ -1681,7 +1730,7 @@ impl Cursor {
         let mut latch = Latch::new(self.close_bar);
         let mut model_exit: Option<(f64, bool)> = None;
         for event in events {
-            let primary = event.is_none() || s.d.primary;
+            let primary = event.is_none_or(|(leg, _)| s.d.is_primary(leg));
             let early = event.is_some_and(|(leg, bar)| s.d.legs[leg].ahead(bar));
             latch.step(idx as i64, early, start_side);
             self.clocks.flipped = false;
@@ -1791,11 +1840,12 @@ impl Cursor {
             return Ok(None);
         }
         if let (Some((leg, bar)), Some(policies)) = (event, &s.policies) {
-            if s.d.primary {
+            if s.d.is_primary(leg) {
                 // The leg's bar is the primary bar.
                 policies.risk.primary(&mut self.policy);
             } else {
-                policies.risk.stream(&mut self.policy, leg + 1, bar, s.d.legs[leg].ahead(bar));
+                let ahead = s.d.legs[leg].ahead(bar);
+                policies.risk.stream(&mut self.policy, s.d.slot(leg), bar, ahead);
             }
         }
         let mut position = side;
@@ -1818,7 +1868,14 @@ impl Cursor {
             }
             Some((leg, bar)) => {
                 self.current[leg] = Some(bar);
-                (s.leg_reached(leg, bar), s.d.legs[leg].phase[bar])
+                // A primary visit waits for every key; another leg's bar
+                // decides once its own are ready.
+                let reached = if s.d.is_primary(leg) {
+                    s.primary_reached(&self.current)
+                } else {
+                    s.leg_reached(leg, bar)
+                };
+                (reached, s.d.legs[leg].phase[bar])
             }
         };
         let order = (now, phase);
@@ -2128,6 +2185,44 @@ mod tests {
             assert_eq!(d.events(u), (&[(0, u)][..], ahead));
         }
         assert_eq!(d.lowest_close, 2.0);
+    }
+
+    #[test]
+    fn primary_frames_visit_the_primary_bar_between_its_instants_legs() {
+        // Leg 0 the primary stream: each of its bars an instant, in the
+        // primary bar's phase -- after a window decided ahead of it, before
+        // one completed with it -- and the legs after it in slot order.
+        let daily = leg(&[20, 40], &[25, 40], 0, true, 1);
+        let d =
+            Dispatch::of_primary_legs(vec![10, 20, 30, 40], vec![1.0, 2.0, 3.0, 4.0], vec![daily])
+                .unwrap();
+        assert_eq!(d.len(), 4);
+        assert_eq!(d.events(0), (&[(0, 0)][..], 0));
+        assert_eq!(d.events(1), (&[(1, 0), (0, 1)][..], 1));
+        assert_eq!(d.events(2), (&[(0, 2)][..], 0));
+        assert_eq!(d.events(3), (&[(0, 3), (1, 1)][..], 0));
+        assert_eq!(d.legs[0].phase, [PHASE_PRIMARY; 4]);
+        assert!(d.legs[1].ahead(0) && !d.legs[1].ahead(1));
+        // The rule session's slots: the primary 0, each leg after it.
+        assert!(d.is_primary(0) && !d.is_primary(1));
+        assert_eq!((d.slot(0), d.slot(1)), (0, 1));
+        assert_eq!((d.leg_of(0), d.leg_of(1), d.leg_of(2)), (Some(0), Some(1), None));
+        assert_eq!(d.lowest_close, 1.0);
+        // A leg's bar at no primary bar declines; alone, the primary frame.
+        let off = leg(&[25], &[25], 0, true, 1);
+        assert!(Dispatch::of_primary_legs(vec![10, 20, 30], vec![1.0; 3], vec![off]).is_err());
+        let alone = Dispatch::of_primary(vec![10, 20], vec![1.0, 2.0]).unwrap();
+        assert_eq!(alone.legs.len(), 1);
+        assert!(alone.is_primary(0) && alone.leg_of(1).is_none());
+        // An ordinary frame's slot 0 is the primary, which no leg is.
+        let legs = Dispatch::of_legs(
+            vec![10, 20],
+            vec![0, 1],
+            vec![leg(&[10, 20], &[10, 20], 0, true, 0)],
+        )
+        .unwrap();
+        assert!(!legs.is_primary(0));
+        assert_eq!((legs.slot(0), legs.leg_of(0), legs.leg_of(1)), (1, None, Some(0)));
     }
 
     #[test]

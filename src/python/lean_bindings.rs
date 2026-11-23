@@ -374,26 +374,10 @@ impl PyLeanFrame {
         legs: Vec<LegTuple<'_>>,
         decides: Option<Vec<bool>>,
     ) -> PyResult<Self> {
-        if decides.as_ref().is_some_and(|decides| decides.len() != legs.len()) {
-            return Err(PyValueError::new_err("decides and legs of different counts"));
-        }
-        let legs = legs
-            .into_iter()
-            .enumerate()
-            .map(|(at, (ts, labels, close, rank, built, stream_index))| LegTerms {
-                ts: ts.as_array().to_vec(),
-                labels: labels.as_array().to_vec(),
-                close: close.as_array().to_vec(),
-                rank,
-                built,
-                stream_index,
-                decides: decides.as_ref().is_none_or(|decides| decides[at]),
-            })
-            .collect();
         let dispatch = Dispatch::of_legs(
             dispatch_timestamps.as_array().to_vec(),
             positions(&dispatch_positions, "a dispatch")?,
-            legs,
+            leg_terms(legs, decides)?,
         )
         .map_err(declined)?;
         Self::framed(&market, &due, dispatch)
@@ -410,6 +394,30 @@ impl PyLeanFrame {
     ) -> PyResult<Self> {
         let dispatch = Dispatch::of_primary(market.market.ts.clone(), market.market.close.clone())
             .map_err(declined)?;
+        Self::framed(&market, &due, dispatch)
+    }
+
+    /// A frame whose leg 0 is *market*'s primary stream, as `of_primary`'s,
+    /// and *legs* -- the symbol's resampled streams or reference legs, as
+    /// `of_legs` takes them -- after it in slot order: rules on the primary
+    /// bars beside a filter's (`NativeModelRunner.primary_decides` with
+    /// resample streams). Every primary bar is an instant, delivered on
+    /// itself after the other legs' bars that close there. *decides* is
+    /// per leg of *legs*, as `of_legs`'; the primary always decides.
+    #[staticmethod]
+    #[pyo3(signature = (market, due, legs, *, decides = None))]
+    fn of_primary_legs(
+        market: PyRef<'_, PyLeanMarket>,
+        due: PyReadonlyArray1<'_, i64>,
+        legs: Vec<LegTuple<'_>>,
+        decides: Option<Vec<bool>>,
+    ) -> PyResult<Self> {
+        let dispatch = Dispatch::of_primary_legs(
+            market.market.ts.clone(),
+            market.market.close.clone(),
+            leg_terms(legs, decides)?,
+        )
+        .map_err(declined)?;
         Self::framed(&market, &due, dispatch)
     }
 
@@ -432,6 +440,26 @@ impl PyLeanFrame {
             frame,
         })
     }
+}
+
+/// `of_legs`' *legs* and *decides*, as the rule session's terms.
+fn leg_terms(legs: Vec<LegTuple<'_>>, decides: Option<Vec<bool>>) -> PyResult<Vec<LegTerms>> {
+    if decides.as_ref().is_some_and(|decides| decides.len() != legs.len()) {
+        return Err(PyValueError::new_err("decides and legs of different counts"));
+    }
+    Ok(legs
+        .into_iter()
+        .enumerate()
+        .map(|(at, (ts, labels, close, rank, built, stream_index))| LegTerms {
+            ts: ts.as_array().to_vec(),
+            labels: labels.as_array().to_vec(),
+            close: close.as_array().to_vec(),
+            rank,
+            built,
+            stream_index,
+            decides: decides.as_ref().is_none_or(|decides| decides[at]),
+        })
+        .collect())
 }
 
 /// Bar places off a Python array; ValueError where one is negative.

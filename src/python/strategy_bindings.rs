@@ -339,9 +339,10 @@ impl PyKernelSession {
     /// the bar a composite contests a loan on too (`cover`), which the
     /// replay declines. 4: an exit, stop or loan cover drops a short target
     /// it trades against, and a target's expansion is offered at the end of
-    /// the bar's step, after its decisions.
+    /// the bar's step, after its decisions. 5: the bar's own sale on a shut
+    /// venue latches no target.
     #[classattr]
-    const REPLAY_VERSION: u32 = 4;
+    const REPLAY_VERSION: u32 = 5;
 
     #[new]
     #[pyo3(signature = (symbol="ASSET", direction=1, config=None, instrument_config=None, instrument=None,

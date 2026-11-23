@@ -107,8 +107,11 @@ fn _raptorbt(py: Python<'_>, m: &PyModule) -> PyResult<()> {
     // alone, its one leg the primary stream (`LeanFrame.of_primary`), a time
     // exit counting those bars. 10: an exit, stop or loan cover drops a
     // short target it trades against, and a target's expansion is offered
-    // at the end of the bar's step, after its decisions.
-    m.add("LEAN_REPLAY_VERSION", 10_u32)?;
+    // at the end of the bar's step, after its decisions. 11: the bar's own
+    // sale on a shut venue latches no target; and a frame whose leg 0 is the
+    // primary stream may hold resample or reference legs beside it
+    // (`LeanFrame.of_primary_legs`): 1m rules under a filter.
+    m.add("LEAN_REPLAY_VERSION", 11_u32)?;
     m.add_function(wrap_pyfunction!(python::strategy_bindings::resolve_atr_period, m)?)?;
 
     // Register the canonical report of a replay and its exact-arithmetic probes
