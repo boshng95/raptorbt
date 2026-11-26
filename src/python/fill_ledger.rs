@@ -161,6 +161,8 @@ enum Entry {
 struct Booking {
     balance: f64,
     held: f64,
+    /// The most the standing position has held (`book_fill`).
+    stood: f64,
     ts: Vec<i64>,
     size: Vec<f64>,
     price: Vec<f64>,
@@ -186,6 +188,8 @@ struct Booked {
     reduces: bool,
     /// The units held after it.
     held: f64,
+    /// The most the standing position has held, 0.0 once flat.
+    stood: f64,
     /// The balance it left.
     balance: f64,
 }
@@ -197,6 +201,7 @@ fn book_fill(
     precision: u32,
     balance: f64,
     held: f64,
+    stood: f64,
     buy: bool,
     ts: i64,
     raw: &FillRecord,
@@ -208,13 +213,24 @@ fn book_fill(
     let signed = if buy { size } else { -size };
     let reduces = held != 0.0 && (held > 0.0) != (signed > 0.0);
     let mut after = held + signed;
-    if after.abs() <= py_max(held.abs(), size) * 1e-12 {
+    // Flat is judged against the most the position stood at (`stood`): the
+    // residue of a float sum grows with the sizes summed, not with the last
+    // fill, so a close worked off in many small fills ends on a residue
+    // larger than its last fill's own rounding.
+    if after.abs() <= py_max(py_max(held.abs(), size), stood) * 1e-12 {
         after = 0.0;
     }
+    let stood = if after == 0.0 {
+        0.0
+    } else if held != 0.0 && (held > 0.0) == (after > 0.0) {
+        py_max(stood, after.abs())
+    } else {
+        after.abs()
+    };
     // `_book_fill`: every fill here reports what it realized.
     let realized = money(raw.gross_realized, precision)?;
     let balance = py_round(balance + realized - cost, precision)?;
-    Some(Booked { ts, size, price, left, cost, reduces, held: after, balance })
+    Some(Booked { ts, size, price, left, cost, reduces, held: after, stood, balance })
 }
 
 /// `_order_row`'s running `(filled, avg_px, commission)` after one more
@@ -255,6 +271,8 @@ struct Tally {
     booked: bool,
     balance: f64,
     held: f64,
+    /// The most the standing position has held (`book_fill`).
+    stood: f64,
     orders: Vec<Slip>,
     rows: Vec<Sums>,
     reductions: Vec<i64>,
@@ -265,10 +283,13 @@ impl Tally {
     fn book(&mut self, precision: u32, raw: &FillRecord) -> bool {
         let slip = self.orders[raw.order as usize];
         let ts = stamp(slip.decided_ns, slip.arrived_on_ns, raw.now_ns);
-        let Some(fill) = book_fill(precision, self.balance, self.held, slip.buy, ts, raw) else {
+        let Some(fill) =
+            book_fill(precision, self.balance, self.held, self.stood, slip.buy, ts, raw)
+        else {
             return false;
         };
         self.held = fill.held;
+        self.stood = fill.stood;
         self.balance = fill.balance;
         if fill.reduces {
             self.reductions.push(fill.ts);
@@ -347,6 +368,7 @@ impl Ledger {
         let booking = terms.as_ref().map(|terms| Booking {
             balance: terms.balance,
             held: 0.0,
+            stood: 0.0,
             ts: Vec::new(),
             size: Vec::new(),
             price: Vec::new(),
@@ -377,6 +399,7 @@ impl Ledger {
             booked: true,
             balance: terms.balance,
             held: 0.0,
+            stood: 0.0,
             orders: Vec::new(),
             rows: Vec::new(),
             reductions: Vec::new(),
@@ -466,6 +489,7 @@ impl Ledger {
             terms.currency_precision,
             booking.balance,
             held,
+            booking.stood,
             order.buy,
             order.stamp(raw.now_ns),
             raw,
@@ -474,6 +498,7 @@ impl Ledger {
         };
         let (ts, after) = (fill.ts, fill.held);
         booking.held = after;
+        booking.stood = fill.stood;
 
         // `_track_peak`.
         let scale = py_max(held.abs(), after.abs());

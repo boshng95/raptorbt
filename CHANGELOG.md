@@ -12,6 +12,25 @@ branch.
 
 ### Fixed
 
+- **One close at a time.** A long's risk exit -- a stop, a target, a time
+  exit -- that acted while a close of the position was already being worked
+  sent a second close beside it: a market close behind the rules' own on
+  the bar that decided both (`preceding_exit`), or beside a close a bar
+  before left pending -- re-offered, resting, shut out by the bell. Two
+  sells for one holding; where a halt reopened below a resting DAY limit,
+  the stop sold the shares and the limit lived on against a flat book.
+  `StrategyBase._exit_position` now sends nothing there, and the whole
+  replay and the lean replay follow it (`close_is_working`): the rule
+  session decides as it did, the replay drops a risk exit's flat target
+  while its own flat target is pending, and a preceding close that reaches
+  the venue is the only close of its bar, pending at its reference in its
+  order type. A two-sided session is unchanged; it refuses a second
+  reduction itself. `CrossoverRuleSession.VERSION` 9.
+- **A lot is flat against the most it stood at.** The fill ledger judged
+  a position flat against its last fill, so a close worked off in many
+  small fills could leave float residue that read as a holding and carried
+  one round trip's peak quantity into the next. Flatness is now measured
+  against the largest quantity the lot stood at (`stood`).
 - **A close a rule session decides latches its bar against entries.**
   `CrossoverRuleSession` and the lean lane let an entry decided later in
   the same callback undo a close decided earlier in it, which kept the lot.

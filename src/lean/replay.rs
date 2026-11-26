@@ -838,11 +838,19 @@ impl Replay<'_> {
             Some(target) => target,
             None => self.advance(i, true)?,
         };
+        if self.close_is_working(target) {
+            // `_exit_position`: one close at a time. The risk check found the
+            // flat intent open -- a close this bar's reconcile re-offered, or
+            // one still resting -- and sent nothing; the bar's own decision
+            // met the same pending close and sent nothing either.
+            target = None;
+        }
         if self.stale_ts == self.m.ts[i] || self.rest_wait_ts == self.m.ts[i] {
             target = self.absorb_close_on_cancel(i, target)?;
         }
         // Reconciling stands in for the bar's own decision, not for its risk
-        // checks: `handle_bar` runs those whatever the reconcile chased.
+        // checks: `handle_bar` runs those whatever the reconcile chased, and
+        // a stop hit where no close is being worked sends its own.
         let policy_acted = target.is_some_and(|t| t.policy.is_some());
         if !reconciled || policy_acted {
             let preceding = if reconciled { None } else { target.and_then(|t| t.preceding) };
@@ -1023,6 +1031,18 @@ impl Replay<'_> {
         Ok(())
     }
 
+    /// `_close_is_working`: whether a risk check's close finds the flat
+    /// intent open -- `StrategyBase._exit_position`, which then sends nothing.
+    ///
+    /// The long-only lane's `_pending_flat` is this loop's flat target, asked
+    /// after the bar's reconcile has dropped one the book already met. The
+    /// signed lane states its closes as targets and is not asked.
+    fn close_is_working(&self, target: Option<Target>) -> bool {
+        self.shorts.is_none()
+            && self.pending_target == Some(0.0)
+            && target.is_some_and(|t| t.policy.is_some() && t.side == 0)
+    }
+
     /// `_absorb_close_on_cancel`: the bar's own decision, on a bar a resting
     /// exit is canceled or waited on -- `None` where `StrategyBase` sends
     /// nothing for it.
@@ -1030,10 +1050,11 @@ impl Replay<'_> {
     /// The rules' close finds the close pending (Composable sells only if
     /// not `has_pending_exit()`, which the `_pending_flat` latch answers),
     /// and an entry is refused as `PENDING_CLOSE` (`note_close`). A risk
-    /// exit sends a close of its own, and anything sent ahead of the decision
-    /// would stand beside the retry: both decline. So does any decision on a
-    /// bar whose range may fill the exit, which Nautilus decides on the book
-    /// that fill leaves.
+    /// check's close finds it pending too ([`Self::close_is_working`]) and
+    /// never reaches here; one that does is on a book no close is pending
+    /// on. Anything sent ahead of the decision would stand beside the retry,
+    /// and declines. So does any decision on a bar whose range may fill the
+    /// exit, which Nautilus decides on the book that fill leaves.
     fn absorb_close_on_cancel(
         &self,
         i: usize,
@@ -1192,8 +1213,18 @@ impl Replay<'_> {
                 Some(at) => self.submit_exit(i, at, None, OrderStyle::Default)?,
                 None => false,
             };
-            let submitted = self.submit_exit(i, reference, None, style)? || preceded;
-            if submitted {
+            if preceded && self.shorts.is_none() {
+                // `_exit_position`: one close at a time. The rules' close
+                // reached the venue ahead of the risk check and latched the
+                // flat intent, so the check sent nothing: the close being
+                // worked is the rules', at their reference and in their
+                // order type. A two-sided session latches no such intent:
+                // its check's cover follows the rules'.
+                self.pending_reference = preceding.unwrap_or(reference);
+                self.pending_order_style = OrderStyle::Default;
+                return Ok(());
+            }
+            if self.submit_exit(i, reference, None, style)? || preceded {
                 return Ok(());
             }
             if risk_exit && self.exit_gated {

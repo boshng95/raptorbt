@@ -2009,9 +2009,13 @@ impl PyCrossoverRuleSession {
     /// them. 8: an entry a visit decided from flat is read as held by the
     /// later visits of its instant on both lanes, the deferred one too, as
     /// `StrategyBase` reads it: a crossover an exit spends there no longer
-    /// sells on the next bar.
+    /// sells on the next bar. 9: one close at a time
+    /// (`StrategyBase._exit_position`) -- the session decides as it did, and
+    /// the replays that submit for it (`replay_rules`, the lean replay) send
+    /// nothing for a risk exit that finds a close of the position already
+    /// being worked, where they sent a second close beside it.
     #[classattr]
-    const VERSION: u32 = 8;
+    const VERSION: u32 = 9;
 
     /// A session over crossover rules `exits` and `entries`, or, given
     /// `conditions`, over the rules rooted at `exit_roots` and `entry_roots`
